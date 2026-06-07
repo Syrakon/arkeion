@@ -1,0 +1,4 @@
+# rustc se queda sin pila (SIGSEGV) monomorfizando el build de tests en
+# algunas máquinas; ampliar la pila del compilador lo evita.
+[env]
+RUST_MIN_STACK = "134217728"

@@ -1,0 +1,20 @@
+[package]
+name = "arkeion"
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.89"
+description = "Motor de base de datos embebido, auditable y versionado — soberano europeo."
+homepage = "https://arkeion.tech"
+# Licencia: modelo TSAL-1.0 → Apache-2.0 diferido, por confirmar (ver README).
+publish = false
+
+# Supply chain mínima y justificada (docs/05-decisiones.md, D8):
+#   sha2      — SHA-256 (FIPS 180-4): tags de integridad y hash chain. RustCrypto, Rust puro.
+#   getrandom — entropía del SO para file_id y kdf_salt en la creación del archivo.
+# Llegarán en M7 (cifrado): aes-gcm, zeroize. Nada más.
+[dependencies]
+sha2 = "0.10"
+getrandom = { version = "0.3", features = ["std"] }
+
+[dev-dependencies]
+tempfile = "3"

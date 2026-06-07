@@ -1,0 +1,52 @@
+-- Transacciones explícitas (M4): BEGIN/COMMIT/ROLLBACK a nivel de conexión.
+
+> CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT);
+ok
+
+> BEGIN;
+ok
+
+> INSERT INTO t (v) VALUES ('uno'), ('dos');
+affected 2
+
+-- Dentro de la transacción las consultas ven las escrituras propias.
+> SELECT COUNT(*) FROM t;
+2
+
+> ROLLBACK;
+ok
+
+> SELECT COUNT(*) FROM t;
+0
+
+-- El rollback descarta también el contador de rowids: se reusa el 1.
+> BEGIN;
+ok
+
+> INSERT INTO t (v) VALUES ('tres');
+affected 1
+
+> UPDATE t SET v = 'tres!' WHERE id = 1;
+affected 1
+
+> COMMIT;
+ok
+
+> SELECT id, v FROM t;
+1|tres!
+
+-- Errores de protocolo.
+> COMMIT;
+error sin transacción abierta
+
+> ROLLBACK;
+error sin transacción abierta
+
+> BEGIN;
+ok
+
+> BEGIN;
+error ya hay una transacción abierta
+
+> ROLLBACK;
+ok

@@ -5,13 +5,53 @@
 //!
 //! Diseño completo en `docs/` (arquitectura, formato de archivo, API, hitos).
 //!
-//! **Estado**: M2 — capas física, transaccional (KV ACID con snapshots sin
-//! locks) y relacional (record/catalog). El SQL y la API pública llegan en M3.
+//! ## Ejemplo
+//!
+//! ```
+//! use arkeion::{Database, Options, params};
+//!
+//! let dir = tempfile::tempdir().unwrap();
+//! let db = Database::open(dir.path().join("demo.arkeion"), Options::default()).unwrap();
+//! let conn = db.connect().unwrap();
+//!
+//! conn.execute(
+//!     "CREATE TABLE clientes (id INTEGER PRIMARY KEY, nombre TEXT NOT NULL, saldo REAL)",
+//!     &[],
+//! )
+//! .unwrap();
+//! conn.execute(
+//!     "INSERT INTO clientes (nombre, saldo) VALUES (?1, ?2)",
+//!     &params!["Acme GmbH", 1250.0],
+//! )
+//! .unwrap();
+//!
+//! let mut rows = conn
+//!     .query("SELECT id, nombre FROM clientes WHERE saldo > ?1", &params![1000])
+//!     .unwrap();
+//! let row = rows.next().unwrap().unwrap();
+//! assert_eq!(row.get::<i64>("id").unwrap(), 1);
+//! assert_eq!(row.get::<String>("nombre").unwrap(), "Acme GmbH");
+//!
+//! // Transacción explícita: o todo, o nada (soltarla sin commit = rollback).
+//! let tx = conn.begin().unwrap();
+//! tx.execute("UPDATE clientes SET saldo = saldo - ?1 WHERE id = 1", &params![250.0])
+//!     .unwrap();
+//! tx.commit().unwrap();
+//! ```
+//!
+//! **Estado**: M4 — DML completo, el MVP: `UPDATE`/`DELETE`, `INNER`/`LEFT
+//! JOIN`, agregados sin `GROUP BY`, transacciones explícitas (`BEGIN` SQL y
+//! [`Transaction`]) y sentencias preparadas. La API se estabiliza milestone
+//! a milestone; lo marcado `#[doc(hidden)]` es interno.
 
 #![forbid(unsafe_code)]
 
+mod api;
 mod error;
 
+pub use api::{
+    ColIndex, Connection, Database, FromValue, Options, Row, Rows, Statement, Transaction,
+};
 pub use error::{Error, Result};
 pub use record::Value;
 
@@ -26,6 +66,8 @@ pub mod commit;
 #[doc(hidden)]
 pub mod crypto;
 #[doc(hidden)]
+pub mod exec;
+#[doc(hidden)]
 pub mod format;
 #[doc(hidden)]
 pub mod io;
@@ -33,6 +75,8 @@ pub mod io;
 pub mod pager;
 #[doc(hidden)]
 pub mod record;
+#[doc(hidden)]
+pub mod sql;
 #[doc(hidden)]
 pub mod tx;
 

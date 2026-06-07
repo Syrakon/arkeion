@@ -1,0 +1,48 @@
+-- Agregados sin GROUP BY (M4): COUNT, SUM, AVG, MIN, MAX.
+
+> CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER, r REAL, s TEXT);
+ok
+
+> INSERT INTO t (v, r, s) VALUES (10, 1.5, 'a'), (20, 2.5, 'b'), (NULL, NULL, NULL), (30, 4.0, 'c');
+affected 4
+
+> SELECT COUNT(*) FROM t;
+4
+
+-- COUNT(col) ignora NULL.
+> SELECT COUNT(v) FROM t;
+3
+
+> SELECT SUM(v), AVG(v) FROM t;
+60|20.0
+
+> SELECT MIN(v), MAX(v), MIN(s), MAX(s) FROM t;
+10|30|a|c
+
+-- INTEGER + REAL promociona a REAL.
+> SELECT SUM(v + r) FROM t;
+68.0
+
+> SELECT COUNT(*) FROM t WHERE v > 10;
+2
+
+-- Expresiones sobre agregados.
+> SELECT COUNT(*) * 2 + 1, MAX(v) - MIN(v) FROM t;
+9|20
+
+> SELECT SUM(s) FROM t;
+error SUM requiere valores numéricos
+
+-- Columnas desnudas no se permiten sin GROUP BY.
+> SELECT v, COUNT(*) FROM t;
+error dentro de un agregado
+
+> SELECT COUNT(*) FROM t WHERE COUNT(*) > 1;
+error no se permiten en WHERE
+
+-- Sobre cero filas: COUNT = 0, el resto NULL.
+> DELETE FROM t;
+affected 4
+
+> SELECT COUNT(*), SUM(v), AVG(v), MIN(v), MAX(v) FROM t;
+0|NULL|NULL|NULL|NULL

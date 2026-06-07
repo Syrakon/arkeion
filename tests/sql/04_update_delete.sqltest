@@ -1,0 +1,58 @@
+-- UPDATE y DELETE (M4): SET multi-columna, WHERE, recuentos y atomicidad.
+
+> CREATE TABLE facturas (id INTEGER PRIMARY KEY, total REAL, estado TEXT NOT NULL DEFAULT 'borrador');
+ok
+
+> INSERT INTO facturas (total, estado) VALUES (100, 'borrador'), (200, 'emitida'), (300, 'emitida');
+affected 3
+
+> UPDATE facturas SET estado = 'pagada' WHERE total >= 200;
+affected 2
+
+> SELECT id, estado FROM facturas ORDER BY id;
+1|borrador
+2|pagada
+3|pagada
+
+-- SET ve la fila antigua: total se duplica una sola vez.
+> UPDATE facturas SET total = total * 2 WHERE id = 1;
+affected 1
+
+> SELECT total FROM facturas WHERE id = 1;
+200.0
+
+> UPDATE facturas SET total = 0 WHERE id = 99;
+affected 0
+
+-- El alias del rowid no se reasigna en v1.
+> UPDATE facturas SET id = 9 WHERE id = 1;
+error PRIMARY KEY
+
+-- Las restricciones aplican también en UPDATE, y la sentencia es atómica.
+> UPDATE facturas SET estado = NULL WHERE id = 1;
+error NOT NULL
+
+> SELECT estado FROM facturas WHERE id = 1;
+borrador
+
+-- Las columnas se validan aunque no haya filas afectadas.
+> UPDATE facturas SET nope = 1 WHERE id = 99;
+error columna desconocida
+
+> DELETE FROM facturas WHERE estado = 'pagada';
+affected 2
+
+> SELECT id FROM facturas;
+1
+
+> DELETE FROM facturas;
+affected 1
+
+> SELECT * FROM facturas;
+empty
+
+> UPDATE inexistente SET a = 1;
+error tabla desconocida
+
+> DELETE FROM inexistente;
+error tabla desconocida

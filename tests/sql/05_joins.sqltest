@@ -1,0 +1,47 @@
+-- JOINs nested-loop (M4): INNER y LEFT, alias y columnas cualificadas.
+
+> CREATE TABLE clientes (id INTEGER PRIMARY KEY, nombre TEXT NOT NULL);
+ok
+
+> CREATE TABLE facturas (id INTEGER PRIMARY KEY, cliente_id INTEGER, total REAL);
+ok
+
+> INSERT INTO clientes (nombre) VALUES ('ana'), ('bo'), ('eva');
+affected 3
+
+> INSERT INTO facturas (cliente_id, total) VALUES (1, 100), (1, 50), (3, 200), (NULL, 7);
+affected 4
+
+> SELECT c.nombre, f.total FROM facturas f INNER JOIN clientes c ON f.cliente_id = c.id ORDER BY f.id;
+ana|100.0
+ana|50.0
+eva|200.0
+
+-- JOIN a secas = INNER JOIN.
+> SELECT c.nombre FROM facturas f JOIN clientes c ON f.cliente_id = c.id WHERE f.total > 60 ORDER BY c.nombre;
+ana
+eva
+
+-- LEFT JOIN conserva las filas sin pareja, con NULLs a la derecha.
+> SELECT c.nombre, f.total FROM clientes c LEFT JOIN facturas f ON f.cliente_id = c.id ORDER BY c.id, f.id;
+ana|100.0
+ana|50.0
+bo|NULL
+eva|200.0
+
+-- Sin calificador la columna se resuelve si es única; `id` es ambigua.
+> SELECT nombre FROM facturas f INNER JOIN clientes c ON f.cliente_id = c.id WHERE total = 200;
+eva
+
+> SELECT id FROM facturas f INNER JOIN clientes c ON f.cliente_id = c.id;
+error columna ambigua
+
+-- `*` expande todas las tablas en orden FROM, JOIN.
+> SELECT * FROM facturas f INNER JOIN clientes c ON f.cliente_id = c.id WHERE c.nombre = 'eva';
+3|3|200.0|3|eva
+
+> SELECT * FROM facturas f INNER JOIN clientes f ON 1 = 1;
+error alias de tabla duplicado
+
+> SELECT * FROM facturas f INNER JOIN nada n ON f.id = n.id;
+error tabla desconocida

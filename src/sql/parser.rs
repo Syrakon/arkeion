@@ -1,0 +1,779 @@
+//! Parser descendente recursivo (docs/04-sql.md). El propio código es la
+//! gramática; los errores llevan la posición en bytes del token conflictivo.
+//!
+//! ```text
+//! expr := or          or  := and (OR and)*        and := not (AND not)*
+//! not  := [NOT] cmp   cmp := add ((=|!=|<|<=|>|>=) add | IS [NOT] NULL | [NOT] LIKE add)?
+//! add  := mul ((+|-) mul)*                        mul := unary ((*|/|%) unary)*
+//! unary := [-] primary
+//! primary := literal | columna | tabla.columna | agregado(expr|*) | ?N | ( expr )
+//! ```
+
+use crate::catalog::ColType;
+use crate::error::{Error, Result};
+use crate::record::Value;
+use crate::sql::ast::*;
+use crate::sql::lexer::{Kw, Spanned, Tok, lex};
+
+pub fn parse(sql: &str) -> Result<Stmt> {
+    let toks = lex(sql)?;
+    let mut p = Parser {
+        toks,
+        i: 0,
+        end: sql.len(),
+    };
+    let stmt = p.statement()?;
+    p.eat(&Tok::Semi);
+    if let Some(s) = p.peek_spanned() {
+        return Err(err_at(s.pos, "se esperaba el final de la sentencia"));
+    }
+    Ok(stmt)
+}
+
+fn err_at(pos: usize, msg: impl Into<String>) -> Error {
+    Error::Sql {
+        msg: msg.into(),
+        pos: Some(pos),
+    }
+}
+
+struct Parser {
+    toks: Vec<Spanned>,
+    i: usize,
+    end: usize,
+}
+
+impl Parser {
+    fn peek_spanned(&self) -> Option<&Spanned> {
+        self.toks.get(self.i)
+    }
+
+    fn peek(&self) -> Option<&Tok> {
+        self.peek_spanned().map(|s| &s.tok)
+    }
+
+    fn peek2(&self) -> Option<&Tok> {
+        self.toks.get(self.i + 1).map(|s| &s.tok)
+    }
+
+    fn pos(&self) -> usize {
+        self.peek_spanned().map_or(self.end, |s| s.pos)
+    }
+
+    fn next(&mut self) -> Option<Tok> {
+        let t = self.toks.get(self.i).map(|s| s.tok.clone());
+        if t.is_some() {
+            self.i += 1;
+        }
+        t
+    }
+
+    fn eat(&mut self, t: &Tok) -> bool {
+        if self.peek() == Some(t) {
+            self.i += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn eat_kw(&mut self, k: Kw) -> bool {
+        self.eat(&Tok::Kw(k))
+    }
+
+    fn expect(&mut self, t: &Tok, what: &str) -> Result<()> {
+        if self.eat(t) {
+            Ok(())
+        } else {
+            Err(err_at(self.pos(), format!("se esperaba {what}")))
+        }
+    }
+
+    fn expect_kw(&mut self, k: Kw, what: &str) -> Result<()> {
+        self.expect(&Tok::Kw(k), what)
+    }
+
+    fn ident(&mut self, what: &str) -> Result<String> {
+        match self.peek() {
+            Some(Tok::Ident(_)) => match self.next() {
+                Some(Tok::Ident(s)) => Ok(s),
+                _ => unreachable!("peek garantiza Ident"),
+            },
+            _ => Err(err_at(self.pos(), format!("se esperaba {what}"))),
+        }
+    }
+
+    // --- sentencias ---
+
+    fn statement(&mut self) -> Result<Stmt> {
+        match self.peek() {
+            Some(Tok::Kw(Kw::Create)) => self.create_table(),
+            Some(Tok::Kw(Kw::Drop)) => self.drop_table(),
+            Some(Tok::Kw(Kw::Insert)) => self.insert(),
+            Some(Tok::Kw(Kw::Select)) => Ok(Stmt::Select(self.select()?)),
+            Some(Tok::Kw(Kw::Update)) => self.update(),
+            Some(Tok::Kw(Kw::Delete)) => self.delete(),
+            Some(Tok::Kw(Kw::Begin)) => {
+                self.i += 1;
+                Ok(Stmt::Begin)
+            }
+            Some(Tok::Kw(Kw::Commit)) => {
+                self.i += 1;
+                Ok(Stmt::Commit)
+            }
+            Some(Tok::Kw(Kw::Rollback)) => {
+                self.i += 1;
+                Ok(Stmt::Rollback)
+            }
+            _ => Err(err_at(
+                self.pos(),
+                "se esperaba CREATE, DROP, INSERT, SELECT, UPDATE, DELETE, BEGIN, COMMIT o ROLLBACK",
+            )),
+        }
+    }
+
+    fn create_table(&mut self) -> Result<Stmt> {
+        self.expect_kw(Kw::Create, "CREATE")?;
+        self.expect_kw(Kw::Table, "TABLE")?;
+        let if_not_exists = if self.eat_kw(Kw::If) {
+            self.expect_kw(Kw::Not, "NOT")?;
+            self.expect_kw(Kw::Exists, "EXISTS")?;
+            true
+        } else {
+            false
+        };
+        let name = self.ident("un nombre de tabla")?;
+        self.expect(&Tok::LParen, "'('")?;
+        let mut columns = Vec::new();
+        loop {
+            columns.push(self.column_def()?);
+            if !self.eat(&Tok::Comma) {
+                break;
+            }
+        }
+        self.expect(&Tok::RParen, "')'")?;
+        Ok(Stmt::CreateTable {
+            if_not_exists,
+            name,
+            columns,
+        })
+    }
+
+    fn column_def(&mut self) -> Result<ColumnAst> {
+        let name = self.ident("un nombre de columna")?;
+        let col_type = match self.next() {
+            Some(Tok::Kw(Kw::Integer)) => ColType::Integer,
+            Some(Tok::Kw(Kw::Real)) => ColType::Real,
+            Some(Tok::Kw(Kw::Text)) => ColType::Text,
+            Some(Tok::Kw(Kw::Blob)) => ColType::Blob,
+            Some(Tok::Kw(Kw::Boolean)) => ColType::Boolean,
+            _ => {
+                return Err(err_at(
+                    self.pos(),
+                    "se esperaba un tipo: INTEGER, REAL, TEXT, BLOB o BOOLEAN",
+                ));
+            }
+        };
+        let mut col = ColumnAst {
+            name,
+            col_type,
+            not_null: false,
+            primary_key: false,
+            default: None,
+        };
+        loop {
+            if self.eat_kw(Kw::Primary) {
+                self.expect_kw(Kw::Key, "KEY")?;
+                col.primary_key = true;
+            } else if self.eat_kw(Kw::Not) {
+                self.expect_kw(Kw::Null, "NULL")?;
+                col.not_null = true;
+            } else if self.eat_kw(Kw::Default) {
+                col.default = Some(self.expr()?);
+            } else {
+                return Ok(col);
+            }
+        }
+    }
+
+    fn drop_table(&mut self) -> Result<Stmt> {
+        self.expect_kw(Kw::Drop, "DROP")?;
+        self.expect_kw(Kw::Table, "TABLE")?;
+        let if_exists = if self.eat_kw(Kw::If) {
+            self.expect_kw(Kw::Exists, "EXISTS")?;
+            true
+        } else {
+            false
+        };
+        Ok(Stmt::DropTable {
+            if_exists,
+            name: self.ident("un nombre de tabla")?,
+        })
+    }
+
+    fn insert(&mut self) -> Result<Stmt> {
+        self.expect_kw(Kw::Insert, "INSERT")?;
+        self.expect_kw(Kw::Into, "INTO")?;
+        let table = self.ident("un nombre de tabla")?;
+        let columns = if self.eat(&Tok::LParen) {
+            let mut cols = vec![self.ident("un nombre de columna")?];
+            while self.eat(&Tok::Comma) {
+                cols.push(self.ident("un nombre de columna")?);
+            }
+            self.expect(&Tok::RParen, "')'")?;
+            Some(cols)
+        } else {
+            None
+        };
+        self.expect_kw(Kw::Values, "VALUES")?;
+        let mut rows = Vec::new();
+        loop {
+            self.expect(&Tok::LParen, "'('")?;
+            let mut row = vec![self.expr()?];
+            while self.eat(&Tok::Comma) {
+                row.push(self.expr()?);
+            }
+            self.expect(&Tok::RParen, "')'")?;
+            rows.push(row);
+            if !self.eat(&Tok::Comma) {
+                break;
+            }
+        }
+        Ok(Stmt::Insert {
+            table,
+            columns,
+            rows,
+        })
+    }
+
+    fn update(&mut self) -> Result<Stmt> {
+        self.expect_kw(Kw::Update, "UPDATE")?;
+        let table = self.ident("un nombre de tabla")?;
+        self.expect_kw(Kw::Set, "SET")?;
+        let mut sets = Vec::new();
+        loop {
+            let col = self.ident("un nombre de columna")?;
+            self.expect(&Tok::Eq, "'='")?;
+            sets.push((col, self.expr()?));
+            if !self.eat(&Tok::Comma) {
+                break;
+            }
+        }
+        let where_clause = if self.eat_kw(Kw::Where) {
+            Some(self.expr()?)
+        } else {
+            None
+        };
+        Ok(Stmt::Update {
+            table,
+            sets,
+            where_clause,
+        })
+    }
+
+    fn delete(&mut self) -> Result<Stmt> {
+        self.expect_kw(Kw::Delete, "DELETE")?;
+        self.expect_kw(Kw::From, "FROM")?;
+        let table = self.ident("un nombre de tabla")?;
+        let where_clause = if self.eat_kw(Kw::Where) {
+            Some(self.expr()?)
+        } else {
+            None
+        };
+        Ok(Stmt::Delete {
+            table,
+            where_clause,
+        })
+    }
+
+    fn select(&mut self) -> Result<SelectStmt> {
+        self.expect_kw(Kw::Select, "SELECT")?;
+        let mut projection = vec![self.select_item()?];
+        while self.eat(&Tok::Comma) {
+            projection.push(self.select_item()?);
+        }
+        self.expect_kw(Kw::From, "FROM")?;
+        let from = self.table_ref()?;
+        let mut joins = Vec::new();
+        loop {
+            let kind = if self.eat_kw(Kw::Inner) {
+                self.expect_kw(Kw::Join, "JOIN")?;
+                JoinKind::Inner
+            } else if self.eat_kw(Kw::Left) {
+                self.expect_kw(Kw::Join, "JOIN")?;
+                JoinKind::Left
+            } else if self.eat_kw(Kw::Join) {
+                JoinKind::Inner
+            } else {
+                break;
+            };
+            let table = self.table_ref()?;
+            self.expect_kw(Kw::On, "ON")?;
+            let on = self.expr()?;
+            joins.push(Join { kind, table, on });
+        }
+        let where_clause = if self.eat_kw(Kw::Where) {
+            Some(self.expr()?)
+        } else {
+            None
+        };
+        let mut order_by = Vec::new();
+        if self.eat_kw(Kw::Order) {
+            self.expect_kw(Kw::By, "BY")?;
+            loop {
+                let first = self.ident("un nombre de columna")?;
+                let (table, column) = if self.eat(&Tok::Dot) {
+                    (Some(first), self.ident("un nombre de columna")?)
+                } else {
+                    (None, first)
+                };
+                let desc = self.eat_kw(Kw::Desc);
+                if !desc {
+                    let _ = self.eat_kw(Kw::Asc); // ASC es el valor por defecto
+                }
+                order_by.push(OrderBy {
+                    table,
+                    column,
+                    desc,
+                });
+                if !self.eat(&Tok::Comma) {
+                    break;
+                }
+            }
+        }
+        let limit = if self.eat_kw(Kw::Limit) {
+            Some(self.expr()?)
+        } else {
+            None
+        };
+        let offset = if self.eat_kw(Kw::Offset) {
+            Some(self.expr()?)
+        } else {
+            None
+        };
+        Ok(SelectStmt {
+            projection,
+            from,
+            joins,
+            where_clause,
+            order_by,
+            limit,
+            offset,
+        })
+    }
+
+    fn table_ref(&mut self) -> Result<TableRef> {
+        let name = self.ident("un nombre de tabla")?;
+        // `AS` exige el alias; un identificador suelto también lo es.
+        let alias = if self.eat_kw(Kw::As) || matches!(self.peek(), Some(Tok::Ident(_))) {
+            Some(self.ident("un alias de tabla")?)
+        } else {
+            None
+        };
+        Ok(TableRef { name, alias })
+    }
+
+    fn select_item(&mut self) -> Result<SelectItem> {
+        if self.eat(&Tok::Star) {
+            return Ok(SelectItem::Star);
+        }
+        Ok(SelectItem::Expr(self.expr()?))
+    }
+
+    // --- expresiones ---
+
+    fn expr(&mut self) -> Result<Expr> {
+        self.or_expr()
+    }
+
+    fn or_expr(&mut self) -> Result<Expr> {
+        let mut left = self.and_expr()?;
+        while self.eat_kw(Kw::Or) {
+            let right = self.and_expr()?;
+            left = Expr::Binary(Box::new(left), BinOp::Or, Box::new(right));
+        }
+        Ok(left)
+    }
+
+    fn and_expr(&mut self) -> Result<Expr> {
+        let mut left = self.not_expr()?;
+        while self.eat_kw(Kw::And) {
+            let right = self.not_expr()?;
+            left = Expr::Binary(Box::new(left), BinOp::And, Box::new(right));
+        }
+        Ok(left)
+    }
+
+    fn not_expr(&mut self) -> Result<Expr> {
+        if self.eat_kw(Kw::Not) {
+            return Ok(Expr::Unary(UnOp::Not, Box::new(self.not_expr()?)));
+        }
+        self.cmp_expr()
+    }
+
+    fn cmp_expr(&mut self) -> Result<Expr> {
+        let left = self.add_expr()?;
+        // IS [NOT] NULL
+        if self.eat_kw(Kw::Is) {
+            let negated = self.eat_kw(Kw::Not);
+            self.expect_kw(Kw::Null, "NULL")?;
+            return Ok(Expr::IsNull {
+                expr: Box::new(left),
+                negated,
+            });
+        }
+        // [NOT] LIKE
+        if self.peek() == Some(&Tok::Kw(Kw::Not)) && self.peek2() == Some(&Tok::Kw(Kw::Like)) {
+            self.i += 2;
+            let pattern = self.add_expr()?;
+            return Ok(Expr::Like {
+                expr: Box::new(left),
+                pattern: Box::new(pattern),
+                negated: true,
+            });
+        }
+        if self.eat_kw(Kw::Like) {
+            let pattern = self.add_expr()?;
+            return Ok(Expr::Like {
+                expr: Box::new(left),
+                pattern: Box::new(pattern),
+                negated: false,
+            });
+        }
+        let op = match self.peek() {
+            Some(Tok::Eq) => BinOp::Eq,
+            Some(Tok::Ne) => BinOp::Ne,
+            Some(Tok::Lt) => BinOp::Lt,
+            Some(Tok::Le) => BinOp::Le,
+            Some(Tok::Gt) => BinOp::Gt,
+            Some(Tok::Ge) => BinOp::Ge,
+            _ => return Ok(left),
+        };
+        self.i += 1;
+        let right = self.add_expr()?;
+        Ok(Expr::Binary(Box::new(left), op, Box::new(right)))
+    }
+
+    fn add_expr(&mut self) -> Result<Expr> {
+        let mut left = self.mul_expr()?;
+        loop {
+            let op = match self.peek() {
+                Some(Tok::Plus) => BinOp::Add,
+                Some(Tok::Minus) => BinOp::Sub,
+                _ => return Ok(left),
+            };
+            self.i += 1;
+            let right = self.mul_expr()?;
+            left = Expr::Binary(Box::new(left), op, Box::new(right));
+        }
+    }
+
+    fn mul_expr(&mut self) -> Result<Expr> {
+        let mut left = self.unary_expr()?;
+        loop {
+            let op = match self.peek() {
+                Some(Tok::Star) => BinOp::Mul,
+                Some(Tok::Slash) => BinOp::Div,
+                Some(Tok::Percent) => BinOp::Mod,
+                _ => return Ok(left),
+            };
+            self.i += 1;
+            let right = self.unary_expr()?;
+            left = Expr::Binary(Box::new(left), op, Box::new(right));
+        }
+    }
+
+    fn unary_expr(&mut self) -> Result<Expr> {
+        if self.eat(&Tok::Minus) {
+            return Ok(Expr::Unary(UnOp::Neg, Box::new(self.unary_expr()?)));
+        }
+        self.primary()
+    }
+
+    fn primary(&mut self) -> Result<Expr> {
+        let pos = self.pos();
+        match self.next() {
+            Some(Tok::Int(n)) => Ok(Expr::Literal(Value::Integer(n))),
+            Some(Tok::Float(f)) => Ok(Expr::Literal(Value::Real(f))),
+            Some(Tok::Str(s)) => Ok(Expr::Literal(Value::Text(s))),
+            Some(Tok::Blob(b)) => Ok(Expr::Literal(Value::Blob(b))),
+            Some(Tok::Kw(Kw::Null)) => Ok(Expr::Literal(Value::Null)),
+            Some(Tok::Kw(Kw::True)) => Ok(Expr::Literal(Value::Bool(true))),
+            Some(Tok::Kw(Kw::False)) => Ok(Expr::Literal(Value::Bool(false))),
+            Some(Tok::Param(n)) => Ok(Expr::Param(n)),
+            Some(Tok::Ident(name)) => {
+                // tabla.columna
+                if self.eat(&Tok::Dot) {
+                    let col = self.ident("un nombre de columna")?;
+                    return Ok(Expr::Column {
+                        table: Some(name),
+                        name: col,
+                    });
+                }
+                // agregado(expr | *)
+                if self.eat(&Tok::LParen) {
+                    let func = match name.to_ascii_uppercase().as_str() {
+                        "COUNT" => AggFunc::Count,
+                        "SUM" => AggFunc::Sum,
+                        "AVG" => AggFunc::Avg,
+                        "MIN" => AggFunc::Min,
+                        "MAX" => AggFunc::Max,
+                        _ => return Err(err_at(pos, format!("función desconocida: {name}"))),
+                    };
+                    let arg = if self.eat(&Tok::Star) {
+                        if func != AggFunc::Count {
+                            return Err(err_at(pos, "solo COUNT admite '*'"));
+                        }
+                        None
+                    } else {
+                        Some(Box::new(self.expr()?))
+                    };
+                    self.expect(&Tok::RParen, "')'")?;
+                    return Ok(Expr::Aggregate { func, arg });
+                }
+                Ok(Expr::Column { table: None, name })
+            }
+            Some(Tok::LParen) => {
+                let e = self.expr()?;
+                self.expect(&Tok::RParen, "')'")?;
+                Ok(e)
+            }
+            _ => Err(err_at(pos, "se esperaba una expresión")),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn col(name: &str) -> Expr {
+        Expr::Column {
+            table: None,
+            name: name.into(),
+        }
+    }
+
+    #[test]
+    fn select_full_shape() {
+        let stmt = parse(
+            "SELECT id, total * 2 FROM facturas WHERE estado = 'x' AND total > ?1 \
+             ORDER BY total DESC, id LIMIT 10 OFFSET 5;",
+        )
+        .unwrap();
+        let Stmt::Select(s) = stmt else {
+            panic!("se esperaba SELECT")
+        };
+        assert_eq!(s.projection.len(), 2);
+        assert_eq!(
+            s.from,
+            TableRef {
+                name: "facturas".into(),
+                alias: None
+            }
+        );
+        assert!(s.joins.is_empty());
+        assert!(s.where_clause.is_some());
+        assert_eq!(
+            s.order_by,
+            vec![
+                OrderBy {
+                    table: None,
+                    column: "total".into(),
+                    desc: true
+                },
+                OrderBy {
+                    table: None,
+                    column: "id".into(),
+                    desc: false
+                },
+            ]
+        );
+        assert_eq!(s.limit, Some(Expr::Literal(Value::Integer(10))));
+        assert_eq!(s.offset, Some(Expr::Literal(Value::Integer(5))));
+    }
+
+    #[test]
+    fn joins_aliases_and_qualified_columns() {
+        let Stmt::Select(s) = parse(
+            "SELECT c.nombre, f.total FROM facturas f \
+             LEFT JOIN clientes AS c ON f.cliente_id = c.id \
+             ORDER BY c.id",
+        )
+        .unwrap() else {
+            panic!()
+        };
+        assert_eq!(
+            s.from,
+            TableRef {
+                name: "facturas".into(),
+                alias: Some("f".into())
+            }
+        );
+        assert_eq!(s.joins.len(), 1);
+        let j = &s.joins[0];
+        assert_eq!(j.kind, JoinKind::Left);
+        assert_eq!(
+            j.table,
+            TableRef {
+                name: "clientes".into(),
+                alias: Some("c".into())
+            }
+        );
+        assert!(matches!(
+            &s.projection[0],
+            SelectItem::Expr(Expr::Column { table: Some(t), name }) if t == "c" && name == "nombre"
+        ));
+        assert_eq!(s.order_by[0].table.as_deref(), Some("c"));
+    }
+
+    #[test]
+    fn update_delete_and_tx_statements() {
+        let stmt = parse("UPDATE t SET a = a + 1, b = 'x' WHERE id = 7").unwrap();
+        let Stmt::Update {
+            table,
+            sets,
+            where_clause,
+        } = stmt
+        else {
+            panic!()
+        };
+        assert_eq!(table, "t");
+        assert_eq!(sets.len(), 2);
+        assert_eq!(sets[1].0, "b");
+        assert!(where_clause.is_some());
+
+        let stmt = parse("DELETE FROM t WHERE a IS NULL").unwrap();
+        assert!(matches!(stmt, Stmt::Delete { ref table, where_clause: Some(_) } if table == "t"));
+        assert!(matches!(
+            parse("DELETE FROM t").unwrap(),
+            Stmt::Delete {
+                where_clause: None,
+                ..
+            }
+        ));
+
+        assert_eq!(parse("BEGIN;").unwrap(), Stmt::Begin);
+        assert_eq!(parse("COMMIT").unwrap(), Stmt::Commit);
+        assert_eq!(parse("ROLLBACK").unwrap(), Stmt::Rollback);
+    }
+
+    #[test]
+    fn aggregates() {
+        let Stmt::Select(s) = parse("SELECT COUNT(*), SUM(total), AVG(total + 1) FROM t").unwrap()
+        else {
+            panic!()
+        };
+        assert!(matches!(
+            &s.projection[0],
+            SelectItem::Expr(Expr::Aggregate {
+                func: AggFunc::Count,
+                arg: None
+            })
+        ));
+        assert!(matches!(
+            &s.projection[1],
+            SelectItem::Expr(Expr::Aggregate {
+                func: AggFunc::Sum,
+                arg: Some(_)
+            })
+        ));
+        assert!(parse("SELECT NOPE(1) FROM t").is_err());
+        assert!(parse("SELECT SUM(*) FROM t").is_err());
+    }
+
+    #[test]
+    fn precedence_or_and_cmp_arith() {
+        // a = 1 OR b = 2 AND c = 3  ⇒  a=1 OR ((b=2) AND (c=3))
+        let Stmt::Select(s) = parse("SELECT * FROM t WHERE a = 1 OR b = 2 AND c = 3").unwrap()
+        else {
+            panic!()
+        };
+        let Some(Expr::Binary(_, BinOp::Or, right)) = s.where_clause else {
+            panic!("OR debe ser la raíz")
+        };
+        assert!(matches!(*right, Expr::Binary(_, BinOp::And, _)));
+
+        // 1 + 2 * 3  ⇒  1 + (2*3)
+        let Stmt::Select(s) = parse("SELECT 1 + 2 * 3 FROM t").unwrap() else {
+            panic!()
+        };
+        let SelectItem::Expr(Expr::Binary(_, BinOp::Add, right)) = &s.projection[0] else {
+            panic!("+ debe ser la raíz")
+        };
+        assert!(matches!(**right, Expr::Binary(_, BinOp::Mul, _)));
+    }
+
+    #[test]
+    fn create_table_with_constraints() {
+        let stmt = parse(
+            "CREATE TABLE IF NOT EXISTS t (id INTEGER PRIMARY KEY, \
+             estado TEXT NOT NULL DEFAULT 'borrador', total REAL)",
+        )
+        .unwrap();
+        let Stmt::CreateTable {
+            if_not_exists,
+            name,
+            columns,
+        } = stmt
+        else {
+            panic!()
+        };
+        assert!(if_not_exists);
+        assert_eq!(name, "t");
+        assert!(columns[0].primary_key);
+        assert!(columns[1].not_null);
+        assert_eq!(
+            columns[1].default,
+            Some(Expr::Literal(Value::Text("borrador".into())))
+        );
+        assert_eq!(columns[2].col_type, ColType::Real);
+    }
+
+    #[test]
+    fn insert_multi_row_and_named_columns() {
+        let stmt = parse("INSERT INTO t (a, b) VALUES (1, 'x'), (?1, NULL)").unwrap();
+        let Stmt::Insert { columns, rows, .. } = stmt else {
+            panic!()
+        };
+        assert_eq!(columns, Some(vec!["a".into(), "b".into()]));
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1][0], Expr::Param(1));
+    }
+
+    #[test]
+    fn is_null_and_not_like() {
+        let Stmt::Select(s) =
+            parse("SELECT * FROM t WHERE a IS NOT NULL AND b NOT LIKE 'x%'").unwrap()
+        else {
+            panic!()
+        };
+        let Some(Expr::Binary(left, BinOp::And, right)) = s.where_clause else {
+            panic!()
+        };
+        assert!(matches!(*left, Expr::IsNull { negated: true, .. }));
+        assert!(matches!(*right, Expr::Like { negated: true, .. }));
+        // Sin ambigüedad con el alias de tabla: `t.a`.
+        let _ = col("sin_uso");
+    }
+
+    #[test]
+    fn syntax_errors_have_positions() {
+        match parse("SELEC 1 FROM t") {
+            Err(Error::Sql { pos: Some(0), .. }) => {}
+            other => panic!("se esperaba error en byte 0, llegó {other:?}"),
+        }
+        match parse("SELECT a FROM t WHERE") {
+            Err(Error::Sql { pos: Some(p), .. }) => assert_eq!(p, 21),
+            other => panic!("se esperaba error con posición, llegó {other:?}"),
+        }
+        match parse("SELECT a FROM t; extra") {
+            Err(Error::Sql { pos: Some(17), .. }) => {}
+            other => panic!("se esperaba error en byte 17, llegó {other:?}"),
+        }
+        match parse("UPDATE t SET = 1") {
+            Err(Error::Sql { pos: Some(13), .. }) => {}
+            other => panic!("se esperaba error en byte 13, llegó {other:?}"),
+        }
+    }
+}

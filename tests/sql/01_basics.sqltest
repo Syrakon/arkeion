@@ -1,0 +1,44 @@
+-- CRUD básico: DDL, INSERT (posicional, nombrado, multi-fila), proyección y WHERE.
+
+> CREATE TABLE facturas (id INTEGER PRIMARY KEY, total REAL, estado TEXT NOT NULL DEFAULT 'borrador', pagada BOOLEAN);
+ok
+
+> INSERT INTO facturas (total) VALUES (100.5);
+affected 1
+
+> INSERT INTO facturas (total, estado, pagada) VALUES (200, 'emitida', TRUE), (300.25, 'emitida', FALSE);
+affected 2
+
+> SELECT * FROM facturas;
+1|100.5|borrador|NULL
+2|200.0|emitida|TRUE
+3|300.25|emitida|FALSE
+
+> SELECT id, total * 2 FROM facturas WHERE estado = 'emitida';
+2|400.0
+3|600.5
+
+> SELECT id FROM facturas WHERE pagada IS NULL;
+1
+
+> SELECT id FROM facturas WHERE pagada IS NOT NULL AND NOT pagada;
+3
+
+-- Point lookup por la PRIMARY KEY (alias del rowid).
+> SELECT estado FROM facturas WHERE id = 2;
+emitida
+
+> SELECT id FROM facturas WHERE id = 99;
+empty
+
+> CREATE TABLE IF NOT EXISTS facturas (x INTEGER);
+ok
+
+> CREATE TABLE facturas (x INTEGER);
+error la tabla ya existe
+
+> DROP TABLE IF EXISTS inexistente;
+ok
+
+> DROP TABLE inexistente;
+error tabla desconocida

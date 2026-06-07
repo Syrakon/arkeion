@@ -1,0 +1,49 @@
+-- Tipos en los límites, LIKE, aritmética, y errores: de tipo, semánticos y
+-- de sintaxis (estos últimos siempre con posición en bytes).
+
+> CREATE TABLE t (a INTEGER, b TEXT, c BLOB, d BOOLEAN);
+ok
+
+> INSERT INTO t VALUES (-5, 'ho''la', x'CAFE', FALSE);
+affected 1
+
+> SELECT a, b, c, d FROM t;
+-5|ho'la|x'cafe'|FALSE
+
+> SELECT a FROM t WHERE b LIKE 'ho%';
+-5
+
+> SELECT a FROM t WHERE b LIKE '__''la';
+-5
+
+> SELECT a FROM t WHERE b NOT LIKE 'ho%';
+empty
+
+> SELECT a + 1, a - 1, a * -2, a % 2, (a + 15) / 2 FROM t;
+-4|-6|10|-1|5
+
+-- La comparación entre tipos distintos es un error, no una coerción.
+> SELECT a FROM t WHERE a = 'x';
+error tipos incomparables
+
+> INSERT INTO t (a) VALUES ('texto');
+error tipo de valor incompatible
+
+> SELECT a FROM t WHERE a / 0 > 1;
+error división por cero
+
+> SELECT nope FROM t;
+error columna desconocida
+
+> SELECT a FROM nada;
+error tabla desconocida
+
+-- Errores de sintaxis con posición exacta (offset en bytes).
+> SELEC a FROM t;
+error byte 0
+
+> SELECT a FROM t WHERE;
+error byte 21
+
+> SELECT a FROM t ORDER 2;
+error byte 22

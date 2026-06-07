@@ -1,0 +1,40 @@
+-- ORDER BY (con NULLs primero), DESC, claves múltiples, LIMIT y OFFSET.
+
+> CREATE TABLE n (v INTEGER, t TEXT);
+ok
+
+> INSERT INTO n VALUES (3, 'c'), (1, 'a'), (2, 'b'), (NULL, 'z'), (2, 'a');
+affected 5
+
+> SELECT v FROM n ORDER BY v;
+NULL
+1
+2
+2
+3
+
+> SELECT v, t FROM n ORDER BY v DESC LIMIT 2;
+3|c
+2|b
+
+> SELECT v, t FROM n ORDER BY v, t DESC;
+NULL|z
+1|a
+2|b
+2|a
+3|c
+
+> SELECT t FROM n ORDER BY v LIMIT 2 OFFSET 1;
+a
+b
+
+> SELECT t FROM n WHERE v >= 2 ORDER BY t DESC, v;
+c
+b
+a
+
+> SELECT v FROM n ORDER BY v LIMIT 0;
+empty
+
+> SELECT v FROM n ORDER BY v LIMIT -1;
+error LIMIT debe ser un entero no negativo

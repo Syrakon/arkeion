@@ -1,0 +1,624 @@
+//! B-tree copy-on-write direccionado por `PageId`.
+//!
+//! Los nodos nunca se enlazan por referencia: leer un nodo = pedir su body a
+//! un `NodeSource`; «mutar» = copiarlo a una página sucia de la transacción
+//! (`NodeStore::make_dirty`) y reescribir el camino hoja→raíz. No hay grafo
+//! de referencias mutables que pelee con el borrow checker (R1).
+//!
+//! Simplificación deliberada de v1: `delete` no rebalancea nodos infrallenos,
+//! solo elimina nodos vacíos (los reequilibra `vacuum` al compactar, M9).
+
+pub mod node;
+
+use std::collections::VecDeque;
+use std::sync::Arc;
+
+use crate::error::{Error, Result};
+use crate::format::{PageBuf, PageId};
+use node::{InnerCell, LeafCell, Payload};
+
+/// Sentinela de árbol vacío (la página 0 es la cabecera del archivo: inequívoco).
+pub const NO_ROOT: PageId = PageId(0);
+
+/// Body de una página, venga de la caché compartida o del estado de una tx.
+pub enum Body<'a> {
+    Shared(Arc<PageBuf>),
+    Local(&'a [u8]),
+}
+
+impl Body<'_> {
+    pub fn bytes(&self) -> &[u8] {
+        match self {
+            Body::Shared(p) => p.body(),
+            Body::Local(b) => b,
+        }
+    }
+}
+
+/// Lectura de páginas (snapshot o transacción de escritura).
+pub trait NodeSource {
+    fn body(&self, id: PageId) -> Result<Body<'_>>;
+}
+
+/// Escritura CoW de páginas (solo la transacción de escritura).
+pub trait NodeStore: NodeSource {
+    /// Página sucia nueva, zeroed.
+    fn alloc(&mut self) -> Result<PageId>;
+    /// CoW: si `id` ya es sucia la devuelve; si es durable, copia su contenido
+    /// a una página sucia nueva y devuelve el nuevo id.
+    fn make_dirty(&mut self, id: PageId) -> Result<PageId>;
+    /// Body mutable de una página sucia.
+    fn body_mut(&mut self, id: PageId) -> &mut [u8];
+    /// Libera una página sucia (reutilizable en esta tx). No-op si es durable:
+    /// las páginas durables son historia, no se liberan (D1).
+    fn free(&mut self, id: PageId);
+    fn is_dirty(&self, id: PageId) -> bool;
+}
+
+// --- lectura ---
+
+pub fn get<S: NodeSource>(src: &S, root: PageId, key: &[u8]) -> Result<Option<Vec<u8>>> {
+    if root == NO_ROOT {
+        return Ok(None);
+    }
+    let mut id = root;
+    loop {
+        let body = src.body(id)?;
+        match node::node_type(body.bytes()) {
+            node::TYPE_INNER => {
+                let (cells, rightmost) = node::parse_inner(id.0, body.bytes())?;
+                let idx = cells.partition_point(|c| c.key.as_slice() <= key);
+                let child = if idx < cells.len() {
+                    cells[idx].child
+                } else {
+                    rightmost
+                };
+                drop(body);
+                id = child;
+            }
+            node::TYPE_LEAF => {
+                let cells = node::parse_leaf(id.0, body.bytes())?;
+                drop(body);
+                let Ok(idx) = cells.binary_search_by(|c| c.key.as_slice().cmp(key)) else {
+                    return Ok(None);
+                };
+                return Ok(Some(read_value(src, &cells[idx].payload)?));
+            }
+            _ => {
+                return Err(Error::Corrupt {
+                    page: id.0,
+                    reason: "tipo de nodo inesperado",
+                });
+            }
+        }
+    }
+}
+
+fn read_value<S: NodeSource>(src: &S, payload: &Payload) -> Result<Vec<u8>> {
+    match payload {
+        Payload::Inline(v) => Ok(v.clone()),
+        Payload::Overflow { total_len, first } => {
+            let mut out = Vec::with_capacity(*total_len as usize);
+            let mut id = *first;
+            while id != NO_ROOT {
+                let body = src.body(id)?;
+                let (chunk, next) = node::parse_overflow(id.0, body.bytes())?;
+                out.extend_from_slice(chunk);
+                drop(body);
+                id = next;
+            }
+            if out.len() as u64 != *total_len {
+                return Err(Error::Corrupt {
+                    page: first.0,
+                    reason: "cadena overflow incompleta",
+                });
+            }
+            Ok(out)
+        }
+    }
+}
+
+// --- escritura ---
+
+struct InsertOutcome {
+    /// Id del nodo tras la operación (puede haber cambiado por CoW).
+    id: PageId,
+    /// Split: (separador, nodo derecho). El separador es la cota inferior
+    /// inclusiva del derecho.
+    split: Option<(Vec<u8>, PageId)>,
+}
+
+pub fn insert<S: NodeStore>(s: &mut S, root: PageId, key: &[u8], value: &[u8]) -> Result<PageId> {
+    if key.is_empty() || key.len() > node::MAX_KEY_LEN {
+        return Err(Error::InvalidInput("clave vacía o de más de 1024 bytes"));
+    }
+    let payload = if node::inline_cell_size(key, value.len()) <= node::MAX_INLINE_CELL {
+        Payload::Inline(value.to_vec())
+    } else {
+        Payload::Overflow {
+            total_len: value.len() as u64,
+            first: write_chain(s, value)?,
+        }
+    };
+
+    if root == NO_ROOT {
+        let id = s.alloc()?;
+        let cells = [LeafCell {
+            key: key.to_vec(),
+            payload,
+        }];
+        let ok = node::encode_leaf(&cells, s.body_mut(id));
+        debug_assert!(ok, "una celda siempre cabe en una hoja vacía");
+        return Ok(id);
+    }
+
+    let out = insert_rec(s, root, key, payload)?;
+    match out.split {
+        None => Ok(out.id),
+        Some((sep, right)) => {
+            let new_root = s.alloc()?;
+            let cells = [InnerCell {
+                key: sep,
+                child: out.id,
+            }];
+            let ok = node::encode_inner(&cells, right, s.body_mut(new_root));
+            debug_assert!(ok, "una raíz con una celda siempre cabe");
+            Ok(new_root)
+        }
+    }
+}
+
+fn insert_rec<S: NodeStore>(
+    s: &mut S,
+    id: PageId,
+    key: &[u8],
+    payload: Payload,
+) -> Result<InsertOutcome> {
+    let body = s.body(id)?;
+    match node::node_type(body.bytes()) {
+        node::TYPE_LEAF => {
+            let mut cells = node::parse_leaf(id.0, body.bytes())?;
+            drop(body);
+            match cells.binary_search_by(|c| c.key.as_slice().cmp(key)) {
+                Ok(i) => {
+                    free_payload(s, &cells[i].payload);
+                    cells[i].payload = payload;
+                }
+                Err(i) => cells.insert(
+                    i,
+                    LeafCell {
+                        key: key.to_vec(),
+                        payload,
+                    },
+                ),
+            }
+            let id = s.make_dirty(id)?;
+            if node::encode_leaf(&cells, s.body_mut(id)) {
+                return Ok(InsertOutcome { id, split: None });
+            }
+            // Split de hoja: el separador es la primera clave de la derecha.
+            let sp = node::split_point(&cells, node::leaf_cell_size);
+            let right_cells = cells.split_off(sp);
+            let sep = right_cells[0].key.clone();
+            let right = s.alloc()?;
+            let ok = node::encode_leaf(&right_cells, s.body_mut(right))
+                && node::encode_leaf(&cells, s.body_mut(id));
+            debug_assert!(ok, "cada mitad de un split cabe por construcción");
+            Ok(InsertOutcome {
+                id,
+                split: Some((sep, right)),
+            })
+        }
+        node::TYPE_INNER => {
+            let (mut cells, mut rightmost) = node::parse_inner(id.0, body.bytes())?;
+            drop(body);
+            let idx = cells.partition_point(|c| c.key.as_slice() <= key);
+            let child = if idx < cells.len() {
+                cells[idx].child
+            } else {
+                rightmost
+            };
+            let out = insert_rec(s, child, key, payload)?;
+
+            if idx < cells.len() {
+                cells[idx].child = out.id;
+            } else {
+                rightmost = out.id;
+            }
+            if let Some((sep, right)) = out.split {
+                // out.id cubre < sep; right cubre [sep, cota original del slot).
+                cells.insert(
+                    idx,
+                    InnerCell {
+                        key: sep,
+                        child: out.id,
+                    },
+                );
+                if idx + 1 < cells.len() {
+                    cells[idx + 1].child = right;
+                } else {
+                    rightmost = right;
+                }
+            }
+
+            let id = s.make_dirty(id)?;
+            if node::encode_inner(&cells, rightmost, s.body_mut(id)) {
+                return Ok(InsertOutcome { id, split: None });
+            }
+            // Split interno: la clave de cells[sp] SUBE; su hijo pasa a ser el
+            // rightmost de la mitad izquierda.
+            let sp = node::split_point(&cells, node::inner_cell_size);
+            let sep_up = cells[sp].key.clone();
+            let left_rightmost = cells[sp].child;
+            let right_cells: Vec<InnerCell> = cells.drain(sp + 1..).collect();
+            cells.pop(); // la celda sp sube
+            let right = s.alloc()?;
+            let ok = node::encode_inner(&right_cells, rightmost, s.body_mut(right))
+                && node::encode_inner(&cells, left_rightmost, s.body_mut(id));
+            debug_assert!(ok, "cada mitad de un split cabe por construcción");
+            Ok(InsertOutcome {
+                id,
+                split: Some((sep_up, right)),
+            })
+        }
+        _ => Err(Error::Corrupt {
+            page: id.0,
+            reason: "tipo de nodo inesperado",
+        }),
+    }
+}
+
+/// (nueva raíz, existía la clave).
+pub fn delete<S: NodeStore>(s: &mut S, root: PageId, key: &[u8]) -> Result<(PageId, bool)> {
+    if root == NO_ROOT {
+        return Ok((NO_ROOT, false));
+    }
+    let (new_root, existed) = delete_rec(s, root, key)?;
+    Ok((new_root.unwrap_or(NO_ROOT), existed))
+}
+
+fn delete_rec<S: NodeStore>(s: &mut S, id: PageId, key: &[u8]) -> Result<(Option<PageId>, bool)> {
+    let body = s.body(id)?;
+    match node::node_type(body.bytes()) {
+        node::TYPE_LEAF => {
+            let mut cells = node::parse_leaf(id.0, body.bytes())?;
+            drop(body);
+            let Ok(i) = cells.binary_search_by(|c| c.key.as_slice().cmp(key)) else {
+                return Ok((Some(id), false));
+            };
+            free_payload(s, &cells[i].payload);
+            cells.remove(i);
+            if cells.is_empty() {
+                s.free(id);
+                return Ok((None, true));
+            }
+            let id = s.make_dirty(id)?;
+            let ok = node::encode_leaf(&cells, s.body_mut(id));
+            debug_assert!(ok, "quitar una celda nunca crece");
+            Ok((Some(id), true))
+        }
+        node::TYPE_INNER => {
+            let (mut cells, mut rightmost) = node::parse_inner(id.0, body.bytes())?;
+            drop(body);
+            let idx = cells.partition_point(|c| c.key.as_slice() <= key);
+            let child = if idx < cells.len() {
+                cells[idx].child
+            } else {
+                rightmost
+            };
+            let (new_child, existed) = delete_rec(s, child, key)?;
+
+            match new_child {
+                Some(nc) => {
+                    if idx < cells.len() {
+                        cells[idx].child = nc;
+                    } else {
+                        rightmost = nc;
+                    }
+                }
+                None => {
+                    // El hijo desapareció: su rango se fusiona con el vecino.
+                    if idx < cells.len() {
+                        cells.remove(idx);
+                    } else if let Some(last) = cells.pop() {
+                        rightmost = last.child;
+                    } else {
+                        // Nodo sin hijos: desaparece también.
+                        s.free(id);
+                        return Ok((None, existed));
+                    }
+                    if cells.is_empty() {
+                        // Solo queda el rightmost: el nodo colapsa en su hijo.
+                        s.free(id);
+                        return Ok((Some(rightmost), existed));
+                    }
+                }
+            }
+            let id = s.make_dirty(id)?;
+            let ok = node::encode_inner(&cells, rightmost, s.body_mut(id));
+            debug_assert!(ok, "actualizar o quitar celdas nunca crece");
+            Ok((Some(id), existed))
+        }
+        _ => Err(Error::Corrupt {
+            page: id.0,
+            reason: "tipo de nodo inesperado",
+        }),
+    }
+}
+
+/// Libera la cadena overflow de un valor sustituido o borrado, solo si fue
+/// escrita por esta misma tx (una cadena es sucia o durable en bloque; las
+/// durables son historia y no se tocan).
+fn free_payload<S: NodeStore>(s: &mut S, payload: &Payload) {
+    let Payload::Overflow { first, .. } = payload else {
+        return;
+    };
+    if !s.is_dirty(*first) {
+        return;
+    }
+    let mut id = *first;
+    while id != NO_ROOT {
+        let next = {
+            let Ok(body) = s.body(id) else { return };
+            match node::parse_overflow(id.0, body.bytes()) {
+                Ok((_, next)) => next,
+                Err(_) => return,
+            }
+        };
+        s.free(id);
+        id = next;
+    }
+}
+
+fn write_chain<S: NodeStore>(s: &mut S, data: &[u8]) -> Result<PageId> {
+    debug_assert!(!data.is_empty());
+    let mut next = NO_ROOT;
+    for chunk in data.chunks(node::OVERFLOW_DATA).rev() {
+        let id = s.alloc()?;
+        node::encode_overflow(chunk, next, s.body_mut(id));
+        next = id;
+    }
+    Ok(next)
+}
+
+// --- cursor de rango ---
+
+/// Iterador ascendente por clave. Resuelve overflow al producir cada par.
+pub struct Cursor<'s, S: NodeSource> {
+    src: &'s S,
+    /// Nodos internos pendientes: (id, índice del próximo hijo a visitar).
+    stack: Vec<(PageId, usize)>,
+    leaf: VecDeque<LeafCell>,
+}
+
+pub fn scan<S: NodeSource>(src: &S, root: PageId) -> Result<Cursor<'_, S>> {
+    let mut c = Cursor {
+        src,
+        stack: Vec::new(),
+        leaf: VecDeque::new(),
+    };
+    if root != NO_ROOT {
+        c.descend(root, None)?;
+    }
+    Ok(c)
+}
+
+/// Comienza en la primera clave ≥ `start`.
+pub fn scan_from<'s, S: NodeSource>(
+    src: &'s S,
+    root: PageId,
+    start: &[u8],
+) -> Result<Cursor<'s, S>> {
+    let mut c = Cursor {
+        src,
+        stack: Vec::new(),
+        leaf: VecDeque::new(),
+    };
+    if root != NO_ROOT {
+        c.descend(root, Some(start))?;
+    }
+    Ok(c)
+}
+
+impl<S: NodeSource> Cursor<'_, S> {
+    fn descend(&mut self, mut id: PageId, start: Option<&[u8]>) -> Result<()> {
+        loop {
+            let body = self.src.body(id)?;
+            match node::node_type(body.bytes()) {
+                node::TYPE_INNER => {
+                    let (cells, rightmost) = node::parse_inner(id.0, body.bytes())?;
+                    drop(body);
+                    let idx = match start {
+                        None => 0,
+                        Some(k) => cells.partition_point(|c| c.key.as_slice() <= k),
+                    };
+                    let child = if idx < cells.len() {
+                        cells[idx].child
+                    } else {
+                        rightmost
+                    };
+                    self.stack.push((id, idx + 1));
+                    id = child;
+                }
+                node::TYPE_LEAF => {
+                    let cells = node::parse_leaf(id.0, body.bytes())?;
+                    drop(body);
+                    self.leaf = cells.into();
+                    if let Some(k) = start {
+                        while self.leaf.front().is_some_and(|c| c.key.as_slice() < k) {
+                            self.leaf.pop_front();
+                        }
+                    }
+                    return Ok(());
+                }
+                _ => {
+                    return Err(Error::Corrupt {
+                        page: id.0,
+                        reason: "tipo de nodo inesperado",
+                    });
+                }
+            }
+        }
+    }
+
+    fn advance(&mut self) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+        loop {
+            if let Some(cell) = self.leaf.pop_front() {
+                let value = read_value(self.src, &cell.payload)?;
+                return Ok(Some((cell.key, value)));
+            }
+            let Some((id, idx)) = self.stack.last().copied() else {
+                return Ok(None);
+            };
+            let body = self.src.body(id)?;
+            let (cells, rightmost) = node::parse_inner(id.0, body.bytes())?;
+            drop(body);
+            if idx <= cells.len() {
+                self.stack.last_mut().expect("recién consultado").1 += 1;
+                let child = if idx < cells.len() {
+                    cells[idx].child
+                } else {
+                    rightmost
+                };
+                self.descend(child, None)?;
+            } else {
+                self.stack.pop();
+            }
+        }
+    }
+}
+
+impl<S: NodeSource> Iterator for Cursor<'_, S> {
+    type Item = Result<(Vec<u8>, Vec<u8>)>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.advance().transpose()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testutil::MemStore;
+
+    fn k(i: u32) -> Vec<u8> {
+        format!("clave-{i:06}").into_bytes()
+    }
+
+    fn v(i: u32) -> Vec<u8> {
+        format!("valor-{i}").into_bytes()
+    }
+
+    #[test]
+    fn empty_tree() {
+        let s = MemStore::new();
+        assert_eq!(get(&s, NO_ROOT, b"x").unwrap(), None);
+        assert_eq!(scan(&s, NO_ROOT).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn insert_get_update_delete_small() {
+        let mut s = MemStore::new();
+        let mut root = NO_ROOT;
+        root = insert(&mut s, root, b"b", b"2").unwrap();
+        root = insert(&mut s, root, b"a", b"1").unwrap();
+        root = insert(&mut s, root, b"c", b"3").unwrap();
+        assert_eq!(get(&s, root, b"a").unwrap().unwrap(), b"1");
+        assert_eq!(get(&s, root, b"zz").unwrap(), None);
+
+        root = insert(&mut s, root, b"a", b"uno").unwrap();
+        assert_eq!(get(&s, root, b"a").unwrap().unwrap(), b"uno");
+
+        let (root, existed) = delete(&mut s, root, b"a").unwrap();
+        assert!(existed);
+        assert_eq!(get(&s, root, b"a").unwrap(), None);
+        let (_, existed) = delete(&mut s, root, b"a").unwrap();
+        assert!(!existed);
+    }
+
+    #[test]
+    fn many_keys_split_scan_and_drain() {
+        let mut s = MemStore::new();
+        let mut root = NO_ROOT;
+        const N: u32 = 5000;
+        // Inserción en orden pseudoaleatorio determinista.
+        let mut order: Vec<u32> = (0..N).collect();
+        let mut seed = 0x9E3779B97F4A7C15u64;
+        for i in (1..order.len()).rev() {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            order.swap(i, (seed % (i as u64 + 1)) as usize);
+        }
+        for &i in &order {
+            root = insert(&mut s, root, &k(i), &v(i)).unwrap();
+        }
+        // Scan completo, ordenado y exacto.
+        let all: Vec<_> = scan(&s, root).unwrap().map(|r| r.unwrap()).collect();
+        assert_eq!(all.len(), N as usize);
+        for (i, (key, val)) in all.iter().enumerate() {
+            assert_eq!(key, &k(i as u32));
+            assert_eq!(val, &v(i as u32));
+        }
+        // scan_from a mitad.
+        let tail: Vec<_> = scan_from(&s, root, &k(N / 2))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(tail.len(), (N / 2) as usize);
+        assert_eq!(tail[0].0, k(N / 2));
+
+        // Borrar todo: el árbol queda vacío y sin páginas residentes.
+        for i in 0..N {
+            let (nr, existed) = delete(&mut s, root, &k(i)).unwrap();
+            assert!(existed, "clave {i} debía existir");
+            root = nr;
+        }
+        assert_eq!(root, NO_ROOT);
+        assert!(
+            s.pages.is_empty(),
+            "quedan {} páginas sin liberar",
+            s.pages.len()
+        );
+    }
+
+    #[test]
+    fn overflow_values_roundtrip_and_free() {
+        let mut s = MemStore::new();
+        let mut root = NO_ROOT;
+        let big: Vec<u8> = (0..50_000u32).map(|i| (i % 251) as u8).collect();
+        root = insert(&mut s, root, b"grande", &big).unwrap();
+        root = insert(&mut s, root, b"chico", b"x").unwrap();
+        assert_eq!(get(&s, root, b"grande").unwrap().unwrap(), big);
+
+        // Sustituir libera la cadena anterior (en MemStore todo es sucio).
+        let pages_before = s.pages.len();
+        root = insert(&mut s, root, b"grande", b"ya-no").unwrap();
+        assert!(s.pages.len() < pages_before);
+        assert_eq!(get(&s, root, b"grande").unwrap().unwrap(), b"ya-no");
+
+        let (root, _) = delete(&mut s, root, b"grande").unwrap();
+        let (root, _) = delete(&mut s, root, b"chico").unwrap();
+        assert_eq!(root, NO_ROOT);
+        assert!(s.pages.is_empty());
+    }
+
+    #[test]
+    fn key_size_limits() {
+        let mut s = MemStore::new();
+        assert!(matches!(
+            insert(&mut s, NO_ROOT, &[0u8; 2000], b"v"),
+            Err(Error::InvalidInput(_))
+        ));
+        assert!(matches!(
+            insert(&mut s, NO_ROOT, b"", b"v"),
+            Err(Error::InvalidInput(_))
+        ));
+        // Clave en el límite exacto: válida.
+        let root = insert(&mut s, NO_ROOT, &[7u8; node::MAX_KEY_LEN], b"v").unwrap();
+        assert_eq!(
+            get(&s, root, &[7u8; node::MAX_KEY_LEN]).unwrap().unwrap(),
+            b"v"
+        );
+    }
+}

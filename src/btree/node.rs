@@ -1,0 +1,330 @@
+//! Codificación de nodos B-tree y páginas overflow (docs/02-formato-archivo.md).
+//!
+//! v1 decodifica nodos completos a vectores de celdas y los reencodifica al
+//! mutar: O(página) por operación, correcto y simple. El array de punteros de
+//! celda (búsqueda binaria in-page) queda como optimización futura.
+
+use crate::error::{Error, Result};
+use crate::format::{BODY_SIZE, PageId};
+
+pub const TYPE_LEAF: u8 = 0x01;
+pub const TYPE_INNER: u8 = 0x02;
+pub const TYPE_OVERFLOW: u8 = 0x03;
+
+/// Longitud máxima de clave: los nodos internos deben alojar varias por página.
+pub const MAX_KEY_LEN: usize = 1024;
+/// Una celda de hoja mayor que esto manda el valor a overflow (≥3 celdas/página).
+pub const MAX_INLINE_CELL: usize = 1280;
+
+const LEAF_HDR: usize = 4; // type, flags, ncells u16
+const INNER_HDR: usize = 12; // type, flags, ncells u16, rightmost u64
+pub const OVERFLOW_HDR: usize = 12; // type, flags, len u16, next u64
+/// Bytes de datos por página overflow.
+pub const OVERFLOW_DATA: usize = BODY_SIZE - OVERFLOW_HDR;
+
+const CELL_OVERFLOW_FLAG: u8 = 0x01;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Payload {
+    Inline(Vec<u8>),
+    Overflow { total_len: u64, first: PageId },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LeafCell {
+    pub key: Vec<u8>,
+    pub payload: Payload,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InnerCell {
+    /// Cota superior **exclusiva** de las claves de `child`.
+    pub key: Vec<u8>,
+    pub child: PageId,
+}
+
+pub fn node_type(body: &[u8]) -> u8 {
+    body[0]
+}
+
+fn corrupt(page: u64, reason: &'static str) -> Error {
+    Error::Corrupt { page, reason }
+}
+
+// --- varint (compartido en format) con error contextualizado ---
+
+use crate::format::{put_varint, varint_len};
+
+fn get_varint(page: u64, buf: &[u8], pos: &mut usize) -> Result<u64> {
+    crate::format::take_varint(buf, pos).ok_or(corrupt(page, "varint inválido"))
+}
+
+fn get_slice<'a>(page: u64, buf: &'a [u8], pos: &mut usize, len: usize) -> Result<&'a [u8]> {
+    let s = buf
+        .get(*pos..*pos + len)
+        .ok_or(corrupt(page, "celda truncada"))?;
+    *pos += len;
+    Ok(s)
+}
+
+fn get_u64(page: u64, buf: &[u8], pos: &mut usize) -> Result<u64> {
+    let s = get_slice(page, buf, pos, 8)?;
+    Ok(u64::from_le_bytes(
+        s.try_into().expect("rango fijo de 8 bytes"),
+    ))
+}
+
+// --- tamaños (para decidir splits sin codificar) ---
+
+pub fn leaf_cell_size(c: &LeafCell) -> usize {
+    let payload = match &c.payload {
+        Payload::Inline(v) => varint_len(v.len() as u64) + v.len(),
+        Payload::Overflow { total_len, .. } => varint_len(*total_len) + 8,
+    };
+    1 + varint_len(c.key.len() as u64) + c.key.len() + payload
+}
+
+pub fn inner_cell_size(c: &InnerCell) -> usize {
+    varint_len(c.key.len() as u64) + c.key.len() + 8
+}
+
+/// Tamaño que tendría una celda de hoja con el valor inline: decide overflow.
+pub fn inline_cell_size(key: &[u8], value_len: usize) -> usize {
+    1 + varint_len(key.len() as u64) + key.len() + varint_len(value_len as u64) + value_len
+}
+
+// --- hoja ---
+
+pub fn parse_leaf(page: u64, body: &[u8]) -> Result<Vec<LeafCell>> {
+    if body[0] != TYPE_LEAF {
+        return Err(corrupt(page, "se esperaba una hoja"));
+    }
+    let ncells = u16::from_le_bytes([body[2], body[3]]) as usize;
+    let mut pos = LEAF_HDR;
+    let mut cells: Vec<LeafCell> = Vec::with_capacity(ncells);
+    for _ in 0..ncells {
+        let flags = *body.get(pos).ok_or(corrupt(page, "celda truncada"))?;
+        pos += 1;
+        let klen = get_varint(page, body, &mut pos)? as usize;
+        let key = get_slice(page, body, &mut pos, klen)?.to_vec();
+        // Invariantes del árbol como defensa en profundidad: claves no
+        // vacías y estrictamente crecientes (una cola de ceros no decodifica).
+        if key.is_empty() || cells.last().is_some_and(|p| p.key >= key) {
+            return Err(corrupt(page, "claves de hoja desordenadas o vacías"));
+        }
+        let payload = if flags & CELL_OVERFLOW_FLAG != 0 {
+            let total_len = get_varint(page, body, &mut pos)?;
+            let first = PageId(get_u64(page, body, &mut pos)?);
+            Payload::Overflow { total_len, first }
+        } else {
+            let vlen = get_varint(page, body, &mut pos)? as usize;
+            Payload::Inline(get_slice(page, body, &mut pos, vlen)?.to_vec())
+        };
+        cells.push(LeafCell { key, payload });
+    }
+    Ok(cells)
+}
+
+/// `false` si las celdas no caben (el llamador hace split). Si caben, escribe
+/// el nodo completo y rellena el resto con ceros (contenido determinista).
+pub fn encode_leaf(cells: &[LeafCell], body: &mut [u8]) -> bool {
+    let mut out = Vec::with_capacity(BODY_SIZE);
+    out.extend_from_slice(&[TYPE_LEAF, 0]);
+    out.extend_from_slice(&(cells.len() as u16).to_le_bytes());
+    for c in cells {
+        match &c.payload {
+            Payload::Inline(v) => {
+                out.push(0);
+                put_varint(&mut out, c.key.len() as u64);
+                out.extend_from_slice(&c.key);
+                put_varint(&mut out, v.len() as u64);
+                out.extend_from_slice(v);
+            }
+            Payload::Overflow { total_len, first } => {
+                out.push(CELL_OVERFLOW_FLAG);
+                put_varint(&mut out, c.key.len() as u64);
+                out.extend_from_slice(&c.key);
+                put_varint(&mut out, *total_len);
+                out.extend_from_slice(&first.0.to_le_bytes());
+            }
+        }
+    }
+    if out.len() > body.len() {
+        return false;
+    }
+    body[..out.len()].copy_from_slice(&out);
+    body[out.len()..].fill(0);
+    true
+}
+
+// --- nodo interno ---
+
+pub fn parse_inner(page: u64, body: &[u8]) -> Result<(Vec<InnerCell>, PageId)> {
+    if body[0] != TYPE_INNER {
+        return Err(corrupt(page, "se esperaba un nodo interno"));
+    }
+    let ncells = u16::from_le_bytes([body[2], body[3]]) as usize;
+    let rightmost = PageId(u64::from_le_bytes(
+        body[4..12].try_into().expect("rango fijo de 8 bytes"),
+    ));
+    let mut pos = INNER_HDR;
+    let mut cells: Vec<InnerCell> = Vec::with_capacity(ncells);
+    for _ in 0..ncells {
+        let klen = get_varint(page, body, &mut pos)? as usize;
+        let key = get_slice(page, body, &mut pos, klen)?.to_vec();
+        if key.is_empty() || cells.last().is_some_and(|p| p.key >= key) {
+            return Err(corrupt(page, "separadores desordenados o vacíos"));
+        }
+        let child = PageId(get_u64(page, body, &mut pos)?);
+        cells.push(InnerCell { key, child });
+    }
+    Ok((cells, rightmost))
+}
+
+pub fn encode_inner(cells: &[InnerCell], rightmost: PageId, body: &mut [u8]) -> bool {
+    let mut out = Vec::with_capacity(BODY_SIZE);
+    out.extend_from_slice(&[TYPE_INNER, 0]);
+    out.extend_from_slice(&(cells.len() as u16).to_le_bytes());
+    out.extend_from_slice(&rightmost.0.to_le_bytes());
+    for c in cells {
+        put_varint(&mut out, c.key.len() as u64);
+        out.extend_from_slice(&c.key);
+        out.extend_from_slice(&c.child.0.to_le_bytes());
+    }
+    if out.len() > body.len() {
+        return false;
+    }
+    body[..out.len()].copy_from_slice(&out);
+    body[out.len()..].fill(0);
+    true
+}
+
+// --- overflow ---
+
+pub fn encode_overflow(chunk: &[u8], next: PageId, body: &mut [u8]) {
+    debug_assert!(chunk.len() <= OVERFLOW_DATA);
+    body[0] = TYPE_OVERFLOW;
+    body[1] = 0;
+    body[2..4].copy_from_slice(&(chunk.len() as u16).to_le_bytes());
+    body[4..12].copy_from_slice(&next.0.to_le_bytes());
+    body[OVERFLOW_HDR..OVERFLOW_HDR + chunk.len()].copy_from_slice(chunk);
+    body[OVERFLOW_HDR + chunk.len()..].fill(0);
+}
+
+/// (datos del trozo, página siguiente).
+pub fn parse_overflow(page: u64, body: &[u8]) -> Result<(&[u8], PageId)> {
+    if body[0] != TYPE_OVERFLOW {
+        return Err(corrupt(page, "se esperaba una página overflow"));
+    }
+    let len = u16::from_le_bytes([body[2], body[3]]) as usize;
+    let next = PageId(u64::from_le_bytes(
+        body[4..12].try_into().expect("rango fijo de 8 bytes"),
+    ));
+    let data = body
+        .get(OVERFLOW_HDR..OVERFLOW_HDR + len)
+        .ok_or(corrupt(page, "overflow truncado"))?;
+    Ok((data, next))
+}
+
+/// Índice de inicio de la mitad derecha de un split: ambas mitades no vacías
+/// y de tamaño codificado similar.
+pub fn split_point<T>(cells: &[T], size: impl Fn(&T) -> usize) -> usize {
+    debug_assert!(cells.len() >= 2);
+    let total: usize = cells.iter().map(&size).sum();
+    let mut acc = 0;
+    for (i, c) in cells.iter().enumerate() {
+        acc += size(c);
+        if acc * 2 >= total {
+            return (i + 1).min(cells.len() - 1);
+        }
+    }
+    cells.len() - 1
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cell(key: &[u8], val: &[u8]) -> LeafCell {
+        LeafCell {
+            key: key.to_vec(),
+            payload: Payload::Inline(val.to_vec()),
+        }
+    }
+
+    #[test]
+    fn leaf_roundtrip() {
+        let cells = vec![
+            cell(b"a", b""),
+            cell(b"clave", b"valor"),
+            LeafCell {
+                key: b"grande".to_vec(),
+                payload: Payload::Overflow {
+                    total_len: 99_999,
+                    first: PageId(42),
+                },
+            },
+        ];
+        let mut body = vec![0u8; BODY_SIZE];
+        assert!(encode_leaf(&cells, &mut body));
+        assert_eq!(parse_leaf(0, &body).unwrap(), cells);
+        assert_eq!(node_type(&body), TYPE_LEAF);
+    }
+
+    #[test]
+    fn leaf_rejects_when_full() {
+        let cells: Vec<LeafCell> = (0..10)
+            .map(|i| cell(format!("k{i:04}").as_bytes(), &[7u8; 500]))
+            .collect();
+        let mut body = vec![0u8; BODY_SIZE];
+        assert!(!encode_leaf(&cells, &mut body));
+        // La mitad sí cabe.
+        assert!(encode_leaf(&cells[..5], &mut body));
+    }
+
+    #[test]
+    fn inner_roundtrip() {
+        let cells = vec![
+            InnerCell {
+                key: b"m".to_vec(),
+                child: PageId(7),
+            },
+            InnerCell {
+                key: b"t".to_vec(),
+                child: PageId(9),
+            },
+        ];
+        let mut body = vec![0u8; BODY_SIZE];
+        assert!(encode_inner(&cells, PageId(11), &mut body));
+        let (parsed, rightmost) = parse_inner(0, &body).unwrap();
+        assert_eq!(parsed, cells);
+        assert_eq!(rightmost, PageId(11));
+    }
+
+    #[test]
+    fn overflow_roundtrip() {
+        let data = vec![3u8; OVERFLOW_DATA];
+        let mut body = vec![0u8; BODY_SIZE];
+        encode_overflow(&data, PageId(5), &mut body);
+        let (chunk, next) = parse_overflow(0, &body).unwrap();
+        assert_eq!(chunk, &data[..]);
+        assert_eq!(next, PageId(5));
+    }
+
+    #[test]
+    fn split_point_balances() {
+        let cells: Vec<LeafCell> = (0..10).map(|i| cell(&[i], &[0u8; 100])).collect();
+        let sp = split_point(&cells, leaf_cell_size);
+        assert!(sp >= 1 && sp < cells.len());
+        assert!(sp.abs_diff(5) <= 1);
+    }
+
+    #[test]
+    fn truncated_cells_are_corrupt() {
+        let cells = vec![cell(b"clave", b"valor")];
+        let mut body = vec![0u8; BODY_SIZE];
+        assert!(encode_leaf(&cells, &mut body));
+        body[2..4].copy_from_slice(&500u16.to_le_bytes()); // ncells mentiroso
+        assert!(parse_leaf(0, &body).is_err());
+    }
+}

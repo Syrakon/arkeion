@@ -3,9 +3,11 @@
 //!
 //! Una transacción de escritura acumula páginas **sucias en memoria** con ids
 //! ya definitivos (posiciones ≥ EOF lógico, posible porque el escritor es
-//! único). El commit las escribe en orden, hace fsync, añade la página de
-//! commit (hash chain incluida) y vuelve a hacer fsync: ese es el punto de
-//! durabilidad. Un rollback es simplemente soltar el estado en memoria.
+//! único). El commit escribe las páginas de datos, añade la página de commit
+//! (hash chain incluida) y hace **un** fsync: ese es el punto de durabilidad
+//! (M9-perf). Un solo fsync basta porque el tag de integridad por página vuelve
+//! ilegible cualquier escritura a medias y la recuperación se detiene en ella.
+//! Un rollback es simplemente soltar el estado en memoria.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -1249,7 +1251,7 @@ impl WriteTx {
             self.parent_version,
         )?;
 
-        // Páginas sucias + página de commit + fsyncs (durabilidad, M1).
+        // Páginas sucias + página de commit + un fsync (durabilidad, M1/M9).
         let head = publish_commit(
             &self.pager,
             &mut self.ts,
@@ -1320,7 +1322,7 @@ fn write_meta_indices(
 }
 
 /// Escribe las páginas sucias de la tx, la página de commit y publica el nuevo
-/// head (doble fsync: el punto de durabilidad de M1). Los campos de cabecera no
+/// head (un solo fsync: el punto de durabilidad, M1/M9-perf). Los campos de cabecera no
 /// derivados de los datos (versión, flags, `prev_page`/`prev_chain`) vienen en
 /// `params`: un commit normal los toma del head anterior; el checkpoint de
 /// `vacuum` (M9) los fija explícitamente.
@@ -1345,7 +1347,6 @@ fn publish_commit(
         pager.cache_insert(id, Arc::new(page));
         pages_written += 1;
     }
-    pager.sync()?;
 
     let mut header = CommitHeader {
         flags: params.flags,
@@ -1367,6 +1368,14 @@ fn publish_commit(
     header.encode_into(page.body_mut());
     pager.write_reserved_page(commit_page, &page)?;
     pager.cache_insert(commit_page, Arc::new(page));
+    // **Único** fsync del commit (M9-perf): páginas de datos y de commit escritas,
+    // una sola barrera. Basta para la durabilidad porque la recuperación no
+    // confía en el orden de flush del SO: el tag de integridad por página hace
+    // **ilegible** cualquier página escrita a medias o no escrita, y el escaneo
+    // hacia delante (que lee en orden y las páginas de datos van antes que la de
+    // commit) se detiene en la primera ilegible. Así, un commit a medio escribir
+    // jamás se adopta; solo se adopta uno cuyas páginas son **todas** legibles
+    // (i.e., el fsync llegó a completarse). ~2× en escrituras durables.
     pager.sync()?;
 
     let head = Head {
@@ -2350,6 +2359,63 @@ mod tests {
         let mut tx = store.begin().unwrap();
         assert_eq!(tx.insert_row(&def, &auto(60)).unwrap(), 6);
         tx.commit().unwrap();
+        assert!(store.verify().unwrap().chain_ok);
+    }
+
+    /// Seguridad del commit de un solo fsync (M9-perf): un commit a medio escribir
+    /// (crash antes de que el fsync complete) no se adopta. Se simula el estado de
+    /// crash: el slot meta del último commit no se actualizó (⇒ recover parte del
+    /// anterior) y una de sus páginas de datos quedó sin escribir (⇒ ilegible por
+    /// el tag). La recuperación se detiene en ella y cae al commit íntegro previo.
+    #[test]
+    fn single_fsync_rejects_a_half_written_tail_commit() {
+        use std::os::unix::fs::FileExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("c.arkeion");
+        let store = Store::create(&path).unwrap();
+
+        // Commits 1 y 2: el estado durable a conservar.
+        for v in 1..=2u64 {
+            let mut tx = store.begin().unwrap();
+            tx.put(format!("k{v}").as_bytes(), format!("v{v}").as_bytes())
+                .unwrap();
+            tx.commit().unwrap();
+        }
+        let n_after_2 = store.lock().head.n_pages; // 1ª página del commit 3
+
+        // Commit 3: el que "se quedó a medias".
+        let mut tx = store.begin().unwrap();
+        tx.put(b"k3", b"v3").unwrap();
+        tx.commit().unwrap();
+        drop(store);
+
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let flip = |off: u64| {
+            let mut b = [0u8; 1];
+            f.read_exact_at(&mut b, off).unwrap();
+            b[0] ^= 0xFF;
+            f.write_all_at(&b, off).unwrap();
+        };
+        let ps = crate::format::PAGE_SIZE as u64;
+        // El slot meta de la versión 3 (impar ⇒ slot B) no llegó: corrómpelo para
+        // que recover use el de la versión 2.
+        flip(crate::format::META_PAGE_B.0 * ps + 64);
+        // Una página de datos del commit 3 quedó sin escribir: ilegible (el tag no
+        // cuadra), como una escritura desgarrada real.
+        flip(n_after_2 * ps + 64);
+        drop(f);
+
+        // Recuperación: el escaneo hacia delante se topa con la página ilegible
+        // antes de la de commit y para; el head queda en el commit 2 íntegro.
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.version(), 2, "el commit a medias no debe adoptarse");
+        let snap = store.snapshot();
+        assert_eq!(snap.get(b"k2").unwrap().unwrap(), b"v2");
+        assert!(snap.get(b"k3").unwrap().is_none(), "v3 no debe verse");
         assert!(store.verify().unwrap().chain_ok);
     }
 }

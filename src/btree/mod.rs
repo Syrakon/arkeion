@@ -216,24 +216,36 @@ fn insert_rec<S: NodeStore>(
             let body = s.body(id)?;
             let mut cells = node::parse_leaf(id.0, body.bytes())?;
             drop(body);
-            match cells.binary_search_by(|c| c.key.as_slice().cmp(key)) {
+            let appended = match cells.binary_search_by(|c| c.key.as_slice().cmp(key)) {
                 Ok(i) => {
                     free_payload(s, &cells[i].payload);
                     cells[i].payload = payload;
+                    false
                 }
-                Err(i) => cells.insert(
-                    i,
-                    LeafCell {
-                        key: key.to_vec(),
-                        payload,
-                    },
-                ),
-            }
+                Err(i) => {
+                    cells.insert(
+                        i,
+                        LeafCell {
+                            key: key.to_vec(),
+                            payload,
+                        },
+                    );
+                    i + 1 == cells.len() // la celda nueva quedó la última
+                }
+            };
             if node::encode_leaf(&cells, s.body_mut(id)) {
                 return Ok(InsertOutcome { id, split: None });
             }
-            // Split de hoja: el separador es la primera clave de la derecha.
-            let sp = node::split_point(&cells, node::leaf_cell_size);
+            // Split de hoja: el separador es la primera clave de la derecha. En un
+            // **append al final** (inserts secuenciales: rowid creciente, imports)
+            // partimos 100/0 —la celda nueva sola a la derecha— para dejar la hoja
+            // izquierda LLENA en vez de a la mitad. Casi duplica el llenado en
+            // cargas append (como hace SQLite); en otro caso, balance por tamaño.
+            let sp = if appended {
+                cells.len() - 1
+            } else {
+                node::split_point(&cells, node::leaf_cell_size)
+            };
             let right_cells = cells.split_off(sp);
             let sep = right_cells[0].key.clone();
             let right = s.alloc()?;

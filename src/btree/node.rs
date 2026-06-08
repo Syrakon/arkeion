@@ -289,6 +289,71 @@ pub fn leaf_contains(page: u64, body: &[u8], key: &[u8]) -> Result<bool> {
     Ok(leaf_seek(page, body, key)?.is_some())
 }
 
+/// Codifica **una** celda de hoja, byte a byte igual que `encode_leaf` por celda.
+fn encode_leaf_cell(key: &[u8], payload: &Payload) -> Vec<u8> {
+    let mut out = Vec::new();
+    match payload {
+        Payload::Inline(v) => {
+            out.push(0);
+            put_varint(&mut out, key.len() as u64);
+            out.extend_from_slice(key);
+            put_varint(&mut out, v.len() as u64);
+            out.extend_from_slice(v);
+        }
+        Payload::Overflow { total_len, first } => {
+            out.push(CELL_OVERFLOW_FLAG);
+            put_varint(&mut out, key.len() as u64);
+            out.extend_from_slice(key);
+            put_varint(&mut out, *total_len);
+            out.extend_from_slice(&first.0.to_le_bytes());
+        }
+    }
+    out
+}
+
+/// Anexa una celda al final de la hoja **in situ**, solo si `key` va después de
+/// la última celda (append puro) y cabe en el hueco. El resultado es **idéntico
+/// byte a byte** a re-encodar la hoja con la celda añadida (mismas celdas en
+/// orden + mismo relleno a cero, que ya estaba ahí), pero sin parsear ni
+/// reescribir las celdas existentes. `Ok(true)` si anexó; `Ok(false)` si hay que
+/// ir por el camino general (clave no final, o no cabe ⇒ split). Es la
+/// optimización de los inserts secuenciales (imports, rowid creciente).
+pub fn leaf_append(page: u64, body: &mut [u8], key: &[u8], payload: &Payload) -> Result<bool> {
+    if body[0] != TYPE_LEAF {
+        return Err(corrupt(page, "se esperaba una hoja"));
+    }
+    let ncells = u16::from_le_bytes([body[2], body[3]]) as usize;
+
+    // Recorre hasta el final, recordando el rango de la última clave.
+    let mut pos = LEAF_HDR;
+    let mut last_key: Option<(usize, usize)> = None;
+    for _ in 0..ncells {
+        let flags = *body.get(pos).ok_or(corrupt(page, "celda truncada"))?;
+        pos += 1;
+        let klen = get_varint(page, body, &mut pos)? as usize;
+        let kstart = pos;
+        let _ = get_slice(page, body, &mut pos, klen)?;
+        last_key = Some((kstart, kstart + klen));
+        skip_leaf_payload(page, body, &mut pos, flags)?;
+    }
+    let end = pos;
+
+    // Solo es append si la clave es estrictamente mayor que la última.
+    if let Some((ks, ke)) = last_key
+        && key <= &body[ks..ke]
+    {
+        return Ok(false);
+    }
+
+    let cell = encode_leaf_cell(key, payload);
+    if end + cell.len() > body.len() {
+        return Ok(false); // no cabe ⇒ camino general (hará split)
+    }
+    body[end..end + cell.len()].copy_from_slice(&cell);
+    body[2..4].copy_from_slice(&((ncells as u16) + 1).to_le_bytes());
+    Ok(true)
+}
+
 // --- overflow ---
 
 pub fn encode_overflow(chunk: &[u8], next: PageId, body: &mut [u8]) {
@@ -432,6 +497,55 @@ mod tests {
                 "descenso diverge para {probe:?}"
             );
         }
+    }
+
+    /// `leaf_append` solo anexa cuando la clave va al final y cabe, y produce
+    /// **exactamente** los mismos bytes que re-encodar la hoja con la celda.
+    #[test]
+    fn leaf_append_is_byte_identical_and_rejects_non_append() {
+        let base = vec![cell(b"a", b"1"), cell(b"m", b"22"), cell(b"t", b"333")];
+        let mut body = vec![0u8; BODY_SIZE];
+        assert!(encode_leaf(&base, &mut body));
+
+        // Append (clave > última): byte-idéntico a re-encodar con la celda.
+        let mut appended = body.clone();
+        assert!(leaf_append(0, &mut appended, b"z", &Payload::Inline(b"9".to_vec())).unwrap());
+        let mut expected = base.clone();
+        expected.push(cell(b"z", b"9"));
+        let mut expected_body = vec![0u8; BODY_SIZE];
+        assert!(encode_leaf(&expected, &mut expected_body));
+        assert_eq!(
+            appended, expected_body,
+            "append no es byte-idéntico al re-encode"
+        );
+
+        // Append de un payload overflow al final: igual de byte-idéntico.
+        let mut over = body.clone();
+        let payload = Payload::Overflow {
+            total_len: 70_000,
+            first: PageId(123),
+        };
+        assert!(leaf_append(0, &mut over, b"zz", &payload).unwrap());
+        let mut expected2 = base.clone();
+        expected2.push(LeafCell {
+            key: b"zz".to_vec(),
+            payload,
+        });
+        let mut expected2_body = vec![0u8; BODY_SIZE];
+        assert!(encode_leaf(&expected2, &mut expected2_body));
+        assert_eq!(over, expected2_body);
+
+        // No-append: clave en medio, igual a una existente, o menor que la 1ª.
+        for k in [&b"b"[..], b"m", b"0"] {
+            let mut b2 = body.clone();
+            assert!(!leaf_append(0, &mut b2, k, &Payload::Inline(b"x".to_vec())).unwrap());
+            assert_eq!(b2, body, "no-append no debe tocar el body");
+        }
+
+        // Clave final pero que no cabe ⇒ false, body intacto (lo parte el general).
+        let mut b3 = body.clone();
+        assert!(!leaf_append(0, &mut b3, b"zzz", &Payload::Inline(vec![7u8; BODY_SIZE])).unwrap());
+        assert_eq!(b3, body);
     }
 
     /// `leaf_find`/`leaf_contains` deben coincidir con `parse_leaf` +

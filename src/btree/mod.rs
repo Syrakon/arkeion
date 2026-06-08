@@ -202,6 +202,18 @@ fn insert_rec<S: NodeStore>(
     let body = s.body(id)?;
     match node::node_type(body.bytes()) {
         node::TYPE_LEAF => {
+            drop(body);
+            let id = s.make_dirty(id)?;
+            // Fast-path: una clave que va al final de la hoja (inserts
+            // secuenciales: rowid creciente, imports) se anexa in situ sin
+            // parsear ni re-encodar las celdas existentes. Bytes idénticos al
+            // re-encode.
+            if node::leaf_append(id.0, s.body_mut(id), key, &payload)? {
+                return Ok(InsertOutcome { id, split: None });
+            }
+
+            // General: parsear (la copia ya sucia), insertar/sobrescribir, encodar.
+            let body = s.body(id)?;
             let mut cells = node::parse_leaf(id.0, body.bytes())?;
             drop(body);
             match cells.binary_search_by(|c| c.key.as_slice().cmp(key)) {
@@ -217,7 +229,6 @@ fn insert_rec<S: NodeStore>(
                     },
                 ),
             }
-            let id = s.make_dirty(id)?;
             if node::encode_leaf(&cells, s.body_mut(id)) {
                 return Ok(InsertOutcome { id, split: None });
             }

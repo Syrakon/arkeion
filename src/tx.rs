@@ -30,10 +30,10 @@ use crate::record::Value;
 /// Rama única de M1; el branching llega en M8.
 pub const MAIN_BRANCH: &str = "main";
 
-// Espacios de claves del árbol meta global (docs/02).
+// Espacios de claves del árbol meta global (docs/02). `0x03` (índice temporal)
+// quedó libre en M9-perf: `AS OF TIMESTAMP` se resuelve desde `META_HIST`.
 const META_REF: u8 = 0x01;
 const META_HIST: u8 = 0x02;
-const META_TS: u8 = 0x03;
 
 /// Punto en la historia al que fijar una lectura (time-travel, M5). El
 /// timestamp es informativo; la versión es la autoridad (docs/05, D12).
@@ -550,8 +550,8 @@ impl Store {
     /// Snapshot histórico (M5, time-travel). `AsOf::Head` equivale a
     /// [`snapshot`](Store::snapshot). Funciona porque el b-tree es CoW
     /// append-only: la raíz de cada versión sigue en disco hasta que `vacuum`
-    /// (M9) la compacte, y el índice histórico del árbol meta (escrito en cada
-    /// commit, `META_HIST`/`META_TS`) la localiza.
+    /// (M9) la compacte, y el índice histórico del árbol meta (`META_HIST`,
+    /// escrito en cada commit) la localiza.
     pub fn snapshot_at(&self, at: AsOf) -> Result<Snapshot> {
         let (pager, head) = {
             let st = self.lock();
@@ -950,25 +950,32 @@ fn snapshot_at_version(pager: &Arc<Pager>, head: &Head, v: u64) -> Result<Snapsh
     Ok(snapshot_of(pager, v, data_root))
 }
 
-/// Mayor versión con timestamp ≤ `ms` (índice `META_TS`, ordenado por
-/// `(ts, version)` en big-endian): recorre el espacio hacia delante y se queda
-/// con la última entrada ≤ `ms`. Antes del primer commit (o de la frontera de
-/// `vacuum`) ⇒ estado génesis. Coste O(commits hasta `ms`), aceptable en v1.
+/// Mayor versión con timestamp ≤ `ms`: recorre el índice histórico `META_HIST`
+/// (ordenado por versión ascendente) leyendo el `ts` de cada valor y se queda
+/// con la mayor versión cuyo `ts ≤ ms` (no asume monotonía del reloj). Antes del
+/// primer commit (o de la frontera de `vacuum`) ⇒ estado génesis. Coste
+/// O(commits), aceptable en v1 (sin índice temporal aparte desde M9-perf).
 fn snapshot_at_timestamp(pager: &Arc<Pager>, head: &Head, ms: u64) -> Result<Snapshot> {
     let src = PagerSource(pager.clone());
     let mut best: Option<u64> = None;
-    for item in btree::scan_from(&src, head.meta_root, &[META_TS])? {
-        let (key, _) = item?;
-        if key.first() != Some(&META_TS) || key.len() != 1 + 8 + 8 {
-            break; // fuera del espacio de timestamps
+    for item in btree::scan_from(&src, head.meta_root, &[META_HIST])? {
+        let (key, val) = item?;
+        if key.first() != Some(&META_HIST) || key.len() != 1 + 8 {
+            break; // fuera del espacio histórico
         }
-        let ts = u64::from_be_bytes(key[1..9].try_into().expect("rango fijo de 8 bytes"));
-        if ts > ms {
-            break;
+        // hist_val = data_root(8) ‖ ts(8) ‖ parent(8).
+        let ts = u64::from_le_bytes(
+            val.get(8..16)
+                .ok_or(Error::CorruptRecord("entrada histórica truncada"))?
+                .try_into()
+                .expect("rango fijo de 8 bytes"),
+        );
+        if ts <= ms {
+            // Versiones ascendentes: la última con ts ≤ ms es la mayor.
+            best = Some(u64::from_be_bytes(
+                key[1..9].try_into().expect("rango fijo de 8 bytes"),
+            ));
         }
-        best = Some(u64::from_be_bytes(
-            key[9..17].try_into().expect("rango fijo de 8 bytes"),
-        ));
     }
     match best {
         None => Ok(genesis_snapshot(pager)),
@@ -1311,12 +1318,15 @@ fn write_meta_indices(
     branch: &str,
     parent_version: u64,
 ) -> Result<PageId> {
+    // `hist[version] → data_root ‖ ts ‖ parent_version` y `ref[branch] →
+    // versión`. El timestamp vive en el valor de `hist`: `AS OF TIMESTAMP` lo
+    // resuelve escaneando `hist` (M9-perf), así que no hace falta un índice
+    // temporal aparte —una escritura de b-tree menos por commit—.
     let mut hist_val = Vec::with_capacity(24);
     hist_val.extend_from_slice(&data_root.0.to_le_bytes());
     hist_val.extend_from_slice(&timestamp_ms.to_le_bytes());
     hist_val.extend_from_slice(&parent_version.to_le_bytes());
     let mut root = btree::insert(ts, meta_root, &hist_key(version), &hist_val)?;
-    root = btree::insert(ts, root, &ts_key(timestamp_ms, version), &[])?;
     root = btree::insert(ts, root, &ref_key(branch), &version.to_le_bytes())?;
     Ok(root)
 }
@@ -1447,14 +1457,6 @@ impl NodeSource for PagerSource {
 fn hist_key(version: u64) -> Vec<u8> {
     let mut k = Vec::with_capacity(9);
     k.push(META_HIST);
-    k.extend_from_slice(&version.to_be_bytes());
-    k
-}
-
-fn ts_key(timestamp_ms: u64, version: u64) -> Vec<u8> {
-    let mut k = Vec::with_capacity(17);
-    k.push(META_TS);
-    k.extend_from_slice(&timestamp_ms.to_be_bytes());
     k.extend_from_slice(&version.to_be_bytes());
     k
 }

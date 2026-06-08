@@ -496,10 +496,244 @@ impl<S: NodeSource> Iterator for Cursor<'_, S> {
     }
 }
 
+// --- diff de dos árboles CoW (M8) ---
+
+/// Cambio en una clave entre dos árboles (`from` → `to`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum KeyChange {
+    /// Clave nueva en `to`.
+    Added(Vec<u8>),
+    /// Clave que estaba en `from` y desapareció.
+    Removed(Vec<u8>),
+    /// Clave en ambos con valor distinto: `(valor_from, valor_to)`.
+    Modified(Vec<u8>, Vec<u8>),
+}
+
+/// Una clave que difiere entre dos árboles.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KeyDiff {
+    pub key: Vec<u8>,
+    pub change: KeyChange,
+}
+
+/// Diferencias clave a clave entre dos árboles `from` y `to`, en orden
+/// ascendente. **Salta los subárboles con el mismo `PageId`** (inmutables por
+/// CoW): el coste es O(cambios), no O(datos) — el corazón del diff de ramas
+/// barato (M8).
+pub fn diff<S: NodeSource>(src: &S, from: PageId, to: PageId) -> Result<Vec<KeyDiff>> {
+    let mut out = Vec::new();
+    diff_range(src, from, to, None, None, &mut out)?;
+    Ok(out)
+}
+
+/// Diff acotado a `[lo, hi)` (extremos abiertos = `None`).
+fn diff_range<S: NodeSource>(
+    src: &S,
+    from: PageId,
+    to: PageId,
+    lo: Option<&[u8]>,
+    hi: Option<&[u8]>,
+    out: &mut Vec<KeyDiff>,
+) -> Result<()> {
+    if from == to {
+        return Ok(()); // subárbol idéntico: el atajo que da O(cambios)
+    }
+    if from == NO_ROOT {
+        for (key, val) in collect_range(src, to, lo, hi)? {
+            out.push(KeyDiff {
+                key,
+                change: KeyChange::Added(val),
+            });
+        }
+        return Ok(());
+    }
+    if to == NO_ROOT {
+        for (key, val) in collect_range(src, from, lo, hi)? {
+            out.push(KeyDiff {
+                key,
+                change: KeyChange::Removed(val),
+            });
+        }
+        return Ok(());
+    }
+    let from_inner = node::node_type(src.body(from)?.bytes()) == node::TYPE_INNER;
+    let to_inner = node::node_type(src.body(to)?.bytes()) == node::TYPE_INNER;
+    if from_inner && to_inner {
+        diff_inner(src, from, to, lo, hi, out)
+    } else {
+        // Alturas distintas o ambas hojas: comparar las entradas del rango.
+        diff_flat(src, from, to, lo, hi, out)
+    }
+}
+
+/// Dos nodos internos: parte el espacio de claves por las cotas de ambos y
+/// recurre en cada par de hijos que se solapan (saltando los compartidos).
+fn diff_inner<S: NodeSource>(
+    src: &S,
+    from: PageId,
+    to: PageId,
+    lo: Option<&[u8]>,
+    hi: Option<&[u8]>,
+    out: &mut Vec<KeyDiff>,
+) -> Result<()> {
+    let a = child_intervals(src, from)?;
+    let b = child_intervals(src, to)?;
+    let (mut i, mut j) = (0usize, 0usize);
+    while i < a.len() && j < b.len() {
+        let (alo, aup) = (a[i].0.as_deref(), a[i].1.as_deref());
+        let (blo, bup) = (b[j].0.as_deref(), b[j].1.as_deref());
+        let seg_lo = max_lower(max_lower(alo, blo), lo);
+        let seg_hi = min_upper(min_upper(aup, bup), hi);
+        if range_valid(seg_lo, seg_hi) {
+            diff_range(src, a[i].2, b[j].2, seg_lo, seg_hi, out)?;
+        }
+        // Avanzar el hijo con cota superior menor (`None` = +inf).
+        match (aup, bup) {
+            (None, None) => {
+                i += 1;
+                j += 1;
+            }
+            (None, Some(_)) => j += 1,
+            (Some(_), None) => i += 1,
+            (Some(x), Some(y)) => match x.cmp(y) {
+                std::cmp::Ordering::Less => i += 1,
+                std::cmp::Ordering::Greater => j += 1,
+                std::cmp::Ordering::Equal => {
+                    i += 1;
+                    j += 1;
+                }
+            },
+        }
+    }
+    Ok(())
+}
+
+/// Compara dos subárboles materializando sus entradas en `[lo, hi)`. Solo se
+/// usa cuando las alturas difieren o se llega a hojas: los subárboles son
+/// pequeños (la inmensa mayoría se saltó por `PageId` antes de llegar aquí).
+fn diff_flat<S: NodeSource>(
+    src: &S,
+    from: PageId,
+    to: PageId,
+    lo: Option<&[u8]>,
+    hi: Option<&[u8]>,
+    out: &mut Vec<KeyDiff>,
+) -> Result<()> {
+    let a = collect_range(src, from, lo, hi)?;
+    let b = collect_range(src, to, lo, hi)?;
+    let (mut i, mut j) = (0usize, 0usize);
+    while i < a.len() && j < b.len() {
+        match a[i].0.cmp(&b[j].0) {
+            std::cmp::Ordering::Less => {
+                out.push(KeyDiff {
+                    key: a[i].0.clone(),
+                    change: KeyChange::Removed(a[i].1.clone()),
+                });
+                i += 1;
+            }
+            std::cmp::Ordering::Greater => {
+                out.push(KeyDiff {
+                    key: b[j].0.clone(),
+                    change: KeyChange::Added(b[j].1.clone()),
+                });
+                j += 1;
+            }
+            std::cmp::Ordering::Equal => {
+                if a[i].1 != b[j].1 {
+                    out.push(KeyDiff {
+                        key: a[i].0.clone(),
+                        change: KeyChange::Modified(a[i].1.clone(), b[j].1.clone()),
+                    });
+                }
+                i += 1;
+                j += 1;
+            }
+        }
+    }
+    for (key, val) in &a[i..] {
+        out.push(KeyDiff {
+            key: key.clone(),
+            change: KeyChange::Removed(val.clone()),
+        });
+    }
+    for (key, val) in &b[j..] {
+        out.push(KeyDiff {
+            key: key.clone(),
+            change: KeyChange::Added(val.clone()),
+        });
+    }
+    Ok(())
+}
+
+/// Hijos de un nodo interno como `(lower, upper, child)`, contiguos y cubriendo
+/// `(-inf, +inf)`. `cell[i].key` es la cota superior exclusiva de su hijo.
+#[allow(clippy::type_complexity)]
+fn child_intervals<S: NodeSource>(
+    src: &S,
+    id: PageId,
+) -> Result<Vec<(Option<Vec<u8>>, Option<Vec<u8>>, PageId)>> {
+    let body = src.body(id)?;
+    let (cells, rightmost) = node::parse_inner(id.0, body.bytes())?;
+    drop(body);
+    let mut out = Vec::with_capacity(cells.len() + 1);
+    let mut prev: Option<Vec<u8>> = None;
+    for c in cells {
+        out.push((prev.clone(), Some(c.key.clone()), c.child));
+        prev = Some(c.key);
+    }
+    out.push((prev, None, rightmost));
+    Ok(out)
+}
+
+/// Entradas `(key, val)` de un subárbol en `[lo, hi)`, en orden.
+fn collect_range<S: NodeSource>(
+    src: &S,
+    id: PageId,
+    lo: Option<&[u8]>,
+    hi: Option<&[u8]>,
+) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    if id == NO_ROOT {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    for item in scan_from(src, id, lo.unwrap_or(&[]))? {
+        let (key, val) = item?;
+        if hi.is_some_and(|h| key.as_slice() >= h) {
+            break;
+        }
+        out.push((key, val));
+    }
+    Ok(out)
+}
+
+/// Mayor de dos cotas inferiores (`None` = -inf).
+fn max_lower<'a>(a: Option<&'a [u8]>, b: Option<&'a [u8]>) -> Option<&'a [u8]> {
+    match (a, b) {
+        (None, x) | (x, None) => x,
+        (Some(x), Some(y)) => Some(x.max(y)),
+    }
+}
+
+/// Menor de dos cotas superiores (`None` = +inf).
+fn min_upper<'a>(a: Option<&'a [u8]>, b: Option<&'a [u8]>) -> Option<&'a [u8]> {
+    match (a, b) {
+        (None, x) | (x, None) => x,
+        (Some(x), Some(y)) => Some(x.min(y)),
+    }
+}
+
+/// `true` si `[lo, hi)` no es vacío (extremos abiertos siempre válidos).
+fn range_valid(lo: Option<&[u8]>, hi: Option<&[u8]>) -> bool {
+    match (lo, hi) {
+        (Some(l), Some(h)) => l < h,
+        _ => true,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testutil::MemStore;
+    use crate::testutil::{CowMemStore, MemStore};
 
     fn k(i: u32) -> Vec<u8> {
         format!("clave-{i:06}").into_bytes()
@@ -620,5 +854,95 @@ mod tests {
             get(&s, root, &[7u8; node::MAX_KEY_LEN]).unwrap().unwrap(),
             b"v"
         );
+    }
+
+    // --- diff (M8) ---
+
+    fn change_of<'a>(d: &'a [KeyDiff], key: &[u8]) -> Option<&'a KeyChange> {
+        d.iter().find(|e| e.key == key).map(|e| &e.change)
+    }
+
+    #[test]
+    fn diff_detects_add_remove_modify_in_order() {
+        let mut s = CowMemStore::new();
+        let mut from = NO_ROOT;
+        for i in 0..200 {
+            from = insert(&mut s, from, &k(i), &v(i)).unwrap();
+        }
+        s.freeze(); // congela `from`: las siguientes mutaciones lo dejan intacto
+        let mut to = insert(&mut s, from, &k(999), b"nuevo").unwrap(); // added
+        to = insert(&mut s, to, &k(100), b"cambiado").unwrap(); // modified
+        to = delete(&mut s, to, &k(50)).unwrap().0; // removed
+
+        let d = diff(&s, from, to).unwrap();
+        assert_eq!(d.len(), 3, "{d:?}");
+        assert_eq!(
+            change_of(&d, &k(999)),
+            Some(&KeyChange::Added(b"nuevo".to_vec()))
+        );
+        assert_eq!(
+            change_of(&d, &k(100)),
+            Some(&KeyChange::Modified(v(100), b"cambiado".to_vec()))
+        );
+        assert_eq!(change_of(&d, &k(50)), Some(&KeyChange::Removed(v(50))));
+        // Salida en orden ascendente de clave.
+        assert!(d.windows(2).all(|w| w[0].key < w[1].key));
+    }
+
+    #[test]
+    fn diff_empty_and_identical() {
+        let mut s = MemStore::new();
+        let mut t = NO_ROOT;
+        for i in 0..30 {
+            t = insert(&mut s, t, &k(i), &v(i)).unwrap();
+        }
+        assert!(diff(&s, t, t).unwrap().is_empty());
+
+        let added = diff(&s, NO_ROOT, t).unwrap();
+        assert_eq!(added.len(), 30);
+        assert!(
+            added
+                .iter()
+                .all(|e| matches!(e.change, KeyChange::Added(_)))
+        );
+
+        let removed = diff(&s, t, NO_ROOT).unwrap();
+        assert_eq!(removed.len(), 30);
+        assert!(
+            removed
+                .iter()
+                .all(|e| matches!(e.change, KeyChange::Removed(_)))
+        );
+    }
+
+    #[test]
+    fn diff_is_exact_on_a_large_shared_tree() {
+        // Árbol multinivel grande; copia CoW con pocos cambios ⇒ diff exacto y
+        // pequeño. La corrección sobre miles de claves implica que el skip por
+        // `PageId` funciona: los subárboles compartidos no se materializan.
+        let mut s = CowMemStore::new();
+        let mut from = NO_ROOT;
+        for i in 0..5000 {
+            from = insert(&mut s, from, &k(i), &v(i)).unwrap();
+        }
+        s.freeze();
+        let mut to = from;
+        for i in [3u32, 1234, 2500, 4999] {
+            to = insert(&mut s, to, &k(i), b"X").unwrap(); // 4 modificadas
+        }
+        to = insert(&mut s, to, &k(9999), b"nuevo").unwrap(); // 1 añadida
+        to = delete(&mut s, to, &k(2222)).unwrap().0; // 1 borrada
+
+        let d = diff(&s, from, to).unwrap();
+        assert_eq!(d.len(), 6, "{} cambios: {:?}", d.len(), d);
+        assert_eq!(
+            change_of(&d, &k(9999)),
+            Some(&KeyChange::Added(b"nuevo".to_vec()))
+        );
+        assert_eq!(change_of(&d, &k(2222)), Some(&KeyChange::Removed(v(2222))));
+        assert!(matches!(
+            change_of(&d, &k(2500)),
+            Some(KeyChange::Modified(_, _))
+        ));
     }
 }

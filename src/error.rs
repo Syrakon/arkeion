@@ -2,7 +2,7 @@
 
 use std::fmt;
 
-use crate::tx::AsOf;
+use crate::tx::{AsOf, MergeConflict};
 
 /// Resultado estándar de Arkeion.
 pub type Result<T> = std::result::Result<T, Error>;
@@ -51,6 +51,14 @@ pub enum Error {
     },
     /// Otro proceso (u otro handle) mantiene la base de datos abierta.
     Busy,
+    /// La rama nombrada no existe (M8): `connect_branch`/`drop_branch`/`diff`/
+    /// `merge` sobre una ref inexistente.
+    BranchNotFound(String),
+    /// Una rama con ese nombre ya existe (M8): `create_branch` duplicado.
+    BranchExists(String),
+    /// `merge` con `FailOnConflict` encontró conflictos: claves que ambas ramas
+    /// cambiaron a estados distintos (misma fila, esquema divergente) (M8).
+    Conflict(Vec<MergeConflict>),
 }
 
 impl fmt::Display for Error {
@@ -96,6 +104,11 @@ impl fmt::Display for Error {
                 write!(f, "no se puede convertir {got} a {expected}")
             }
             Error::Busy => write!(f, "la base de datos está en uso por otro proceso"),
+            Error::BranchNotFound(name) => write!(f, "la rama «{name}» no existe"),
+            Error::BranchExists(name) => write!(f, "la rama «{name}» ya existe"),
+            Error::Conflict(conflicts) => {
+                write!(f, "merge con {} conflicto(s) sin resolver", conflicts.len())
+            }
         }
     }
 }

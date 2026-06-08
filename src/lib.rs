@@ -39,27 +39,29 @@
 //! tx.commit().unwrap();
 //! ```
 //!
-//! **Estado**: M7 — cifrado en reposo sobre M6. [`Options::key`] activa
-//! AES-256-GCM por página (D6); la zona de datos va cifrada y autenticada,
-//! clave errónea da [`Error::WrongKey`] y cifrado sin clave [`Error::KeyRequired`].
-//! Reposa sobre M6 (auditoría: [`Database::verify`], [`Error::ChainBroken`]),
-//! M5 (time-travel: `AS OF`, [`Connection::snapshot`]) y M4 (DML completo,
-//! JOINs, agregados, transacciones, prepared statements). La API se estabiliza
-//! milestone a milestone; lo marcado `#[doc(hidden)]` es interno.
+//! **Estado**: M8 — branching, diff y merge sobre M7. [`Database::create_branch`]/
+//! [`Database::connect_branch`]/[`Database::merge`]: ramas estilo Git que
+//! comparten páginas por CoW, [`Database::diff`] O(cambios) y merge 3-way con
+//! [`Error::Conflict`] detallado. Reposa sobre M7 (cifrado: [`Options::key`]),
+//! M6 (auditoría: [`Database::verify`]), M5 (time-travel: `AS OF`) y M4 (DML
+//! completo, JOINs, agregados, transacciones, prepared statements). La API se
+//! estabiliza milestone a milestone; lo marcado `#[doc(hidden)]` es interno.
 
 #![forbid(unsafe_code)]
 
 mod api;
+mod branch;
 mod error;
 
 pub use api::{
     ColIndex, Connection, Database, FromValue, Options, Row, Rows, Statement, Transaction,
 };
+pub use branch::{ChangeKind, Diff, RowChange, SchemaChange};
 pub use commit::AuditReport;
 pub use crypto::Key;
 pub use error::{Error, Result};
 pub use record::Value;
-pub use tx::AsOf;
+pub use tx::{AsOf, BranchInfo, MergeConflict, MergePolicy, MergeReport};
 
 // Módulos internos: públicos solo para que los hitos se construyan incrementalmente
 // sin marcar código de fundación como muerto. NO son API estable.

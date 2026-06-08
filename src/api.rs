@@ -12,6 +12,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
 
+use crate::branch::Diff;
 use crate::commit::AuditReport;
 use crate::crypto::Key;
 use crate::error::{Error, Result};
@@ -21,7 +22,9 @@ use crate::sql::{
     self,
     ast::{AsOfClause, Stmt},
 };
-use crate::tx::{AsOf, Snapshot, Store, WriteTx};
+use crate::tx::{
+    AsOf, BranchInfo, MAIN_BRANCH, MergePolicy, MergeReport, Snapshot, Store, WriteTx,
+};
 
 /// Opciones de apertura. *Zero-config*: los valores por defecto funcionan.
 #[derive(Clone, Debug)]
@@ -109,9 +112,53 @@ impl Database {
     pub fn connect(&self) -> Result<Connection> {
         Ok(Connection {
             store: self.store.clone(),
+            branch: MAIN_BRANCH.to_owned(),
             open_tx: RefCell::new(None),
             pinned: None,
         })
+    }
+
+    /// Conexión sobre una rama concreta (M8): sus lecturas y escrituras van a
+    /// esa rama. `BranchNotFound` si no existe.
+    pub fn connect_branch(&self, name: &str) -> Result<Connection> {
+        self.store.snapshot_on(name)?; // valida que la rama existe
+        Ok(Connection {
+            store: self.store.clone(),
+            branch: name.to_owned(),
+            open_tx: RefCell::new(None),
+            pinned: None,
+        })
+    }
+
+    /// Crea una rama apuntando al estado `from` (M8, D5). `BranchExists` si ya
+    /// existe. Es un commit meta-only: comparte físicamente las páginas con
+    /// `from` hasta que diverja (CoW).
+    pub fn create_branch(&self, name: &str, from: AsOf) -> Result<()> {
+        self.store.create_branch(name, from)
+    }
+
+    /// Borra una rama (M8): elimina su ref; las páginas quedan hasta `vacuum`
+    /// (M9). No se puede borrar `main`.
+    pub fn drop_branch(&self, name: &str) -> Result<()> {
+        self.store.drop_branch(name)
+    }
+
+    /// Lista todas las ramas y la versión a la que apunta cada una (M8).
+    pub fn branches(&self) -> Result<Vec<BranchInfo>> {
+        self.store.branches()
+    }
+
+    /// Diferencias de `from` a `to` entre dos ramas (M8): cambios de esquema y
+    /// de fila. O(cambios) — salta los subárboles físicamente compartidos.
+    pub fn diff(&self, from: &str, to: &str) -> Result<Diff> {
+        Ok(crate::branch::decode(&self.store.diff(from, to)?))
+    }
+
+    /// Fusiona `from` en `into` (merge 3-way, M8). Un merge limpio aplica
+    /// exactamente el diff de `from`; con [`MergePolicy::FailOnConflict`], una
+    /// clave cambiada distinto en ambas ramas devuelve [`Error::Conflict`].
+    pub fn merge(&self, from: &str, into: &str, policy: MergePolicy) -> Result<MergeReport> {
+        self.store.merge(from, into, policy)
     }
 
     /// Auditoría completa de la hash chain (M6): recorre todos los commits de
@@ -156,6 +203,9 @@ fn clause_to_asof(clause: &AsOfClause) -> AsOf {
 /// bloquean ni son bloqueadas por la escritura en curso.
 pub struct Connection {
     store: Arc<Store>,
+    /// Rama sobre la que lee y escribe esta conexión (M8). `main` por defecto;
+    /// otra vía [`Database::connect_branch`].
+    branch: String,
     /// Transacción abierta con `BEGIN` (SQL). `None` = autocommit. Soltarla
     /// sin `COMMIT` (p. ej. al soltar la conexión) es un rollback.
     open_tx: RefCell<Option<WriteTx>>,
@@ -188,7 +238,7 @@ impl Connection {
                         "ya hay una transacción abierta: COMMIT o ROLLBACK antes de BEGIN",
                     ));
                 }
-                *open = Some(self.store.begin()?);
+                *open = Some(self.store.begin_on(&self.branch)?);
                 Ok(0)
             }
             Stmt::Commit => {
@@ -214,7 +264,7 @@ impl Connection {
                 Some(tx) => exec::run_execute(tx, stmt, params),
                 // Autocommit: o toda la sentencia, o nada.
                 None => {
-                    let mut tx = self.store.begin()?;
+                    let mut tx = self.store.begin_on(&self.branch)?;
                     let n = exec::run_execute(&mut tx, stmt, params)?;
                     tx.commit()?;
                     Ok(n)
@@ -250,7 +300,7 @@ impl Connection {
         } else {
             match self.open_tx.borrow().as_ref() {
                 Some(tx) => exec::run_select(tx, select, params)?,
-                None => exec::run_select(&self.store.snapshot(), select, params)?,
+                None => exec::run_select(&self.store.snapshot_on(&self.branch)?, select, params)?,
             }
         };
         Ok(Rows {
@@ -278,7 +328,7 @@ impl Connection {
             ));
         }
         Ok(Transaction {
-            tx: RefCell::new(self.store.begin()?),
+            tx: RefCell::new(self.store.begin_on(&self.branch)?),
             _conn: PhantomData,
         })
     }
@@ -315,17 +365,21 @@ impl Connection {
         let snap = self.store.snapshot_at(at)?;
         Ok(Connection {
             store: self.store.clone(),
+            branch: self.branch.clone(),
             open_tx: RefCell::new(None),
             pinned: Some(snap),
         })
     }
 
     /// Versión actual de la conexión: el snapshot fijado si la conexión es de
-    /// solo lectura ([`Connection::snapshot`]), o el head de la rama si no.
+    /// solo lectura ([`Connection::snapshot`]), o el head de su rama si no.
     pub fn version(&self) -> u64 {
         match &self.pinned {
             Some(snap) => snap.version(),
-            None => self.store.version(),
+            None => self
+                .store
+                .snapshot_on(&self.branch)
+                .map_or(0, |s| s.version()),
         }
     }
 }

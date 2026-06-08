@@ -155,6 +155,32 @@ impl Database {
         Ok(crate::branch::decode(&self.store.diff(from, to)?))
     }
 
+    /// Diferencias entre dos **versiones** de la historia (post-M9): el "git
+    /// diff" entre dos puntos en el tiempo. Combínalo con [`history`](Database::history)
+    /// (el "git log") para inspeccionar qué cambió y cuándo. `0` = estado vacío
+    /// inicial; una versión futura o compactada por `vacuum` da
+    /// [`Error::VersionNotFound`]. Para ver qué hizo un solo commit `v`, usa
+    /// `diff_versions(v - 1, v)`.
+    ///
+    /// ```
+    /// use arkeion::{Database, Options};
+    ///
+    /// let dir = tempfile::tempdir().unwrap();
+    /// let db = Database::open(dir.path().join("t.arkeion"), Options::default()).unwrap();
+    /// let conn = db.connect().unwrap();
+    /// conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER)", &[]).unwrap();
+    /// conn.execute("INSERT INTO t (n) VALUES (10)", &[]).unwrap(); // v2
+    /// conn.execute("INSERT INTO t (n) VALUES (20)", &[]).unwrap(); // v3
+    ///
+    /// // Qué cambió en el commit v3 (la segunda inserción): una fila nueva.
+    /// let d = db.diff_versions(2, 3).unwrap();
+    /// assert_eq!(d.rows.len(), 1);
+    /// assert!(d.schema.is_empty());
+    /// ```
+    pub fn diff_versions(&self, from: u64, to: u64) -> Result<Diff> {
+        Ok(crate::branch::decode(&self.store.diff_versions(from, to)?))
+    }
+
     /// Fusiona `from` en `into` (merge 3-way, M8). Un merge limpio aplica
     /// exactamente el diff de `from`; con [`MergePolicy::FailOnConflict`], una
     /// clave cambiada distinto en ambas ramas devuelve [`Error::Conflict`].

@@ -432,6 +432,21 @@ impl Store {
         btree::diff(&src, from_root, to_root)
     }
 
+    /// Diferencias del árbol de datos entre dos **versiones** (post-M9): el "git
+    /// diff" entre dos puntos de la historia (cf. [`history`](Store::history)).
+    /// `0` = estado génesis; una versión futura o ya compactada por `vacuum` da
+    /// `VersionNotFound`. O(cambios) como [`diff`](Store::diff).
+    pub fn diff_versions(&self, from: u64, to: u64) -> Result<Vec<btree::KeyDiff>> {
+        let (pager, head) = {
+            let st = self.lock();
+            (st.pager.clone(), st.head.clone())
+        };
+        let from_root = read_data_root(&pager, head.meta_root, from)?;
+        let to_root = read_data_root(&pager, head.meta_root, to)?;
+        let src = PagerSource(pager);
+        btree::diff(&src, from_root, to_root)
+    }
+
     /// Fusiona `from` en `into` (merge 3-way, M8). Encuentra el ancestro común
     /// por versión, compara `diff(base, from)` con `diff(base, into)` clave a
     /// clave: aplica los cambios que solo hizo `from`; ante una clave que ambas
@@ -2504,5 +2519,38 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![3, 4]
         );
+    }
+
+    /// `diff_versions` compara dos puntos de la historia (el "git diff").
+    #[test]
+    fn diff_versions_compares_two_points_in_time() {
+        let dir = tempfile::tempdir().unwrap();
+        // store_with_versions deja en cada versión v: kv "k{v}" y reescribe "head".
+        let store = store_with_versions(&dir.path().join("d.arkeion"), 5);
+
+        // De v2 a v4: aparecen k3 y k4, y "head" se modifica (2→4).
+        let changes = store.diff_versions(2, 4).unwrap();
+        let keys: std::collections::HashSet<Vec<u8>> =
+            changes.iter().map(|c| c.key.clone()).collect();
+        assert!(keys.contains(b"k3".as_slice()));
+        assert!(keys.contains(b"k4".as_slice()));
+        assert!(keys.contains(b"head".as_slice()));
+        assert!(!keys.contains(b"k2".as_slice()), "k2 ya existía en v2");
+
+        // Un solo commit: diff_versions(v-1, v).
+        let one = store.diff_versions(4, 5).unwrap();
+        let one_keys: std::collections::HashSet<Vec<u8>> =
+            one.iter().map(|c| c.key.clone()).collect();
+        assert!(one_keys.contains(b"k5".as_slice()));
+        assert!(one_keys.contains(b"head".as_slice()));
+        assert_eq!(one_keys.len(), 2);
+
+        // Génesis (0) a head: todo es nuevo.
+        assert!(!store.diff_versions(0, 5).unwrap().is_empty());
+        // Versión futura ⇒ VersionNotFound.
+        assert!(matches!(
+            store.diff_versions(2, 99),
+            Err(Error::VersionNotFound(_))
+        ));
     }
 }

@@ -135,10 +135,14 @@ fn run_arkeion(durable_n: i64, bulk_n: i64, scan_reps: i64) -> Vec<(&'static str
 fn run_sqlite(durable_n: i64, bulk_n: i64, scan_reps: i64) -> Vec<(&'static str, f64)> {
     use rusqlite::Connection;
 
-    // Durabilidad equivalente a arkeion: synchronous=FULL + journal por defecto.
+    // Durabilidad equivalente a arkeion: synchronous=FULL. Journal de rollback
+    // por defecto; con ARKEION_BENCH_SQLITE_WAL=1, modo WAL (1 fsync/commit).
     fn open(path: std::path::PathBuf) -> Connection {
         let conn = Connection::open(path).unwrap();
         conn.pragma_update(None, "synchronous", "FULL").unwrap();
+        if std::env::var("ARKEION_BENCH_SQLITE_WAL").is_ok() {
+            conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+        }
         conn.execute_batch(CREATE).unwrap();
         conn
     }

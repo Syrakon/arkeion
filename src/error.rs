@@ -2,6 +2,8 @@
 
 use std::fmt;
 
+use crate::tx::AsOf;
+
 /// Resultado estándar de Arkeion.
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -31,6 +33,9 @@ pub enum Error {
     Constraint(&'static str),
     /// Error de SQL: sintaxis (con posición en bytes) o semántica (sin ella).
     Sql { msg: String, pos: Option<usize> },
+    /// `AS OF` apunta a un punto inalcanzable de la historia: versión futura o
+    /// ya compactada por `vacuum` (M9).
+    VersionNotFound(AsOf),
     /// Conversión `Row::get::<T>` imposible para el valor presente.
     Conversion {
         expected: &'static str,
@@ -63,6 +68,18 @@ impl fmt::Display for Error {
             Error::Constraint(reason) => write!(f, "restricción violada: {reason}"),
             Error::Sql { msg, pos: Some(p) } => write!(f, "error SQL en byte {p}: {msg}"),
             Error::Sql { msg, pos: None } => write!(f, "error SQL: {msg}"),
+            Error::VersionNotFound(AsOf::Version(v)) => {
+                write!(
+                    f,
+                    "la versión {v} no existe (futura o compactada por vacuum)"
+                )
+            }
+            Error::VersionNotFound(_) => {
+                write!(
+                    f,
+                    "no hay ninguna versión para el punto temporal solicitado"
+                )
+            }
             Error::Conversion { expected, got } => {
                 write!(f, "no se puede convertir {got} a {expected}")
             }

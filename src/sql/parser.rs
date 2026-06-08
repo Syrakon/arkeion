@@ -13,6 +13,7 @@ use crate::catalog::ColType;
 use crate::error::{Error, Result};
 use crate::record::Value;
 use crate::sql::ast::*;
+use crate::sql::datetime;
 use crate::sql::lexer::{Kw, Spanned, Tok, lex};
 
 pub fn parse(sql: &str) -> Result<Stmt> {
@@ -351,6 +352,7 @@ impl Parser {
         } else {
             None
         };
+        let as_of = self.as_of()?;
         Ok(SelectStmt {
             projection,
             from,
@@ -359,13 +361,59 @@ impl Parser {
             order_by,
             limit,
             offset,
+            as_of,
         })
+    }
+
+    /// `AS OF VERSION n | AS OF TIMESTAMP 'rfc3339'`, al cierre de un SELECT
+    /// (docs/04-sql). El timestamp se resuelve aquí a epoch ms para que un
+    /// literal mal formado falle con posición, como el resto del parser.
+    fn as_of(&mut self) -> Result<Option<AsOfClause>> {
+        if self.peek() != Some(&Tok::Kw(Kw::As)) || self.peek2() != Some(&Tok::Kw(Kw::Of)) {
+            return Ok(None);
+        }
+        self.next(); // AS
+        self.next(); // OF
+        if self.eat_kw(Kw::Version) {
+            let pos = self.pos();
+            match self.next() {
+                Some(Tok::Int(n)) if n >= 0 => Ok(Some(AsOfClause::Version(n as u64))),
+                _ => Err(err_at(
+                    pos,
+                    "se esperaba un número de versión entero no negativo",
+                )),
+            }
+        } else if self.eat_kw(Kw::Timestamp) {
+            let pos = self.pos();
+            match self.next() {
+                Some(Tok::Str(s)) => {
+                    let ms = datetime::parse_rfc3339_ms(&s)
+                        .ok_or_else(|| err_at(pos, "timestamp RFC 3339 inválido"))?;
+                    Ok(Some(AsOfClause::Timestamp(ms)))
+                }
+                _ => Err(err_at(
+                    pos,
+                    "se esperaba un literal de timestamp RFC 3339 entre comillas",
+                )),
+            }
+        } else {
+            Err(err_at(
+                self.pos(),
+                "se esperaba VERSION o TIMESTAMP tras AS OF",
+            ))
+        }
     }
 
     fn table_ref(&mut self) -> Result<TableRef> {
         let name = self.ident("un nombre de tabla")?;
-        // `AS` exige el alias; un identificador suelto también lo es.
-        let alias = if self.eat_kw(Kw::As) || matches!(self.peek(), Some(Tok::Ident(_))) {
+        // `AS` exige el alias; un identificador suelto también lo es. Pero
+        // `AS OF` es la cláusula temporal de sentencia, no un alias: no la
+        // consumas aquí aunque empiece por `AS`.
+        let as_of_ahead =
+            self.peek() == Some(&Tok::Kw(Kw::As)) && self.peek2() == Some(&Tok::Kw(Kw::Of));
+        let alias = if !as_of_ahead
+            && (self.eat_kw(Kw::As) || matches!(self.peek(), Some(Tok::Ident(_))))
+        {
             Some(self.ident("un alias de tabla")?)
         } else {
             None
@@ -625,6 +673,47 @@ mod tests {
             SelectItem::Expr(Expr::Column { table: Some(t), name }) if t == "c" && name == "nombre"
         ));
         assert_eq!(s.order_by[0].table.as_deref(), Some("c"));
+    }
+
+    #[test]
+    fn as_of_version_and_timestamp() {
+        // Tras WHERE/ORDER/LIMIT, sin ambigüedad de alias.
+        let Stmt::Select(s) =
+            parse("SELECT total FROM facturas WHERE id = 7 AS OF VERSION 1042").unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(s.as_of, Some(AsOfClause::Version(1042)));
+
+        // `FROM tabla AS OF …`: el `AS` es de la cláusula temporal, no un
+        // alias. La tabla queda sin alias.
+        let Stmt::Select(s) =
+            parse("SELECT * FROM facturas AS OF TIMESTAMP '1970-01-01T00:00:00.250Z'").unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(s.from.alias, None);
+        assert_eq!(s.as_of, Some(AsOfClause::Timestamp(250)));
+
+        // Sin AS OF, sigue siendo None; y un alias real sigue funcionando.
+        let Stmt::Select(s) = parse("SELECT * FROM facturas f").unwrap() else {
+            panic!()
+        };
+        assert_eq!(s.as_of, None);
+        assert_eq!(s.from.alias.as_deref(), Some("f"));
+    }
+
+    #[test]
+    fn as_of_rejects_malformed() {
+        // Falta VERSION/TIMESTAMP.
+        assert!(parse("SELECT * FROM t AS OF 5").is_err());
+        // Versión no entera.
+        assert!(parse("SELECT * FROM t AS OF VERSION 'x'").is_err());
+        // Timestamp inválido: error con posición (es un error SQL posicionado).
+        let err = parse("SELECT * FROM t AS OF TIMESTAMP 'ayer'").unwrap_err();
+        assert!(matches!(err, Error::Sql { pos: Some(_), .. }));
+        // AS OF solo cierra la sentencia: nada después.
+        assert!(parse("SELECT * FROM t AS OF VERSION 1 LIMIT 5").is_err());
     }
 
     #[test]

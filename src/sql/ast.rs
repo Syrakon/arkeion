@@ -87,6 +87,18 @@ pub struct SelectStmt {
     pub order_by: Vec<OrderBy>,
     pub limit: Option<Expr>,
     pub offset: Option<Expr>,
+    /// `AS OF` (time-travel, M5): si está, toda la consulta se evalúa contra
+    /// un único snapshot histórico. Cierra la sentencia.
+    pub as_of: Option<AsOfClause>,
+}
+
+/// Punto histórico de un `SELECT … AS OF` (docs/04-sql). La versión es la
+/// autoridad; el timestamp ya viene resuelto a epoch ms desde el literal
+/// RFC 3339 en el parser (docs/05, D12).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum AsOfClause {
+    Version(u64),
+    Timestamp(u64),
 }
 
 #[derive(Clone, Debug, PartialEq)]

@@ -39,10 +39,12 @@
 //! tx.commit().unwrap();
 //! ```
 //!
-//! **Estado**: M4 — DML completo, el MVP: `UPDATE`/`DELETE`, `INNER`/`LEFT
-//! JOIN`, agregados sin `GROUP BY`, transacciones explícitas (`BEGIN` SQL y
-//! [`Transaction`]) y sentencias preparadas. La API se estabiliza milestone
-//! a milestone; lo marcado `#[doc(hidden)]` es interno.
+//! **Estado**: M5 — time-travel sobre el MVP de M4. `SELECT … AS OF VERSION n`
+//! y `AS OF TIMESTAMP 'rfc3339'`, más [`Connection::snapshot`] (conexión de
+//! solo lectura fijada a un punto de la historia). Reposa sobre M4: DML
+//! completo, `INNER`/`LEFT JOIN`, agregados sin `GROUP BY`, transacciones
+//! explícitas y sentencias preparadas. La API se estabiliza milestone a
+//! milestone; lo marcado `#[doc(hidden)]` es interno.
 
 #![forbid(unsafe_code)]
 
@@ -54,6 +56,7 @@ pub use api::{
 };
 pub use error::{Error, Result};
 pub use record::Value;
+pub use tx::AsOf;
 
 // Módulos internos: públicos solo para que los hitos se construyan incrementalmente
 // sin marcar código de fundación como muerto. NO son API estable.

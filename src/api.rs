@@ -10,12 +10,16 @@ use std::cell::RefCell;
 use std::marker::PhantomData;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::{Duration, UNIX_EPOCH};
 
 use crate::error::{Error, Result};
 use crate::exec;
 use crate::record::Value;
-use crate::sql::{self, ast::Stmt};
-use crate::tx::{Store, WriteTx};
+use crate::sql::{
+    self,
+    ast::{AsOfClause, Stmt},
+};
+use crate::tx::{AsOf, Snapshot, Store, WriteTx};
 
 /// Opciones de apertura. *Zero-config*: los valores por defecto funcionan.
 #[derive(Clone, Debug)]
@@ -71,6 +75,7 @@ impl Database {
         Ok(Connection {
             store: self.store.clone(),
             open_tx: RefCell::new(None),
+            pinned: None,
         })
     }
 }
@@ -82,6 +87,14 @@ fn sql_err(msg: impl Into<String>) -> Error {
     }
 }
 
+/// Traduce el `AS OF` ya parseado de un SELECT al punto temporal del almacén.
+fn clause_to_asof(clause: &AsOfClause) -> AsOf {
+    match *clause {
+        AsOfClause::Version(v) => AsOf::Version(v),
+        AsOfClause::Timestamp(ms) => AsOf::Timestamp(UNIX_EPOCH + Duration::from_millis(ms)),
+    }
+}
+
 /// Conexión: ejecuta SQL. Las lecturas usan snapshots inmutables y jamás
 /// bloquean ni son bloqueadas por la escritura en curso.
 pub struct Connection {
@@ -89,6 +102,10 @@ pub struct Connection {
     /// Transacción abierta con `BEGIN` (SQL). `None` = autocommit. Soltarla
     /// sin `COMMIT` (p. ej. al soltar la conexión) es un rollback.
     open_tx: RefCell<Option<WriteTx>>,
+    /// Si está, la conexión es de **solo lectura** fijada a este snapshot
+    /// histórico ([`Connection::snapshot`]): toda consulta lo ve y las
+    /// escrituras devuelven error. Vacío en una conexión normal.
+    pinned: Option<Snapshot>,
 }
 
 impl Connection {
@@ -100,6 +117,11 @@ impl Connection {
     }
 
     fn execute_stmt(&self, stmt: &Stmt, params: &[Value]) -> Result<usize> {
+        if self.pinned.is_some() {
+            return Err(sql_err(
+                "conexión de solo lectura (snapshot histórico): no admite escrituras",
+            ));
+        }
         match stmt {
             Stmt::Select(_) => Err(sql_err("SELECT devuelve filas: usa query")),
             Stmt::Begin => {
@@ -155,9 +177,24 @@ impl Connection {
         let Stmt::Select(select) = stmt else {
             return Err(sql_err("solo SELECT devuelve filas: usa execute"));
         };
-        let out = match self.open_tx.borrow().as_ref() {
-            Some(tx) => exec::run_select(tx, select, params)?,
-            None => exec::run_select(&self.store.snapshot(), select, params)?,
+        let out = if let Some(snap) = &self.pinned {
+            // Conexión ya fijada a un instante: no se puede re-fijar por sentencia.
+            if select.as_of.is_some() {
+                return Err(sql_err(
+                    "la conexión ya está fijada a un snapshot: quita el AS OF de la consulta",
+                ));
+            }
+            exec::run_select(snap, select, params)?
+        } else if let Some(clause) = &select.as_of {
+            // AS OF lee la historia confirmada; ignora una tx abierta (no se
+            // escribe en el pasado: para eso están las ramas, M8).
+            let snap = self.store.snapshot_at(clause_to_asof(clause))?;
+            exec::run_select(&snap, select, params)?
+        } else {
+            match self.open_tx.borrow().as_ref() {
+                Some(tx) => exec::run_select(tx, select, params)?,
+                None => exec::run_select(&self.store.snapshot(), select, params)?,
+            }
         };
         Ok(Rows {
             columns: Arc::from(out.columns),
@@ -178,15 +215,61 @@ impl Connection {
     /// si ya hay una escritura en curso (incluido un `BEGIN` SQL en esta
     /// misma conexión), devuelve [`Error::Busy`].
     pub fn begin(&self) -> Result<Transaction<'_>> {
+        if self.pinned.is_some() {
+            return Err(sql_err(
+                "conexión de solo lectura (snapshot histórico): no admite transacciones",
+            ));
+        }
         Ok(Transaction {
             tx: RefCell::new(self.store.begin()?),
             _conn: PhantomData,
         })
     }
 
-    /// Versión actual (número de commit) de la base.
+    /// Conexión **de solo lectura** fijada a un punto de la historia
+    /// (time-travel, M5): todas sus consultas ven ese instante y las
+    /// escrituras devuelven error. Falla con [`Error::VersionNotFound`] si el
+    /// punto no existe. La versión es la autoridad; el timestamp es
+    /// informativo (docs/05, D12).
+    ///
+    /// ```
+    /// use arkeion::{AsOf, Database, Options};
+    ///
+    /// let dir = tempfile::tempdir().unwrap();
+    /// let db = Database::open(dir.path().join("t.arkeion"), Options::default()).unwrap();
+    /// let conn = db.connect().unwrap();
+    /// conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER NOT NULL)", &[])
+    ///     .unwrap();
+    /// conn.execute("INSERT INTO t (n) VALUES (1)", &[]).unwrap();
+    /// let v1 = conn.version();
+    /// conn.execute("INSERT INTO t (n) VALUES (2)", &[]).unwrap();
+    ///
+    /// // Una vista fijada a v1 solo ve la primera fila.
+    /// let antes = conn.snapshot(AsOf::Version(v1)).unwrap();
+    /// let mut rows = antes.query("SELECT n FROM t", &[]).unwrap();
+    /// assert_eq!(rows.next().unwrap().unwrap().get::<i64>("n").unwrap(), 1);
+    /// assert!(rows.next().is_none());
+    ///
+    /// // Es de solo lectura.
+    /// assert!(antes.execute("INSERT INTO t (n) VALUES (3)", &[]).is_err());
+    /// ```
+    pub fn snapshot(&self, at: AsOf) -> Result<Connection> {
+        // Resuelve ya: una versión inexistente falla aquí, no al consultar.
+        let snap = self.store.snapshot_at(at)?;
+        Ok(Connection {
+            store: self.store.clone(),
+            open_tx: RefCell::new(None),
+            pinned: Some(snap),
+        })
+    }
+
+    /// Versión actual de la conexión: el snapshot fijado si la conexión es de
+    /// solo lectura ([`Connection::snapshot`]), o el head de la rama si no.
     pub fn version(&self) -> u64 {
-        self.store.version()
+        match &self.pinned {
+            Some(snap) => snap.version(),
+            None => self.store.version(),
+        }
     }
 }
 
@@ -236,6 +319,12 @@ impl Transaction<'_> {
         let Stmt::Select(select) = sql::parse(sql)? else {
             return Err(sql_err("solo SELECT devuelve filas: usa execute"));
         };
+        if select.as_of.is_some() {
+            return Err(sql_err(
+                "AS OF no está disponible dentro de una transacción de escritura: \
+                 usa una consulta normal o Connection::snapshot",
+            ));
+        }
         let out = exec::run_select(&*self.tx.borrow(), &select, params)?;
         Ok(Rows {
             columns: Arc::from(out.columns),

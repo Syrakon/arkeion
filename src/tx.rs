@@ -31,6 +31,19 @@ const META_REF: u8 = 0x01;
 const META_HIST: u8 = 0x02;
 const META_TS: u8 = 0x03;
 
+/// Punto en la historia al que fijar una lectura (time-travel, M5). El
+/// timestamp es informativo; la versión es la autoridad (docs/05, D12).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum AsOf {
+    /// Head actual de la rama (equivale a [`Store::snapshot`]).
+    Head,
+    /// Versión exacta (número de commit). `VersionNotFound` si es futura o ya
+    /// la compactó `vacuum` (M9).
+    Version(u64),
+    /// Mayor versión cuyo commit tiene timestamp ≤ el dado.
+    Timestamp(SystemTime),
+}
+
 /// Almacén clave-valor transaccional sobre un único archivo. Todos sus
 /// campos son `Arc`: clonarlo es barato y las transacciones son dueñas de
 /// lo que necesitan (sin lifetimes hacia el `Store`).
@@ -98,6 +111,83 @@ impl Store {
 
     pub fn version(&self) -> u64 {
         self.head.lock().expect("head envenenado").version
+    }
+
+    /// Snapshot histórico (M5, time-travel). `AsOf::Head` equivale a
+    /// [`snapshot`](Store::snapshot). Funciona porque el b-tree es CoW
+    /// append-only: la raíz de cada versión sigue en disco hasta que `vacuum`
+    /// (M9) la compacte, y el índice histórico del árbol meta (escrito en cada
+    /// commit, `META_HIST`/`META_TS`) la localiza.
+    pub fn snapshot_at(&self, at: AsOf) -> Result<Snapshot> {
+        let head = self.head.lock().expect("head envenenado").clone();
+        match at {
+            AsOf::Head => Ok(self.snapshot_of(head.version, head.data_root)),
+            AsOf::Version(v) => self.snapshot_at_version(&head, v),
+            AsOf::Timestamp(t) => self.snapshot_at_timestamp(&head, system_time_to_ms(t)),
+        }
+    }
+
+    fn snapshot_of(&self, version: u64, data_root: PageId) -> Snapshot {
+        Snapshot {
+            pager: self.pager.clone(),
+            version,
+            data_root,
+        }
+    }
+
+    /// Estado tras 0 commits: árbol de datos vacío, ligado a la identidad del
+    /// archivo.
+    fn genesis_snapshot(&self) -> Snapshot {
+        let data_root = commit::genesis_head(&self.pager.header().file_id).data_root;
+        self.snapshot_of(0, data_root)
+    }
+
+    fn snapshot_at_version(&self, head: &Head, v: u64) -> Result<Snapshot> {
+        if v == head.version {
+            return Ok(self.snapshot_of(head.version, head.data_root));
+        }
+        if v > head.version {
+            return Err(Error::VersionNotFound(AsOf::Version(v)));
+        }
+        if v == 0 {
+            return Ok(self.genesis_snapshot());
+        }
+        let src = PagerSource(self.pager.clone());
+        let raw = btree::get(&src, head.meta_root, &hist_key(v))?
+            .ok_or(Error::VersionNotFound(AsOf::Version(v)))?;
+        let bytes: [u8; 8] = raw
+            .get(0..8)
+            .ok_or(Error::CorruptRecord("entrada histórica truncada"))?
+            .try_into()
+            .expect("rango fijo de 8 bytes");
+        Ok(self.snapshot_of(v, PageId(u64::from_le_bytes(bytes))))
+    }
+
+    /// Mayor versión con timestamp ≤ `ms` (índice `META_TS`, ordenado por
+    /// `(ts, version)` en big-endian): recorre el espacio hacia delante y se
+    /// queda con la última entrada ≤ `ms`. Antes del primer commit ⇒ estado
+    /// génesis. Coste O(commits hasta `ms`), aceptable en v1 (sin índice
+    /// secundario hasta v1.1).
+    fn snapshot_at_timestamp(&self, head: &Head, ms: u64) -> Result<Snapshot> {
+        let src = PagerSource(self.pager.clone());
+        let mut best: Option<u64> = None;
+        for item in btree::scan_from(&src, head.meta_root, &[META_TS])? {
+            let (key, _) = item?;
+            if key.first() != Some(&META_TS) || key.len() != 1 + 8 + 8 {
+                break; // fuera del espacio de timestamps
+            }
+            let ts = u64::from_be_bytes(key[1..9].try_into().expect("rango fijo de 8 bytes"));
+            if ts > ms {
+                break;
+            }
+            best = Some(u64::from_be_bytes(
+                key[9..17].try_into().expect("rango fijo de 8 bytes"),
+            ));
+        }
+        match best {
+            None => Ok(self.genesis_snapshot()),
+            Some(v) => self.snapshot_at_version(head, v),
+        }
     }
 }
 
@@ -414,6 +504,20 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
+fn system_time_to_ms(t: SystemTime) -> u64 {
+    t.duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64
+}
+
+/// Lector de páginas inmutables del pager: recorre el árbol meta (índice
+/// histórico) sin montar un [`Snapshot`] de datos.
+struct PagerSource(Arc<Pager>);
+
+impl NodeSource for PagerSource {
+    fn body(&self, id: PageId) -> Result<Body<'_>> {
+        Ok(Body::Shared(self.0.read_page(id)?))
+    }
+}
+
 fn hist_key(version: u64) -> Vec<u8> {
     let mut k = Vec::with_capacity(9);
     k.push(META_HIST);
@@ -476,5 +580,88 @@ mod tests {
         // El snapshot viejo sigue viendo el pasado; uno nuevo ve el presente.
         assert_eq!(snap.get(b"k").unwrap(), None);
         assert_eq!(store.snapshot().get(b"k").unwrap().unwrap(), b"v");
+    }
+
+    /// M5: tras K commits, `AS OF VERSION i` reproduce *exactamente* el estado
+    /// i para todo i (0 = vacío). Versión futura ⇒ `VersionNotFound`.
+    #[test]
+    fn snapshot_at_version_reproduces_every_past_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::create(&dir.path().join("t.arkeion")).unwrap();
+
+        // Estado de referencia por versión. Claves con padding para que el
+        // orden de inserción coincida con el de scan (lexicográfico).
+        let k = 12u64;
+        let mut expected: Vec<Vec<(Vec<u8>, Vec<u8>)>> = vec![vec![]];
+        for i in 1..=k {
+            let key = format!("k{i:02}").into_bytes();
+            let val = format!("v{i:02}").into_bytes();
+            let mut tx = store.begin().unwrap();
+            tx.put(&key, &val).unwrap();
+            assert_eq!(tx.commit().unwrap(), i);
+            let mut state = expected[(i - 1) as usize].clone();
+            state.push((key, val));
+            expected.push(state);
+        }
+
+        for i in 0..=k {
+            let snap = store.snapshot_at(AsOf::Version(i)).unwrap();
+            assert_eq!(snap.version(), i);
+            let got: Vec<(Vec<u8>, Vec<u8>)> = snap.scan().unwrap().collect::<Result<_>>().unwrap();
+            assert_eq!(got, expected[i as usize], "estado de la versión {i}");
+        }
+
+        assert!(matches!(
+            store.snapshot_at(AsOf::Version(k + 1)),
+            Err(Error::VersionNotFound(AsOf::Version(_)))
+        ));
+        // `Head` siempre apunta al estado vivo.
+        assert_eq!(store.snapshot_at(AsOf::Head).unwrap().version(), k);
+    }
+
+    /// M5: `AS OF TIMESTAMP` resuelve a la mayor versión con ts ≤ t, con las
+    /// fronteras (antes del primero, entre dos, después del último) correctas.
+    #[test]
+    fn snapshot_at_timestamp_resolves_floor_and_boundaries() {
+        use std::thread::sleep;
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::create(&dir.path().join("t.arkeion")).unwrap();
+
+        // Separación de 2 ms para garantizar timestamps distintos por commit.
+        let before = SystemTime::now();
+        sleep(Duration::from_millis(2));
+
+        let mut tx = store.begin().unwrap();
+        tx.put(b"a", b"1").unwrap();
+        assert_eq!(tx.commit().unwrap(), 1);
+
+        sleep(Duration::from_millis(2));
+        let between = SystemTime::now();
+        sleep(Duration::from_millis(2));
+
+        let mut tx = store.begin().unwrap();
+        tx.put(b"b", b"2").unwrap();
+        assert_eq!(tx.commit().unwrap(), 2);
+
+        sleep(Duration::from_millis(2));
+        let after = SystemTime::now();
+
+        // Antes del primer commit: estado génesis (vacío).
+        let s0 = store.snapshot_at(AsOf::Timestamp(before)).unwrap();
+        assert_eq!(s0.version(), 0);
+        assert_eq!(s0.get(b"a").unwrap(), None);
+
+        // Entre commit 1 y 2: ve `a`, no `b`.
+        let s1 = store.snapshot_at(AsOf::Timestamp(between)).unwrap();
+        assert_eq!(s1.version(), 1);
+        assert_eq!(s1.get(b"a").unwrap().unwrap(), b"1");
+        assert_eq!(s1.get(b"b").unwrap(), None);
+
+        // Después del último: ve todo.
+        let s2 = store.snapshot_at(AsOf::Timestamp(after)).unwrap();
+        assert_eq!(s2.version(), 2);
+        assert_eq!(s2.get(b"b").unwrap().unwrap(), b"2");
     }
 }

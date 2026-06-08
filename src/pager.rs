@@ -19,6 +19,10 @@ use crate::format::{
 };
 use crate::io::{DbFile, sync_parent_dir};
 
+/// Tope de la caché de páginas (M9): ~16 MiB de bodies. Las páginas son
+/// inmutables, así que evictar nunca pierde datos: se releen del disco.
+const CACHE_CAP: usize = 4096;
+
 pub struct Pager {
     file: DbFile,
     header: FileHeader,
@@ -26,9 +30,55 @@ pub struct Pager {
     plain: PlainProvider,
     /// Zona append: `PlainProvider` sin cifrado, `Aes256GcmProvider` con clave (M7).
     crypto: Arc<dyn CryptoProvider>,
-    /// Caché de páginas inmutables. Sin tope en M0; eviction en M9.
-    cache: Mutex<HashMap<PageId, Arc<PageBuf>>>,
+    /// Caché acotada de páginas inmutables (M9): LRU aproximada con tope.
+    cache: Mutex<PageCache>,
     state: Mutex<AppendState>,
+}
+
+/// Caché de páginas con tope y eviction LRU aproximada (M9). Cada entrada lleva
+/// el «tick» del último acceso; al superar el tope se evicta en lote (hasta 3/4
+/// del tope) descartando las más antiguas. O(n log n) por lote, amortizado a
+/// O(log n) por inserción (los lotes distan cap/4 inserciones).
+struct PageCache {
+    map: HashMap<PageId, (Arc<PageBuf>, u64)>,
+    tick: u64,
+    cap: usize,
+}
+
+impl PageCache {
+    fn new(cap: usize) -> PageCache {
+        PageCache {
+            map: HashMap::new(),
+            tick: 0,
+            cap,
+        }
+    }
+
+    fn get(&mut self, id: PageId) -> Option<Arc<PageBuf>> {
+        self.tick += 1;
+        let tick = self.tick;
+        let (page, last) = self.map.get_mut(&id)?;
+        *last = tick;
+        Some(page.clone())
+    }
+
+    fn insert(&mut self, id: PageId, page: Arc<PageBuf>) {
+        self.tick += 1;
+        self.map.insert(id, (page, self.tick));
+        if self.map.len() > self.cap {
+            self.evict_batch();
+        }
+    }
+
+    /// Descarta las entradas más antiguas hasta dejar la caché a 3/4 del tope.
+    fn evict_batch(&mut self) {
+        let target = self.cap * 3 / 4;
+        let drop_n = self.map.len() - target;
+        let mut ticks: Vec<u64> = self.map.values().map(|(_, t)| *t).collect();
+        ticks.select_nth_unstable(drop_n - 1);
+        let threshold = ticks[drop_n - 1];
+        self.map.retain(|_, (_, t)| *t > threshold);
+    }
 }
 
 #[derive(Debug)]
@@ -74,7 +124,7 @@ impl Pager {
             header,
             plain: PlainProvider,
             crypto,
-            cache: Mutex::new(HashMap::new()),
+            cache: Mutex::new(PageCache::new(CACHE_CAP)),
             state: Mutex::new(AppendState {
                 next_page: FIRST_DATA_PAGE.0,
                 nonce_counter: 0,
@@ -151,7 +201,7 @@ impl Pager {
             header,
             plain: PlainProvider,
             crypto,
-            cache: Mutex::new(HashMap::new()),
+            cache: Mutex::new(PageCache::new(CACHE_CAP)),
             // floor: una página final a medio escribir queda fuera y será
             // sobrescrita por el siguiente append (truncado lógico).
             state: Mutex::new(AppendState {
@@ -207,8 +257,8 @@ impl Pager {
                 reason: "página fuera de rango",
             });
         }
-        if let Some(p) = self.cache.lock().expect("caché envenenada").get(&id) {
-            return Ok(p.clone());
+        if let Some(p) = self.cache.lock().expect("caché envenenada").get(id) {
+            return Ok(p);
         }
 
         let mut page = PageBuf::zeroed();
@@ -336,6 +386,11 @@ impl Pager {
 
     pub fn header(&self) -> &FileHeader {
         &self.header
+    }
+
+    #[cfg(test)]
+    fn cache_len(&self) -> usize {
+        self.cache.lock().expect("caché envenenada").map.len()
     }
 }
 
@@ -554,6 +609,42 @@ mod tests {
         let short = dir.path().join("corto.arkeion");
         std::fs::write(&short, b"x").unwrap();
         assert!(matches!(Pager::open(&short), Err(Error::NotADatabase)));
+    }
+
+    #[test]
+    fn page_cache_evicts_oldest_and_stays_bounded() {
+        let mut c = PageCache::new(100);
+        for i in 0..1000u64 {
+            c.insert(PageId(i), Arc::new(PageBuf::zeroed()));
+        }
+        assert!(c.map.len() <= 100, "len {} > tope 100", c.map.len());
+        // Las recién insertadas siguen; las primeras se evictaron.
+        assert!(c.get(PageId(999)).is_some());
+        assert!(c.get(PageId(0)).is_none());
+    }
+
+    #[test]
+    fn cache_eviction_preserves_data_end_to_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = db_path(&dir);
+        let pager = Pager::create(&path).unwrap();
+
+        // Más páginas que el tope ⇒ se evicta durante los appends.
+        let n = CACHE_CAP as u64 + 300;
+        let ids: Vec<PageId> = (0..n)
+            .map(|i| pager.append_page(pattern(i)).unwrap())
+            .collect();
+        pager.sync().unwrap();
+        assert!(pager.cache_len() <= CACHE_CAP);
+
+        // Todas se leen correctas: las evictadas, releídas del disco.
+        for (i, id) in ids.iter().enumerate() {
+            let page = pager.read_page(*id).unwrap();
+            let mut expected = vec![0u8; BODY_SIZE];
+            pattern(i as u64)(&mut expected);
+            assert_eq!(page.body(), &expected[..], "página {i} difiere");
+        }
+        assert!(pager.cache_len() <= CACHE_CAP, "la caché no quedó acotada");
     }
 
     #[test]

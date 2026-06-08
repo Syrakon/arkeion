@@ -432,6 +432,12 @@ impl Store {
         btree::diff(&src, from_root, to_root)
     }
 
+    /// Cambios introducidos por un commit concreto (post-M9): el "git show" de
+    /// la versión `version` (equivale a `diff_versions(version-1, version)`).
+    pub fn changes(&self, version: u64) -> Result<Vec<btree::KeyDiff>> {
+        self.diff_versions(version.saturating_sub(1), version)
+    }
+
     /// Diferencias del árbol de datos entre dos **versiones** (post-M9): el "git
     /// diff" entre dos puntos de la historia (cf. [`history`](Store::history)).
     /// `0` = estado génesis; una versión futura o ya compactada por `vacuum` da
@@ -2556,13 +2562,14 @@ mod tests {
         assert!(keys.contains(b"head".as_slice()));
         assert!(!keys.contains(b"k2".as_slice()), "k2 ya existía en v2");
 
-        // Un solo commit: diff_versions(v-1, v).
+        // Un solo commit: diff_versions(v-1, v) == changes(v).
         let one = store.diff_versions(4, 5).unwrap();
         let one_keys: std::collections::HashSet<Vec<u8>> =
             one.iter().map(|c| c.key.clone()).collect();
         assert!(one_keys.contains(b"k5".as_slice()));
         assert!(one_keys.contains(b"head".as_slice()));
         assert_eq!(one_keys.len(), 2);
+        assert_eq!(store.changes(5).unwrap(), one);
 
         // Génesis (0) a head: todo es nuevo.
         assert!(!store.diff_versions(0, 5).unwrap().is_empty());

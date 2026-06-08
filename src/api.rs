@@ -181,6 +181,12 @@ impl Database {
         Ok(crate::branch::decode(&self.store.diff_versions(from, to)?))
     }
 
+    /// Los cambios que introdujo un commit concreto: el "git show" de la versión
+    /// `version` (equivale a `diff_versions(version - 1, version)`).
+    pub fn changes(&self, version: u64) -> Result<Diff> {
+        Ok(crate::branch::decode(&self.store.changes(version)?))
+    }
+
     /// Fusiona `from` en `into` (merge 3-way, M8). Un merge limpio aplica
     /// exactamente el diff de `from`; con [`MergePolicy::FailOnConflict`], una
     /// clave cambiada distinto en ambas ramas devuelve [`Error::Conflict`].

@@ -235,6 +235,88 @@ fn run_sqlite(_: i64, _: i64, _: i64) -> Vec<(&'static str, f64)> {
     Vec::new()
 }
 
+/// Comparación **justa**: SQLite obligado a dar las mismas garantías que arkeion
+/// —historia completa (tabla `t_log`) + cadena de hash tamper-evident por
+/// escritura—. Cada insert lógico = (fila en `t`) + (entrada encadenada en
+/// `t_log`), en **una** transacción (1 fsync, como el commit de arkeion).
+/// Devuelve (durable ops/s, lote ops/s).
+#[cfg(feature = "bench-sqlite")]
+fn run_sqlite_audited(durable_n: i64, bulk_n: i64) -> (f64, f64) {
+    use rusqlite::Connection;
+    use sha2::{Digest, Sha256};
+
+    let wal = std::env::var("ARKEION_BENCH_SQLITE_WAL").is_ok();
+    let setup = |path: std::path::PathBuf| -> Connection {
+        let conn = Connection::open(path).unwrap();
+        conn.pragma_update(None, "synchronous", "FULL").unwrap();
+        if wal {
+            conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+        }
+        conn.execute_batch(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER NOT NULL);\
+             CREATE TABLE t_log (seq INTEGER PRIMARY KEY, rid INTEGER, n INTEGER, hash BLOB NOT NULL);",
+        )
+        .unwrap();
+        conn
+    };
+    let chain = |prev: &[u8; 32], rid: i64, n: i64| -> [u8; 32] {
+        let mut h = Sha256::new();
+        h.update(prev);
+        h.update(rid.to_le_bytes());
+        h.update(n.to_le_bytes());
+        h.finalize().into()
+    };
+
+    // Durable: cada insert lógico en su propia transacción ⇒ 1 fsync, como arkeion.
+    let durable = {
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = setup(dir.path().join("ad.sqlite"));
+        let mut prev = [0u8; 32];
+        let t = Instant::now();
+        for i in 1..=durable_n {
+            let n = i * 2;
+            prev = chain(&prev, i, n);
+            let tx = conn.transaction().unwrap();
+            tx.execute(
+                "INSERT INTO t (id, n) VALUES (?1, ?2)",
+                rusqlite::params![i, n],
+            )
+            .unwrap();
+            tx.execute(
+                "INSERT INTO t_log (rid, n, hash) VALUES (?1, ?2, ?3)",
+                rusqlite::params![i, n, &prev[..]],
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+        ops(durable_n, t.elapsed())
+    };
+
+    // Lote: todo en una transacción.
+    let batch = {
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = setup(dir.path().join("ab.sqlite"));
+        let mut prev = [0u8; 32];
+        let t = Instant::now();
+        let tx = conn.transaction().unwrap();
+        {
+            let mut ins_t = tx.prepare("INSERT INTO t (id, n) VALUES (?1, ?2)").unwrap();
+            let mut ins_l = tx
+                .prepare("INSERT INTO t_log (rid, n, hash) VALUES (?1, ?2, ?3)")
+                .unwrap();
+            for i in 1..=bulk_n {
+                let n = i * 2;
+                prev = chain(&prev, i, n);
+                ins_t.execute(rusqlite::params![i, n]).unwrap();
+                ins_l.execute(rusqlite::params![i, n, &prev[..]]).unwrap();
+            }
+        }
+        tx.commit().unwrap();
+        ops(bulk_n, t.elapsed())
+    };
+    (durable, batch)
+}
+
 fn main() {
     // Args posicionales numéricos: durable_n bulk_n scan_reps.
     let nums: Vec<i64> = std::env::args()
@@ -293,4 +375,35 @@ fn main() {
     }
     println!();
     println!("ratio = arkeion / sqlite  (>1 ⇒ arkeion más rápido en esa operación)");
+
+    // Comparación justa: SQLite con las garantías de arkeion (historia + hash chain).
+    #[cfg(feature = "bench-sqlite")]
+    {
+        let (ad, ab) = run_sqlite_audited(durable_n, bulk_n);
+        let ark_durable = ark[0].1; // "insert 1 fila/commit (durable)"
+        let ark_batch = ark[1].1; // "insert lote (1 commit)"
+        println!();
+        println!(
+            "— comparación JUSTA: SQLite con historia + cadena de hash (= garantías de arkeion) —"
+        );
+        println!(
+            "{:<24} {:>12} {:>14} {:>9}",
+            "insert", "arkeion", "sqlite+audit", "ratio"
+        );
+        println!("{}", "-".repeat(62));
+        println!(
+            "{:<24} {:>12} {:>14} {:>8.2}x",
+            "durable (1/commit)",
+            human(ark_durable),
+            human(ad),
+            ark_durable / ad
+        );
+        println!(
+            "{:<24} {:>12} {:>14} {:>8.2}x",
+            "lote (1 commit)",
+            human(ark_batch),
+            human(ab),
+            ark_batch / ab
+        );
+    }
 }

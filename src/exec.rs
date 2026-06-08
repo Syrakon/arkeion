@@ -7,7 +7,7 @@
 
 use std::cmp::Ordering;
 
-use crate::catalog::{ColumnSpec, TableDef, TableSpec};
+use crate::catalog::{ColumnDef, ColumnSpec, TableDef, TableSpec};
 use crate::error::{Error, Result};
 use crate::record::Value;
 use crate::sql::ast::{
@@ -216,6 +216,38 @@ pub fn run_execute(tx: &mut WriteTx, stmt: &Stmt, params: &[Value]) -> Result<us
                 tx.insert_row(&def, &values)?;
             }
             Ok(rows.len())
+        }
+        Stmt::AlterTableAddColumn { table, column } => {
+            if column.primary_key {
+                return Err(sql_err(
+                    "ALTER TABLE ADD: no se puede añadir una PRIMARY KEY",
+                ));
+            }
+            if tx.table(table)?.is_none() {
+                return Err(sql_err(format!("tabla desconocida: {table}")));
+            }
+            let default = match &column.default {
+                None => None,
+                Some(e) => {
+                    if e.contains_param() {
+                        return Err(sql_err("DEFAULT no admite parámetros"));
+                    }
+                    match eval_const(e, params)? {
+                        Value::Null => None,
+                        v => Some(v),
+                    }
+                }
+            };
+            tx.add_column(
+                table,
+                ColumnDef {
+                    name: column.name.clone(),
+                    col_type: column.col_type,
+                    not_null: column.not_null,
+                    default,
+                },
+            )?;
+            Ok(0)
         }
         Stmt::Update {
             table,

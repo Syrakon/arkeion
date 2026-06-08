@@ -33,6 +33,8 @@ pub enum Tok {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kw {
+    Add,
+    Alter,
     And,
     As,
     Asc,
@@ -40,6 +42,7 @@ pub enum Kw {
     Blob,
     Boolean,
     By,
+    Column,
     Commit,
     Create,
     Default,
@@ -86,6 +89,8 @@ pub enum Kw {
 
 fn keyword(word: &str) -> Option<Kw> {
     Some(match word.to_ascii_uppercase().as_str() {
+        "ADD" => Kw::Add,
+        "ALTER" => Kw::Alter,
         "AND" => Kw::And,
         "AS" => Kw::As,
         "ASC" => Kw::Asc,
@@ -93,6 +98,7 @@ fn keyword(word: &str) -> Option<Kw> {
         "BLOB" => Kw::Blob,
         "BOOLEAN" => Kw::Boolean,
         "BY" => Kw::By,
+        "COLUMN" => Kw::Column,
         "COMMIT" => Kw::Commit,
         "CREATE" => Kw::Create,
         "DEFAULT" => Kw::Default,

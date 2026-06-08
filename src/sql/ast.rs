@@ -24,6 +24,12 @@ pub enum Stmt {
         rows: Vec<Vec<Expr>>,
     },
     Select(SelectStmt),
+    /// `ALTER TABLE t ADD [COLUMN] coldef`. La columna se añade al final; las
+    /// filas existentes la leen como su `DEFAULT` (o NULL) sin reescribirse.
+    AlterTableAddColumn {
+        table: String,
+        column: ColumnAst,
+    },
     Update {
         table: String,
         sets: Vec<(String, Expr)>,

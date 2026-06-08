@@ -1256,6 +1256,14 @@ impl WriteTx {
         catalog::get_table(&self.ts, self.data_root, name)
     }
 
+    /// Añade una columna a una tabla existente (`ALTER TABLE ADD COLUMN`). No
+    /// reescribe las filas existentes.
+    pub fn add_column(&mut self, table: &str, col: catalog::ColumnDef) -> Result<()> {
+        let (root, _) = catalog::add_column(&mut self.ts, self.data_root, table, col)?;
+        self.data_root = root;
+        Ok(())
+    }
+
     /// Inserta y devuelve el rowid (automático o explícito vía columna alias).
     /// El contador de rowid se cachea en la tx y se vuelca en el commit, así que
     /// solo se escribe la hoja de la fila (no la del contador) por inserción.

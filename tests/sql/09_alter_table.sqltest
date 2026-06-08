@@ -1,0 +1,54 @@
+-- ALTER TABLE ADD COLUMN (post-M9): añade una columna al final sin reescribir
+-- las filas existentes (las leen con su DEFAULT, o NULL).
+
+> CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER);
+ok
+
+> INSERT INTO t (n) VALUES (10), (20);
+affected 2
+
+-- Con DEFAULT: las filas viejas lo muestran sin reescribirse.
+> ALTER TABLE t ADD COLUMN label TEXT DEFAULT 'none';
+ok
+
+> SELECT id, n, label FROM t ORDER BY id;
+1|10|none
+2|20|none
+
+-- Una fila nueva puede fijar la columna nueva; las viejas siguen con su default.
+> INSERT INTO t (n, label) VALUES (30, 'tres');
+affected 1
+
+> SELECT n, label FROM t ORDER BY id;
+10|none
+20|none
+30|tres
+
+-- Sin DEFAULT: las filas viejas la leen como NULL.
+> ALTER TABLE t ADD COLUMN extra INTEGER;
+ok
+
+> SELECT n, extra FROM t ORDER BY id;
+10|NULL
+20|NULL
+30|NULL
+
+-- 'COLUMN' es opcional.
+> ALTER TABLE t ADD score INTEGER DEFAULT 5;
+ok
+
+> SELECT n, score FROM t WHERE id = 1;
+10|5
+
+-- Errores.
+> ALTER TABLE t ADD COLUMN n TEXT;
+error la columna ya existe
+
+> ALTER TABLE t ADD COLUMN req INTEGER NOT NULL;
+error NOT NULL
+
+> ALTER TABLE t ADD COLUMN pk INTEGER PRIMARY KEY;
+error PRIMARY KEY
+
+> ALTER TABLE nope ADD COLUMN x INTEGER;
+error tabla desconocida

@@ -109,6 +109,7 @@ impl Parser {
     fn statement(&mut self) -> Result<Stmt> {
         match self.peek() {
             Some(Tok::Kw(Kw::Create)) => self.create_table(),
+            Some(Tok::Kw(Kw::Alter)) => self.alter_table(),
             Some(Tok::Kw(Kw::Drop)) => self.drop_table(),
             Some(Tok::Kw(Kw::Insert)) => self.insert(),
             Some(Tok::Kw(Kw::Select)) => Ok(Stmt::Select(self.select()?)),
@@ -158,6 +159,16 @@ impl Parser {
             name,
             columns,
         })
+    }
+
+    fn alter_table(&mut self) -> Result<Stmt> {
+        self.expect_kw(Kw::Alter, "ALTER")?;
+        self.expect_kw(Kw::Table, "TABLE")?;
+        let table = self.ident("un nombre de tabla")?;
+        self.expect_kw(Kw::Add, "ADD")?;
+        let _ = self.eat_kw(Kw::Column); // COLUMN es opcional
+        let column = self.column_def()?;
+        Ok(Stmt::AlterTableAddColumn { table, column })
     }
 
     fn column_def(&mut self) -> Result<ColumnAst> {

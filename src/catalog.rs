@@ -288,6 +288,35 @@ pub fn create_table<S: NodeStore>(
     Ok((root, def))
 }
 
+/// Añade una columna al final de una tabla (`ALTER TABLE ADD COLUMN`). **No
+/// reescribe filas**: las existentes leerán la columna como su `DEFAULT` (o
+/// NULL) gracias a `finish_row`. Falla si la tabla no existe, la columna ya
+/// existe, se exceden las columnas, o es `NOT NULL` sin `DEFAULT` (las filas
+/// viejas violarían la restricción).
+pub fn add_column<S: NodeStore>(
+    s: &mut S,
+    root: PageId,
+    table_name: &str,
+    col: ColumnDef,
+) -> Result<(PageId, TableDef)> {
+    validate_name(&col.name, "nombre de columna vacío o de más de 128 bytes")?;
+    let mut def = get_table(s, root, table_name)?.ok_or(Error::Constraint("tabla desconocida"))?;
+    if def.columns.iter().any(|c| c.name == col.name) {
+        return Err(Error::Constraint("la columna ya existe"));
+    }
+    if def.columns.len() >= MAX_COLUMNS {
+        return Err(Error::InvalidInput("se excede el máximo de columnas"));
+    }
+    if col.not_null && col.default.is_none() {
+        return Err(Error::Constraint(
+            "ADD COLUMN NOT NULL requiere un DEFAULT (las filas existentes serían NULL)",
+        ));
+    }
+    def.columns.push(col);
+    let root = btree::insert(s, root, &table_key(table_name), &encode_def(&def))?;
+    Ok((root, def))
+}
+
 pub fn get_table<S: NodeSource>(src: &S, root: PageId, name: &str) -> Result<Option<TableDef>> {
     match btree::get(src, root, &table_key(name))? {
         Some(bytes) => Ok(Some(decode_def(name, &bytes)?)),
@@ -502,7 +531,12 @@ fn finish_row(table: &TableDef, rowid: i64, mut values: Vec<Value>) -> Result<Ve
             "la fila tiene más columnas que el esquema",
         ));
     }
-    values.resize(table.columns.len(), Value::Null);
+    // Columnas que faltan = añadidas por `ALTER TABLE ADD COLUMN` tras escribir
+    // la fila: se leen como su DEFAULT (o NULL), sin reescribir la fila.
+    while values.len() < table.columns.len() {
+        let col = &table.columns[values.len()];
+        values.push(col.default.clone().unwrap_or(Value::Null));
+    }
     if let Some(i) = table.rowid_alias {
         values[i] = Value::Integer(rowid);
     }
@@ -515,8 +549,10 @@ fn finish_row(table: &TableDef, rowid: i64, mut values: Vec<Value>) -> Result<Ve
 pub struct TableScan<'s, S: NodeSource> {
     cur: Cursor<'s, S>,
     prefix: [u8; 5],
-    ncols: usize,
-    rowid_alias: Option<usize>,
+    /// Esquema (clonado) para reconstruir cada fila con `finish_row`: rellena
+    /// las columnas añadidas por `ALTER TABLE` con su DEFAULT, igual que el
+    /// camino de point lookup.
+    def: TableDef,
     done: bool,
 }
 
@@ -529,8 +565,7 @@ pub fn scan_table<'s, S: NodeSource>(
     Ok(TableScan {
         cur: btree::scan_from(src, root, &prefix)?,
         prefix,
-        ncols: table.columns.len(),
-        rowid_alias: table.rowid_alias,
+        def: table.clone(),
         done: false,
     })
 }
@@ -554,16 +589,7 @@ impl<S: NodeSource> Iterator for TableScan<'_, S> {
         let parse = || -> Result<(i64, Vec<Value>)> {
             let rowid = record::rowid_from_be(&key[5..])
                 .ok_or(Error::CorruptRecord("clave de fila mal formada"))?;
-            let mut values = record::decode_values(&payload)?;
-            if values.len() > self.ncols {
-                return Err(Error::CorruptRecord(
-                    "la fila tiene más columnas que el esquema",
-                ));
-            }
-            values.resize(self.ncols, Value::Null);
-            if let Some(i) = self.rowid_alias {
-                values[i] = Value::Integer(rowid);
-            }
+            let values = finish_row(&self.def, rowid, record::decode_values(&payload)?)?;
             Ok((rowid, values))
         };
         Some(parse())

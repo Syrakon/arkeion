@@ -113,6 +113,14 @@ impl Store {
         self.head.lock().expect("head envenenado").version
     }
 
+    /// Auditoría completa de la hash chain hasta el head actual (M6). Devuelve
+    /// un [`commit::AuditReport`]; `ChainBroken` con la versión exacta si una
+    /// página histórica fue manipulada.
+    pub fn verify(&self) -> Result<commit::AuditReport> {
+        let head = self.head.lock().expect("head envenenado").clone();
+        commit::verify(&self.pager, &head)
+    }
+
     /// Snapshot histórico (M5, time-travel). `AsOf::Head` equivale a
     /// [`snapshot`](Store::snapshot). Funciona porque el b-tree es CoW
     /// append-only: la raíz de cada versión sigue en disco hasta que `vacuum`
@@ -663,5 +671,66 @@ mod tests {
         let s2 = store.snapshot_at(AsOf::Timestamp(after)).unwrap();
         assert_eq!(s2.version(), 2);
         assert_eq!(s2.get(b"b").unwrap().unwrap(), b"2");
+    }
+
+    /// M6: una cadena intacta se audita en verde, incl. génesis y tras reabrir.
+    #[test]
+    fn verify_accepts_a_clean_chain() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.arkeion");
+        let store = Store::create(&path).unwrap();
+
+        // Génesis: cadena trivialmente válida (0 commits).
+        let r = store.verify().unwrap();
+        assert_eq!((r.head, r.commits, r.chain_ok), (0, 0, true));
+
+        for i in 1..=8 {
+            let mut tx = store.begin().unwrap();
+            tx.put(format!("k{i:02}").as_bytes(), b"v").unwrap();
+            assert_eq!(tx.commit().unwrap(), i);
+        }
+        let r = store.verify().unwrap();
+        assert_eq!((r.head, r.commits, r.chain_ok), (8, 8, true));
+
+        // La cadena es externamente verificable: reabrir y re-auditar.
+        drop(store);
+        let store = Store::open(&path).unwrap();
+        assert!(store.verify().unwrap().chain_ok);
+    }
+
+    /// M6: voltear un byte de una página histórica ⇒ `ChainBroken`.
+    #[test]
+    fn verify_detects_a_tampered_historical_page() {
+        use std::io::{Read, Seek, SeekFrom, Write};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.arkeion");
+        let store = Store::create(&path).unwrap();
+        for i in 1..=4 {
+            let mut tx = store.begin().unwrap();
+            tx.put(format!("k{i:02}").as_bytes(), b"valor").unwrap();
+            tx.commit().unwrap();
+        }
+        drop(store); // cerrar el archivo antes de manipularlo
+
+        // Un byte del body de la primera página de datos (página 3, commit 1).
+        let off = crate::format::FIRST_DATA_PAGE.0 * crate::format::PAGE_SIZE as u64 + 100;
+        let mut f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        f.seek(SeekFrom::Start(off)).unwrap();
+        let mut b = [0u8; 1];
+        f.read_exact(&mut b).unwrap();
+        b[0] ^= 0x01;
+        f.seek(SeekFrom::Start(off)).unwrap();
+        f.write_all(&b).unwrap();
+        f.sync_all().unwrap();
+        drop(f);
+
+        let store = Store::open(&path).unwrap();
+        let err = store.verify().unwrap_err();
+        assert!(matches!(err, Error::ChainBroken { .. }), "fue {err:?}");
     }
 }

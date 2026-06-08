@@ -39,12 +39,13 @@
 //! tx.commit().unwrap();
 //! ```
 //!
-//! **Estado**: M5 — time-travel sobre el MVP de M4. `SELECT … AS OF VERSION n`
-//! y `AS OF TIMESTAMP 'rfc3339'`, más [`Connection::snapshot`] (conexión de
-//! solo lectura fijada a un punto de la historia). Reposa sobre M4: DML
-//! completo, `INNER`/`LEFT JOIN`, agregados sin `GROUP BY`, transacciones
-//! explícitas y sentencias preparadas. La API se estabiliza milestone a
-//! milestone; lo marcado `#[doc(hidden)]` es interno.
+//! **Estado**: M6 — auditoría verificable sobre M5. [`Database::verify`]
+//! recorre la hash chain entera y devuelve un [`AuditReport`]; manipular
+//! cualquier byte de cualquier página histórica da [`Error::ChainBroken`] con
+//! la versión exacta (binario opcional `arkeion-verify`). Reposa sobre M5
+//! (time-travel: `AS OF`, [`Connection::snapshot`]) y M4 (DML completo, JOINs,
+//! agregados, transacciones, prepared statements). La API se estabiliza
+//! milestone a milestone; lo marcado `#[doc(hidden)]` es interno.
 
 #![forbid(unsafe_code)]
 
@@ -54,6 +55,7 @@ mod error;
 pub use api::{
     ColIndex, Connection, Database, FromValue, Options, Row, Rows, Statement, Transaction,
 };
+pub use commit::AuditReport;
 pub use error::{Error, Result};
 pub use record::Value;
 pub use tx::AsOf;

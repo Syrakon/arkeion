@@ -36,6 +36,10 @@ pub enum Error {
     /// `AS OF` apunta a un punto inalcanzable de la historia: versión futura o
     /// ya compactada por `vacuum` (M9).
     VersionNotFound(AsOf),
+    /// La auditoría (`Database::verify`) encontró la hash chain rota: una
+    /// página histórica fue manipulada. `at` es la versión exacta donde el
+    /// invariante deja de cumplirse (M6, D4).
+    ChainBroken { at: u64, reason: &'static str },
     /// Conversión `Row::get::<T>` imposible para el valor presente.
     Conversion {
         expected: &'static str,
@@ -79,6 +83,9 @@ impl fmt::Display for Error {
                     f,
                     "no hay ninguna versión para el punto temporal solicitado"
                 )
+            }
+            Error::ChainBroken { at, reason } => {
+                write!(f, "cadena de auditoría rota en la versión {at}: {reason}")
             }
             Error::Conversion { expected, got } => {
                 write!(f, "no se puede convertir {got} a {expected}")

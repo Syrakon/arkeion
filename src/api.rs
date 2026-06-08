@@ -12,6 +12,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
 
+use crate::commit::AuditReport;
 use crate::error::{Error, Result};
 use crate::exec;
 use crate::record::Value;
@@ -77,6 +78,28 @@ impl Database {
             open_tx: RefCell::new(None),
             pinned: None,
         })
+    }
+
+    /// Auditoría completa de la hash chain (M6): recorre todos los commits de
+    /// génesis a head y devuelve un [`AuditReport`]. Devuelve
+    /// [`Error::ChainBroken`] con la versión exacta si una página histórica fue
+    /// manipulada (D4). La cadena cubre el plaintext, así que la auditoría es
+    /// independiente de si el archivo está cifrado.
+    ///
+    /// ```
+    /// use arkeion::{Database, Options};
+    ///
+    /// let dir = tempfile::tempdir().unwrap();
+    /// let db = Database::open(dir.path().join("t.arkeion"), Options::default()).unwrap();
+    /// let conn = db.connect().unwrap();
+    /// conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)", &[]).unwrap();
+    ///
+    /// let report = db.verify().unwrap();
+    /// assert!(report.chain_ok);
+    /// assert_eq!(report.head, report.commits);
+    /// ```
+    pub fn verify(&self) -> Result<AuditReport> {
+        self.store.verify()
     }
 }
 

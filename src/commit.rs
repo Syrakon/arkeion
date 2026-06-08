@@ -7,7 +7,7 @@
 
 use sha2::{Digest, Sha256};
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::format::{FIRST_DATA_PAGE, MAGIC_COMMIT, MetaSlot, PageId};
 use crate::pager::Pager;
 
@@ -224,6 +224,102 @@ pub fn recover(pager: &Pager) -> Result<Head> {
         }
     }
     Ok(head)
+}
+
+/// Informe de una auditoría completa de la hash chain (M6, docs/03-api).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuditReport {
+    /// Versión del head auditado.
+    pub head: u64,
+    /// Commits recorridos desde génesis (== `head` salvo manipulación).
+    pub commits: u64,
+    /// Siempre `true` cuando `verify` devuelve `Ok`: un fallo es `ChainBroken`,
+    /// no un informe negativo.
+    pub chain_ok: bool,
+}
+
+/// Auditoría completa: recorre la cadena de génesis a `head` y comprueba, en
+/// cada commit, todos los invariantes que ligan las páginas a la cadena
+/// (docs/02, D4). Cualquier byte manipulado de cualquier página histórica
+/// rompe al menos uno ⇒ `ChainBroken` con la versión exacta:
+///
+/// - **tag de página**: leer una página (de datos o de commit) valida su tag;
+///   un flip sin recalcular el tag es `Corrupt`, que aquí se atribuye a su
+///   versión.
+/// - **`content_hash`**: SHA-256 de los bodies en claro de las páginas de datos
+///   del commit; atrapa un flip con el tag recalculado.
+/// - **`chain_hash` autoconsistente** y **enlace `prev_chain`**: atrapan la
+///   manipulación de campos de cabecera y el re-encadenado.
+/// - **continuidad de versión**: génesis→head sin saltos.
+pub fn verify(pager: &Pager, head: &Head) -> Result<AuditReport> {
+    let broken = |at: u64, reason: &'static str| Error::ChainBroken { at, reason };
+
+    // 1. Enumerar las cabeceras de commit caminando hacia atrás por `prev_page`
+    //    (0 = génesis). El estimado `head.version - recogidas` da la versión de
+    //    la página que se está leyendo cuando la cadena es por lo demás íntegra.
+    let mut headers = Vec::new();
+    let mut page = head.commit_page;
+    while page != 0 {
+        let at = head.version.saturating_sub(headers.len() as u64);
+        let buf = pager
+            .read_page(PageId(page))
+            .map_err(|_| broken(at, "página de commit ilegible o corrupta"))?;
+        let header = CommitHeader::decode(buf.body())
+            .ok_or_else(|| broken(at, "página de commit mal formada"))?;
+        let prev = header.prev_page;
+        headers.push((PageId(page), header));
+        page = prev;
+    }
+    headers.reverse(); // génesis → head
+
+    // 2. Verificar en orden, recomputando la cadena desde el eslabón cero.
+    let mut prev_chain = genesis_chain(&pager.header().file_id);
+    let mut expected_version = 0u64;
+    for (pid, header) in &headers {
+        expected_version += 1;
+        if header.version != expected_version {
+            return Err(broken(header.version, "versión fuera de secuencia"));
+        }
+
+        // content_hash sobre los bodies en claro de las páginas de datos del
+        // commit: `[commit_page - (pages_written - 1), commit_page)`.
+        let data_count = header.pages_written.saturating_sub(1);
+        let start = pid
+            .0
+            .checked_sub(data_count)
+            .ok_or_else(|| broken(header.version, "pages_written inválido"))?;
+        let mut hasher = Sha256::new();
+        for dp in start..pid.0 {
+            let buf = pager
+                .read_page(PageId(dp))
+                .map_err(|_| broken(header.version, "página de datos ilegible o corrupta"))?;
+            hasher.update(buf.body());
+        }
+        let content_hash: [u8; 32] = hasher.finalize().into();
+        if content_hash != header.content_hash {
+            return Err(broken(header.version, "content_hash no coincide"));
+        }
+        if header.prev_chain != prev_chain {
+            return Err(broken(header.version, "prev_chain no enlaza"));
+        }
+        if header.chain_hash != header.compute_chain() {
+            return Err(broken(header.version, "chain_hash inconsistente"));
+        }
+        prev_chain = header.chain_hash;
+    }
+
+    // 3. La cadena recorrida debe reproducir el head vivo.
+    if expected_version != head.version {
+        return Err(broken(expected_version, "el recorrido no llega al head"));
+    }
+    if prev_chain != head.chain_hash {
+        return Err(broken(head.version, "el chain_hash del head no coincide"));
+    }
+    Ok(AuditReport {
+        head: head.version,
+        commits: head.version,
+        chain_ok: true,
+    })
 }
 
 /// Meta slot coherente con un head (lo escribe el commit y la recuperación no

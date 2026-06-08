@@ -39,13 +39,15 @@
 //! tx.commit().unwrap();
 //! ```
 //!
-//! **Estado**: M8 — branching, diff y merge sobre M7. [`Database::create_branch`]/
-//! [`Database::connect_branch`]/[`Database::merge`]: ramas estilo Git que
-//! comparten páginas por CoW, [`Database::diff`] O(cambios) y merge 3-way con
-//! [`Error::Conflict`] detallado. Reposa sobre M7 (cifrado: [`Options::key`]),
-//! M6 (auditoría: [`Database::verify`]), M5 (time-travel: `AS OF`) y M4 (DML
-//! completo, JOINs, agregados, transacciones, prepared statements). La API se
-//! estabiliza milestone a milestone; lo marcado `#[doc(hidden)]` es interno.
+//! **Estado**: M9 (núcleo) — `vacuum`/compactación sobre M8. [`Database::vacuum`]
+//! reescribe la base según [`Retention`] (checkpoint de cadena + replay de
+//! deltas + rename atómico) y [`Database::vacuum_rekey`] rota la clave; ambas
+//! mantienen `verify()` OK y el `AS OF` de las versiones retenidas. Reposa sobre
+//! M8 (ramas: [`Database::create_branch`]/[`Database::merge`]/[`Database::diff`]),
+//! M7 (cifrado: [`Options::key`]), M6 (auditoría: [`Database::verify`]), M5
+//! (time-travel: `AS OF`) y M4 (DML completo, JOINs, agregados, transacciones,
+//! prepared statements). La API se estabiliza milestone a milestone; lo marcado
+//! `#[doc(hidden)]` es interno.
 
 #![forbid(unsafe_code)]
 
@@ -61,7 +63,7 @@ pub use commit::AuditReport;
 pub use crypto::Key;
 pub use error::{Error, Result};
 pub use record::Value;
-pub use tx::{AsOf, BranchInfo, MergeConflict, MergePolicy, MergeReport};
+pub use tx::{AsOf, BranchInfo, MergeConflict, MergePolicy, MergeReport, Retention, VacuumReport};
 
 // Módulos internos: públicos solo para que los hitos se construyan incrementalmente
 // sin marcar código de fundación como muerto. NO son API estable.

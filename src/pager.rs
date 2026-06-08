@@ -23,6 +23,15 @@ use crate::io::{DbFile, sync_parent_dir};
 /// inmutables, así que evictar nunca pierde datos: se releen del disco.
 const CACHE_CAP: usize = 4096;
 
+/// Construye el proveedor cripto para una clave opcional (D8): AES-256-GCM con
+/// clave, integridad SHA-256 sin ella.
+pub(crate) fn provider_for(key: Option<&Key>) -> Arc<dyn CryptoProvider> {
+    match key {
+        Some(k) => Arc::new(Aes256GcmProvider::new(k)),
+        None => Arc::new(PlainProvider),
+    }
+}
+
 pub struct Pager {
     file: DbFile,
     header: FileHeader,
@@ -100,6 +109,19 @@ impl Pager {
     /// append se sella con AES-256-GCM; cabecera y meta slots van siempre en
     /// claro (no contienen datos de usuario).
     pub fn create_keyed(path: &Path, key: Option<&Key>) -> Result<Pager> {
+        Self::create_with_crypto(path, key.is_some(), provider_for(key))
+    }
+
+    /// Núcleo de la creación, parametrizado por el proveedor cripto ya
+    /// construido (M9). Lo usa `vacuum` para crear el archivo temporal con el
+    /// **mismo** proveedor (misma clave) sin volver a manejar la `Key` cruda, o
+    /// con uno nuevo (rotación de clave). Genera una identidad de archivo nueva:
+    /// el archivo compactado arranca una cadena de auditoría fresca.
+    pub(crate) fn create_with_crypto(
+        path: &Path,
+        encrypted: bool,
+        crypto: Arc<dyn CryptoProvider>,
+    ) -> Result<Pager> {
         let file = DbFile::create_new(path)?;
         if !file.try_lock_exclusive()? {
             return Err(Error::Busy);
@@ -110,13 +132,9 @@ impl Pager {
         let mut kdf_salt = [0u8; 16];
         getrandom::fill(&mut kdf_salt).map_err(|e| Error::Io(std::io::Error::other(e)))?;
         let header = FileHeader {
-            flags: if key.is_some() { FLAG_ENCRYPTED } else { 0 },
+            flags: if encrypted { FLAG_ENCRYPTED } else { 0 },
             file_id,
             kdf_salt,
-        };
-        let crypto: Arc<dyn CryptoProvider> = match key {
-            Some(k) => Arc::new(Aes256GcmProvider::new(k)),
-            None => Arc::new(PlainProvider),
         };
 
         let pager = Pager {
@@ -386,6 +404,17 @@ impl Pager {
 
     pub fn header(&self) -> &FileHeader {
         &self.header
+    }
+
+    /// Proveedor cripto activo, para crear un archivo hermano con la **misma**
+    /// clave (vacuum manteniendo el cifrado, M9).
+    pub(crate) fn crypto(&self) -> Arc<dyn CryptoProvider> {
+        self.crypto.clone()
+    }
+
+    /// `true` si el archivo está cifrado (bit `FLAG_ENCRYPTED`).
+    pub fn is_encrypted(&self) -> bool {
+        self.header.flags & FLAG_ENCRYPTED != 0
     }
 
     #[cfg(test)]

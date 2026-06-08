@@ -8,20 +8,21 @@
 //! durabilidad. Un rollback es simplemente soltar el estado en memoria.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
 
 use crate::btree::{self, Body, Cursor, NodeSource, NodeStore};
 use crate::catalog::{self, TableDef, TableScan, TableSpec};
-use crate::commit::{self, CommitHeader, Head};
+use crate::commit::{self, COMMIT_FLAG_CHECKPOINT, CommitHeader, Head};
 use crate::crypto::Key;
 use crate::error::{Error, Result};
 use crate::format::{PageBuf, PageId};
-use crate::pager::Pager;
+use crate::io::sync_parent_dir;
+use crate::pager::{Pager, provider_for};
 use crate::record::Value;
 
 /// Rama única de M1; el branching llega en M8.
@@ -91,14 +92,60 @@ pub struct MergeConflict {
     pub into: Option<Vec<u8>>,
 }
 
-/// Almacén clave-valor transaccional sobre un único archivo. Todos sus
-/// campos son `Arc`: clonarlo es barato y las transacciones son dueñas de
-/// lo que necesitan (sin lifetimes hacia el `Store`).
+/// Política de retención de historia para [`Store::vacuum`] (M9): fija la
+/// frontera K (versión más antigua conservada). Las versiones `< K` se compactan
+/// (su `AS OF` pasa a [`Error::VersionNotFound`]); las `≥ K` se conservan y
+/// siguen respondiendo `AS OF`. El presente (head) **siempre** se conserva.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Retention {
+    /// Conserva toda la historia: `vacuum` solo desfragmenta (y, si se pide,
+    /// rota la clave). K = 1.
+    KeepAll,
+    /// Conserva las últimas `n` versiones (head incluido). `KeepLast(0)` y
+    /// `KeepLast(1)` conservan solo el head.
+    KeepLast(u64),
+    /// Conserva las versiones con timestamp de commit ≥ el dado. Si todas son
+    /// más antiguas, conserva solo el head.
+    KeepSince(SystemTime),
+}
+
+/// Resumen de un `vacuum` (M9): qué se conservó y cuánto se recuperó.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VacuumReport {
+    /// Frontera K: versión más antigua conservada (1 si se conservó todo). 0 si
+    /// la base no tenía commits.
+    pub kept_from: u64,
+    /// Versión head: invariante, `vacuum` nunca pierde el presente.
+    pub head: u64,
+    /// Versiones compactadas (descartadas): `kept_from - 1` (0 si K ≤ 1).
+    pub reclaimed_versions: u64,
+    /// Páginas del archivo antes de compactar.
+    pub pages_before: u64,
+    /// Páginas del archivo después: la desfragmentación medible.
+    pub pages_after: u64,
+}
+
+/// Estado mutable del almacén: el pager activo y la cabeza global. Viven juntos
+/// bajo un único `Mutex` para que `vacuum` (M9) pueda reescribir el archivo y
+/// publicar el par `(pager, head)` nuevo de forma atómica: ningún lector llega
+/// a ver un pager y un head descasados (un `data_root` de un archivo leído del
+/// otro). Los snapshots ya en vuelo siguen siendo dueños de su `Arc<Pager>`
+/// anterior, así que leen su archivo (el inodo viejo) hasta soltarse.
+struct DbState {
+    pager: Arc<Pager>,
+    head: Head,
+}
+
+/// Almacén clave-valor transaccional sobre un único archivo. Todos sus campos
+/// son `Arc`: clonarlo es barato y las transacciones son dueñas de lo que
+/// necesitan (sin lifetimes hacia el `Store`).
 #[derive(Clone)]
 pub struct Store {
-    pager: Arc<Pager>,
-    head: Arc<Mutex<Head>>,
+    state: Arc<Mutex<DbState>>,
     writer: Arc<AtomicBool>,
+    /// Ruta del archivo: la necesita `vacuum` para el archivo temporal y el
+    /// rename atómico (M9).
+    path: PathBuf,
 }
 
 impl Store {
@@ -110,11 +157,7 @@ impl Store {
     pub fn create_keyed(path: &Path, key: Option<&Key>) -> Result<Store> {
         let pager = Pager::create_keyed(path, key)?;
         let head = commit::genesis_head(&pager.header().file_id);
-        Ok(Store {
-            pager: Arc::new(pager),
-            head: Arc::new(Mutex::new(head)),
-            writer: Arc::new(AtomicBool::new(false)),
-        })
+        Ok(Store::from_parts(path, pager, head))
     }
 
     pub fn open(path: &Path) -> Result<Store> {
@@ -133,31 +176,52 @@ impl Store {
         let torn_tail = pager.n_pages().saturating_sub(head.n_pages);
         pager.set_n_pages(head.n_pages);
         pager.set_nonce_counter(head.nonce_counter + torn_tail);
-        Ok(Store {
-            pager: Arc::new(pager),
-            head: Arc::new(Mutex::new(head)),
+        Ok(Store::from_parts(path, pager, head))
+    }
+
+    fn from_parts(path: &Path, pager: Pager, head: Head) -> Store {
+        Store {
+            state: Arc::new(Mutex::new(DbState {
+                pager: Arc::new(pager),
+                head,
+            })),
             writer: Arc::new(AtomicBool::new(false)),
-        })
+            path: path.to_owned(),
+        }
+    }
+
+    fn lock(&self) -> MutexGuard<'_, DbState> {
+        self.state.lock().expect("estado del store envenenado")
+    }
+
+    /// Pager activo (clon barato del `Arc`). Cada llamada lo relee del estado:
+    /// no cachear el resultado entre operaciones, pues `vacuum` puede sustituirlo.
+    #[cfg(test)]
+    fn pager(&self) -> Arc<Pager> {
+        self.lock().pager.clone()
     }
 
     /// Snapshot de lectura: fija el commit actual y lee páginas inmutables.
     /// Nunca bloquea ni es bloqueado por el escritor.
     pub fn snapshot(&self) -> Snapshot {
-        let h = self.head.lock().expect("head envenenado").clone();
+        let st = self.lock();
         Snapshot {
-            pager: self.pager.clone(),
-            version: h.version,
-            data_root: h.data_root,
+            pager: st.pager.clone(),
+            version: st.head.version,
+            data_root: st.head.data_root,
         }
     }
 
     /// Snapshot de lectura fijado a la cabeza de una rama (M8). `BranchNotFound`
     /// si la rama no existe.
     pub fn snapshot_on(&self, branch: &str) -> Result<Snapshot> {
-        let global = self.head.lock().expect("head envenenado").clone();
-        let bh = self.resolve_branch_head(&global, branch)?;
+        let (pager, global) = {
+            let st = self.lock();
+            (st.pager.clone(), st.head.clone())
+        };
+        let bh = resolve_branch_head(&pager, &global, branch)?;
         Ok(Snapshot {
-            pager: self.pager.clone(),
+            pager,
             version: bh.version,
             data_root: bh.data_root,
         })
@@ -175,8 +239,11 @@ impl Store {
         if self.writer.swap(true, Ordering::Acquire) {
             return Err(Error::Busy);
         }
-        let global = self.head.lock().expect("head envenenado").clone();
-        let bh = match self.resolve_branch_head(&global, branch) {
+        let (pager, global) = {
+            let st = self.lock();
+            (st.pager.clone(), st.head.clone())
+        };
+        let bh = match resolve_branch_head(&pager, &global, branch) {
             Ok(bh) => bh,
             Err(e) => {
                 self.writer.store(false, Ordering::Release); // liberar el escritor
@@ -184,77 +251,17 @@ impl Store {
             }
         };
         Ok(WriteTx {
-            pager: self.pager.clone(),
-            head: self.head.clone(),
+            ts: TxStore::new(pager.clone()),
+            pager,
+            state: self.state.clone(),
             writer: self.writer.clone(),
             branch: branch.to_owned(),
             parent_page: bh.commit_page,
             parent_version: bh.version,
             data_root: bh.data_root,
             meta_root: global.meta_root,
-            ts: TxStore::new(self.pager.clone()),
             base: global,
         })
-    }
-
-    /// Resuelve la cabeza de una rama: su `data_root` y versión. `main` siempre
-    /// existe (antes del primer commit es génesis); otra rama inexistente da
-    /// `BranchNotFound`.
-    fn resolve_branch_head(&self, global: &Head, branch: &str) -> Result<BranchHead> {
-        match self.read_ref(global.meta_root, branch)? {
-            Some(version) => {
-                // El `commit_page` solo lo tiene a mano la rama tip (head
-                // global); para las demás es informativo (no lo usa la lógica).
-                let commit_page = if version == global.version {
-                    global.commit_page
-                } else {
-                    0
-                };
-                Ok(BranchHead {
-                    version,
-                    data_root: self.read_data_root(global.meta_root, version)?,
-                    commit_page,
-                })
-            }
-            None if branch == MAIN_BRANCH => Ok(BranchHead {
-                version: 0,
-                data_root: commit::genesis_head(&self.pager.header().file_id).data_root,
-                commit_page: 0,
-            }),
-            None => Err(Error::BranchNotFound(branch.to_owned())),
-        }
-    }
-
-    /// Versión a la que apunta `ref[branch]` en un árbol meta, si existe.
-    fn read_ref(&self, meta_root: PageId, branch: &str) -> Result<Option<u64>> {
-        let src = PagerSource(self.pager.clone());
-        match btree::get(&src, meta_root, &ref_key(branch))? {
-            Some(raw) => {
-                let b: [u8; 8] = raw
-                    .get(0..8)
-                    .ok_or(Error::CorruptRecord("ref de rama truncada"))?
-                    .try_into()
-                    .expect("rango fijo de 8 bytes");
-                Ok(Some(u64::from_le_bytes(b)))
-            }
-            None => Ok(None),
-        }
-    }
-
-    /// `data_root` de una versión vía índice histórico (versión 0 = génesis).
-    fn read_data_root(&self, meta_root: PageId, version: u64) -> Result<PageId> {
-        if version == 0 {
-            return Ok(commit::genesis_head(&self.pager.header().file_id).data_root);
-        }
-        let src = PagerSource(self.pager.clone());
-        let raw = btree::get(&src, meta_root, &hist_key(version))?
-            .ok_or(Error::VersionNotFound(AsOf::Version(version)))?;
-        let b: [u8; 8] = raw
-            .get(0..8)
-            .ok_or(Error::CorruptRecord("entrada histórica truncada"))?
-            .try_into()
-            .expect("rango fijo de 8 bytes");
-        Ok(PageId(u64::from_le_bytes(b)))
     }
 
     // --- gestión de ramas (M8) ---
@@ -277,16 +284,19 @@ impl Store {
     }
 
     fn create_branch_locked(&self, name: &str, from: AsOf) -> Result<()> {
-        let global = self.head.lock().expect("head envenenado").clone();
-        if self.read_ref(global.meta_root, name)?.is_some() {
+        let (pager, global) = {
+            let st = self.lock();
+            (st.pager.clone(), st.head.clone())
+        };
+        if read_ref(&pager, global.meta_root, name)?.is_some() {
             return Err(Error::BranchExists(name.to_owned()));
         }
-        let from_version = self.snapshot_at(from)?.version();
-        let from_data_root = self.read_data_root(global.meta_root, from_version)?;
+        let from_version = snapshot_at(&pager, &global, from)?.version();
+        let from_data_root = read_data_root(&pager, global.meta_root, from_version)?;
 
         let version = global.version + 1;
         let timestamp_ms = now_ms();
-        let mut ts = TxStore::new(self.pager.clone());
+        let mut ts = TxStore::new(pager.clone());
         let meta_root = write_meta_indices(
             &mut ts,
             global.meta_root,
@@ -297,16 +307,14 @@ impl Store {
             from_version,
         )?;
         let head = publish_commit(
-            &self.pager,
+            &pager,
             &mut ts,
-            &global,
-            name,
-            global.commit_page,
+            CommitParams::after(&global, name, global.commit_page),
             from_data_root,
             meta_root,
             timestamp_ms,
         )?;
-        *self.head.lock().expect("head envenenado") = head;
+        self.lock().head = head;
         Ok(())
     }
 
@@ -326,14 +334,17 @@ impl Store {
     }
 
     fn drop_branch_locked(&self, name: &str) -> Result<()> {
-        let global = self.head.lock().expect("head envenenado").clone();
-        if self.read_ref(global.meta_root, name)?.is_none() {
+        let (pager, global) = {
+            let st = self.lock();
+            (st.pager.clone(), st.head.clone())
+        };
+        if read_ref(&pager, global.meta_root, name)?.is_none() {
             return Err(Error::BranchNotFound(name.to_owned()));
         }
-        let main = self.resolve_branch_head(&global, MAIN_BRANCH)?;
+        let main = resolve_branch_head(&pager, &global, MAIN_BRANCH)?;
         let version = global.version + 1;
         let timestamp_ms = now_ms();
-        let mut ts = TxStore::new(self.pager.clone());
+        let mut ts = TxStore::new(pager.clone());
         let (meta_root, _) = btree::delete(&mut ts, global.meta_root, &ref_key(name))?;
         let meta_root = write_meta_indices(
             &mut ts,
@@ -345,24 +356,25 @@ impl Store {
             main.version,
         )?;
         let head = publish_commit(
-            &self.pager,
+            &pager,
             &mut ts,
-            &global,
-            MAIN_BRANCH,
-            main.commit_page,
+            CommitParams::after(&global, MAIN_BRANCH, main.commit_page),
             main.data_root,
             meta_root,
             timestamp_ms,
         )?;
-        *self.head.lock().expect("head envenenado") = head;
+        self.lock().head = head;
         Ok(())
     }
 
     /// Lista todas las ramas y la versión a la que apunta cada una (M8). `main`
     /// siempre aparece (head 0 antes del primer commit).
     pub fn branches(&self) -> Result<Vec<BranchInfo>> {
-        let global = self.head.lock().expect("head envenenado").clone();
-        let src = PagerSource(self.pager.clone());
+        let (pager, global) = {
+            let st = self.lock();
+            (st.pager.clone(), st.head.clone())
+        };
+        let src = PagerSource(pager);
         let mut out = Vec::new();
         let mut has_main = false;
         for item in btree::scan_from(&src, global.meta_root, &[META_REF])? {
@@ -395,10 +407,13 @@ impl Store {
     /// Diferencias del árbol de datos entre dos ramas (M8): los cambios de
     /// `from` a `to`. O(cambios) gracias al skip de subárboles compartidos.
     pub fn diff(&self, from: &str, to: &str) -> Result<Vec<btree::KeyDiff>> {
-        let global = self.head.lock().expect("head envenenado").clone();
-        let from_root = self.resolve_branch_head(&global, from)?.data_root;
-        let to_root = self.resolve_branch_head(&global, to)?.data_root;
-        let src = PagerSource(self.pager.clone());
+        let (pager, global) = {
+            let st = self.lock();
+            (st.pager.clone(), st.head.clone())
+        };
+        let from_root = resolve_branch_head(&pager, &global, from)?.data_root;
+        let to_root = resolve_branch_head(&pager, &global, to)?.data_root;
+        let src = PagerSource(pager);
         btree::diff(&src, from_root, to_root)
     }
 
@@ -418,20 +433,21 @@ impl Store {
     }
 
     fn merge_locked(&self, from: &str, into: &str) -> Result<MergeReport> {
-        let global = self.head.lock().expect("head envenenado").clone();
-        let vf = self
-            .read_ref(global.meta_root, from)?
+        let (pager, global) = {
+            let st = self.lock();
+            (st.pager.clone(), st.head.clone())
+        };
+        let vf = read_ref(&pager, global.meta_root, from)?
             .ok_or_else(|| Error::BranchNotFound(from.to_owned()))?;
-        let vi = self
-            .read_ref(global.meta_root, into)?
+        let vi = read_ref(&pager, global.meta_root, into)?
             .ok_or_else(|| Error::BranchNotFound(into.to_owned()))?;
 
-        let base_v = self.merge_base(global.meta_root, vf, vi)?;
-        let base_root = self.read_data_root(global.meta_root, base_v)?;
-        let from_root = self.read_data_root(global.meta_root, vf)?;
-        let into_root = self.read_data_root(global.meta_root, vi)?;
+        let base_v = merge_base(&pager, global.meta_root, vf, vi)?;
+        let base_root = read_data_root(&pager, global.meta_root, base_v)?;
+        let from_root = read_data_root(&pager, global.meta_root, vf)?;
+        let into_root = read_data_root(&pager, global.meta_root, vi)?;
 
-        let src = PagerSource(self.pager.clone());
+        let src = PagerSource(pager.clone());
         let from_changes = btree::diff(&src, base_root, from_root)?;
         let into_changes = btree::diff(&src, base_root, into_root)?;
         let into_targets: HashMap<&[u8], Option<Vec<u8>>> = into_changes
@@ -474,7 +490,7 @@ impl Store {
         }
 
         // Aplicar los cambios de `from` sobre `into`: nuevo commit en `into`.
-        let mut ts = TxStore::new(self.pager.clone());
+        let mut ts = TxStore::new(pager.clone());
         let mut data_root = into_root;
         for (key, target) in &to_apply {
             data_root = match target {
@@ -499,73 +515,33 @@ impl Store {
             vi,
         )?;
         let head = publish_commit(
-            &self.pager,
+            &pager,
             &mut ts,
-            &global,
-            into,
-            into_commit_page,
+            CommitParams::after(&global, into, into_commit_page),
             data_root,
             meta_root,
             timestamp_ms,
         )?;
-        *self.head.lock().expect("head envenenado") = head;
+        self.lock().head = head;
         Ok(MergeReport {
             version,
             applied: to_apply.len(),
         })
     }
 
-    /// Ancestro común (merge base) de dos versiones, caminando `parent_version`
-    /// (M8). Génesis (0) es ancestro de todo: la búsqueda siempre termina.
-    fn merge_base(&self, meta_root: PageId, vf: u64, vi: u64) -> Result<u64> {
-        let mut ancestors = std::collections::HashSet::new();
-        let mut v = vf;
-        loop {
-            ancestors.insert(v);
-            if v == 0 {
-                break;
-            }
-            v = self.read_parent_version(meta_root, v)?;
-        }
-        let mut v = vi;
-        loop {
-            if ancestors.contains(&v) {
-                return Ok(v);
-            }
-            if v == 0 {
-                return Ok(0);
-            }
-            v = self.read_parent_version(meta_root, v)?;
-        }
-    }
-
-    /// Versión padre (en la rama) de una versión, vía índice histórico (M8).
-    fn read_parent_version(&self, meta_root: PageId, version: u64) -> Result<u64> {
-        if version == 0 {
-            return Ok(0);
-        }
-        let src = PagerSource(self.pager.clone());
-        let raw = btree::get(&src, meta_root, &hist_key(version))?
-            .ok_or(Error::VersionNotFound(AsOf::Version(version)))?;
-        // hist_val = data_root(8) ‖ ts(8) ‖ parent_version(8).
-        match raw.get(16..24) {
-            Some(b) => Ok(u64::from_le_bytes(
-                b.try_into().expect("rango fijo de 8 bytes"),
-            )),
-            None => Ok(0), // entradas pre-M8 (16 B): tratar como enraizadas en génesis
-        }
-    }
-
     pub fn version(&self) -> u64 {
-        self.head.lock().expect("head envenenado").version
+        self.lock().head.version
     }
 
     /// Auditoría completa de la hash chain hasta el head actual (M6). Devuelve
     /// un [`commit::AuditReport`]; `ChainBroken` con la versión exacta si una
     /// página histórica fue manipulada.
     pub fn verify(&self) -> Result<commit::AuditReport> {
-        let head = self.head.lock().expect("head envenenado").clone();
-        commit::verify(&self.pager, &head)
+        let (pager, head) = {
+            let st = self.lock();
+            (st.pager.clone(), st.head.clone())
+        };
+        commit::verify(&pager, &head)
     }
 
     /// Snapshot histórico (M5, time-travel). `AsOf::Head` equivale a
@@ -574,75 +550,426 @@ impl Store {
     /// (M9) la compacte, y el índice histórico del árbol meta (escrito en cada
     /// commit, `META_HIST`/`META_TS`) la localiza.
     pub fn snapshot_at(&self, at: AsOf) -> Result<Snapshot> {
-        let head = self.head.lock().expect("head envenenado").clone();
-        match at {
-            AsOf::Head => Ok(self.snapshot_of(head.version, head.data_root)),
-            AsOf::Version(v) => self.snapshot_at_version(&head, v),
-            AsOf::Timestamp(t) => self.snapshot_at_timestamp(&head, system_time_to_ms(t)),
-        }
+        let (pager, head) = {
+            let st = self.lock();
+            (st.pager.clone(), st.head.clone())
+        };
+        snapshot_at(&pager, &head, at)
     }
 
-    fn snapshot_of(&self, version: u64, data_root: PageId) -> Snapshot {
-        Snapshot {
-            pager: self.pager.clone(),
-            version,
-            data_root,
-        }
+    /// Compacta el archivo según `retention`, manteniendo la clave de cifrado
+    /// actual (M9): reescribe a un temporal y publica con rename atómico.
+    pub fn vacuum(&self, retention: Retention) -> Result<VacuumReport> {
+        self.run_vacuum(retention, Rekey::Keep)
     }
 
-    /// Estado tras 0 commits: árbol de datos vacío, ligado a la identidad del
-    /// archivo.
-    fn genesis_snapshot(&self) -> Snapshot {
-        let data_root = commit::genesis_head(&self.pager.header().file_id).data_root;
-        self.snapshot_of(0, data_root)
+    /// Como [`vacuum`](Store::vacuum) pero además rota la clave de cifrado a
+    /// `new_key` (`None` = desactivar cifrado) (M9, D6).
+    pub fn vacuum_rekey(
+        &self,
+        retention: Retention,
+        new_key: Option<&Key>,
+    ) -> Result<VacuumReport> {
+        self.run_vacuum(retention, Rekey::To(new_key))
     }
 
-    fn snapshot_at_version(&self, head: &Head, v: u64) -> Result<Snapshot> {
-        if v == head.version {
-            return Ok(self.snapshot_of(head.version, head.data_root));
+    fn run_vacuum(&self, retention: Retention, rekey: Rekey<'_>) -> Result<VacuumReport> {
+        // `vacuum` es un escritor: `Busy` si hay una tx (u otro vacuum) en curso.
+        if self.writer.swap(true, Ordering::Acquire) {
+            return Err(Error::Busy);
         }
-        if v > head.version {
-            return Err(Error::VersionNotFound(AsOf::Version(v)));
-        }
-        if v == 0 {
-            return Ok(self.genesis_snapshot());
-        }
-        let src = PagerSource(self.pager.clone());
-        let raw = btree::get(&src, head.meta_root, &hist_key(v))?
-            .ok_or(Error::VersionNotFound(AsOf::Version(v)))?;
-        let bytes: [u8; 8] = raw
-            .get(0..8)
-            .ok_or(Error::CorruptRecord("entrada histórica truncada"))?
-            .try_into()
-            .expect("rango fijo de 8 bytes");
-        Ok(self.snapshot_of(v, PageId(u64::from_le_bytes(bytes))))
+        let result = self.vacuum_locked(retention, rekey);
+        self.writer.store(false, Ordering::Release);
+        result
     }
 
-    /// Mayor versión con timestamp ≤ `ms` (índice `META_TS`, ordenado por
-    /// `(ts, version)` en big-endian): recorre el espacio hacia delante y se
-    /// queda con la última entrada ≤ `ms`. Antes del primer commit ⇒ estado
-    /// génesis. Coste O(commits hasta `ms`), aceptable en v1 (sin índice
-    /// secundario hasta v1.1).
-    fn snapshot_at_timestamp(&self, head: &Head, ms: u64) -> Result<Snapshot> {
-        let src = PagerSource(self.pager.clone());
-        let mut best: Option<u64> = None;
-        for item in btree::scan_from(&src, head.meta_root, &[META_TS])? {
-            let (key, _) = item?;
-            if key.first() != Some(&META_TS) || key.len() != 1 + 8 + 8 {
-                break; // fuera del espacio de timestamps
-            }
-            let ts = u64::from_be_bytes(key[1..9].try_into().expect("rango fijo de 8 bytes"));
-            if ts > ms {
-                break;
-            }
-            best = Some(u64::from_be_bytes(
-                key[9..17].try_into().expect("rango fijo de 8 bytes"),
+    /// Reescribe el archivo compactado en un temporal y lo publica con un rename
+    /// atómico (M9). Un fallo (o un kill) en cualquier punto antes del rename
+    /// deja el archivo original intacto: solo queda un temporal huérfano, que el
+    /// próximo `vacuum` borra. Tras el rename, sustituye el par `(pager, head)`
+    /// de forma atómica: las lecturas nuevas ven el archivo compactado; los
+    /// snapshots ya en vuelo conservan su `Arc<Pager>` (el inodo viejo, ya sin
+    /// nombre) hasta soltarse.
+    fn vacuum_locked(&self, retention: Retention, rekey: Rekey<'_>) -> Result<VacuumReport> {
+        let (old_pager, old_head) = {
+            let st = self.lock();
+            (st.pager.clone(), st.head.clone())
+        };
+        let pages_before = old_head.n_pages;
+
+        // v1: vacuum linealiza la historia (solo conserva `main`). Con otras ramas
+        // vivas, eso cambiaría en silencio lo que ve `main` (el head global puede
+        // ser un commit de otra rama). Mejor negarse y pedir merge/drop antes.
+        if old_head.version != 0 && !has_only_main_branch(&old_pager, &old_head)? {
+            return Err(Error::InvalidInput(
+                "vacuum requiere una sola rama: fusiona o borra las demás antes de compactar",
             ));
         }
-        match best {
-            None => Ok(self.genesis_snapshot()),
-            Some(v) => self.snapshot_at_version(head, v),
+
+        let temp = vacuum_temp_path(&self.path);
+        let _ = std::fs::remove_file(&temp); // limpia un temporal de un vacuum abortado
+
+        // Pager temporal con la cripto destino: misma clave (Keep) o nueva (To).
+        let new_pager = match rekey {
+            Rekey::Keep => {
+                Pager::create_with_crypto(&temp, old_pager.is_encrypted(), old_pager.crypto())?
+            }
+            Rekey::To(key) => Pager::create_with_crypto(&temp, key.is_some(), provider_for(key))?,
+        };
+        let new_pager = Arc::new(new_pager);
+
+        // Continúa el contador de nonce del archivo viejo: con la **misma** clave,
+        // reiniciarlo a 0 reutilizaría pares (clave, nonce) ya usados en el
+        // archivo original — catastrófico en AES-GCM (D6). Inofensivo sin cifrado
+        // (el proveedor lo ignora) y sobrado con clave nueva.
+        new_pager.set_nonce_counter(old_pager.nonce_counter());
+
+        let build = build_compacted(&old_pager, &old_head, &new_pager, retention);
+        let (new_head, kept_from) = match build {
+            Ok(v) => v,
+            Err(e) => {
+                drop(new_pager); // suelta el fd y el lock del temporal
+                let _ = std::fs::remove_file(&temp);
+                return Err(e);
+            }
+        };
+
+        // Publicación atómica: rename (reemplaza el original) + fsync del dir.
+        if let Err(e) =
+            std::fs::rename(&temp, &self.path).and_then(|()| sync_parent_dir(&self.path))
+        {
+            drop(new_pager);
+            let _ = std::fs::remove_file(&temp);
+            return Err(Error::Io(e));
         }
+        let pages_after = new_head.n_pages;
+
+        // Intercambia pager y head juntos, bajo un único lock.
+        {
+            let mut st = self.lock();
+            st.pager = new_pager;
+            st.head = new_head;
+        }
+
+        Ok(VacuumReport {
+            kept_from,
+            head: old_head.version,
+            reclaimed_versions: kept_from.saturating_sub(1),
+            pages_before,
+            pages_after,
+        })
+    }
+}
+
+/// Destino de clave de un `vacuum` (M9): conservar la actual o rotar a otra.
+enum Rekey<'a> {
+    Keep,
+    To(Option<&'a Key>),
+}
+
+/// Ruta del archivo temporal de `vacuum`, en el **mismo** directorio que el
+/// original (un rename entre directorios distintos no sería atómico).
+fn vacuum_temp_path(path: &Path) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(".vacuum-tmp");
+    path.with_file_name(name)
+}
+
+/// Frontera de retención K (versión más antigua conservada), en `[1, head]`. El
+/// llamado garantiza `head ≥ 1`.
+fn vacuum_frontier(old_pager: &Arc<Pager>, old_head: &Head, retention: Retention) -> Result<u64> {
+    let head = old_head.version;
+    let k = match retention {
+        Retention::KeepAll => 1,
+        // Últimas `n`: K = head-n+1, acotado a [1, head]. KeepLast(0|1) ⇒ K=head.
+        Retention::KeepLast(n) => head.saturating_sub(n.saturating_sub(1)).max(1),
+        // Primera versión con timestamp ≥ el dado; si ninguna, solo el head.
+        Retention::KeepSince(t) => {
+            let ms = system_time_to_ms(t);
+            let mut k = head;
+            for v in 1..=head {
+                if read_hist(old_pager, old_head.meta_root, v)?.1 >= ms {
+                    k = v;
+                    break;
+                }
+            }
+            k
+        }
+    };
+    Ok(k)
+}
+
+/// Construye el archivo compactado en `new_pager` a partir de `old_pager`: un
+/// **checkpoint** que materializa el estado completo en la frontera K, y luego
+/// el **replay** de cada delta K+1..=head reusando `btree::diff` (O(cambios)) y
+/// la misma maquinaria de commit. Devuelve `(head_nuevo, K)`.
+///
+/// El replay reproduce con fidelidad el estado de datos de cada versión retenida
+/// (su `AS OF` sigue exacto) pero **linealiza** la historia: solo conserva la
+/// ref `main` (apuntando al head) y un `parent_version` lineal. Para conservar
+/// ramas, fusiónalas (o bórralas) antes de compactar.
+fn build_compacted(
+    old_pager: &Arc<Pager>,
+    old_head: &Head,
+    new_pager: &Arc<Pager>,
+    retention: Retention,
+) -> Result<(Head, u64)> {
+    // Base vacía: el temporal ya es génesis; nada que materializar.
+    if old_head.version == 0 {
+        return Ok((commit::genesis_head(&new_pager.header().file_id), 0));
+    }
+
+    let old_meta = old_head.meta_root;
+    let k = vacuum_frontier(old_pager, old_head, retention)?;
+
+    // 1. Checkpoint en versión K: vuelca el árbol de datos de K en uno nuevo
+    //    compacto. Su cadena arranca del eslabón cero del archivo nuevo, pero
+    //    numera desde K (lo entiende `commit::verify`).
+    let mut ts = TxStore::new(new_pager.clone());
+    let snap_k = snapshot_at_version(old_pager, old_head, k)?;
+    let mut data_root = btree::NO_ROOT;
+    for item in snap_k.scan()? {
+        let (key, val) = item?;
+        data_root = btree::insert(&mut ts, data_root, &key, &val)?;
+    }
+    let ts_k = read_hist(old_pager, old_meta, k)?.1;
+    let meta_root =
+        write_meta_indices(&mut ts, btree::NO_ROOT, k, data_root, ts_k, MAIN_BRANCH, 0)?;
+    let checkpoint = CommitParams {
+        version: k,
+        flags: COMMIT_FLAG_CHECKPOINT,
+        prev_page: 0,
+        prev_chain: commit::genesis_chain(&new_pager.header().file_id),
+        branch: MAIN_BRANCH,
+        parent_page: 0,
+    };
+    let mut base = publish_commit(new_pager, &mut ts, checkpoint, data_root, meta_root, ts_k)?;
+
+    // 2. Replay de los deltas K+1..=head: el diff entre raíces consecutivas del
+    //    archivo viejo, aplicado sobre el árbol nuevo (que ya contiene v-1).
+    let old_src = PagerSource(old_pager.clone());
+    for v in (k + 1)..=old_head.version {
+        let prev_root = read_data_root(old_pager, old_meta, v - 1)?;
+        let cur_root = read_data_root(old_pager, old_meta, v)?;
+        let diffs = btree::diff(&old_src, prev_root, cur_root)?;
+
+        let mut ts = TxStore::new(new_pager.clone());
+        let mut data_root = base.data_root;
+        for d in &diffs {
+            data_root = match &d.change {
+                btree::KeyChange::Added(val) | btree::KeyChange::Modified(_, val) => {
+                    btree::insert(&mut ts, data_root, &d.key, val)?
+                }
+                btree::KeyChange::Removed(_) => btree::delete(&mut ts, data_root, &d.key)?.0,
+            };
+        }
+        let ts_v = read_hist(old_pager, old_meta, v)?.1;
+        let meta_root = write_meta_indices(
+            &mut ts,
+            base.meta_root,
+            v,
+            data_root,
+            ts_v,
+            MAIN_BRANCH,
+            v - 1,
+        )?;
+        base = publish_commit(
+            new_pager,
+            &mut ts,
+            CommitParams::after(&base, MAIN_BRANCH, base.commit_page),
+            data_root,
+            meta_root,
+            ts_v,
+        )?;
+    }
+    Ok((base, k))
+}
+
+// --- resolución de versiones e índices del árbol meta (libres de `self`) ---
+//
+// Toman el `pager` por parámetro en vez de leerlo de un `Store`: el llamador
+// captura el par `(pager, head)` bajo un único lock y lo pasa, de modo que
+// `vacuum` (M9) jamás puede sustituir el pager a media operación de lectura.
+
+/// Resuelve la cabeza de una rama: su `data_root` y versión. `main` siempre
+/// existe (antes del primer commit es génesis); otra rama inexistente da
+/// `BranchNotFound`.
+fn resolve_branch_head(pager: &Arc<Pager>, global: &Head, branch: &str) -> Result<BranchHead> {
+    match read_ref(pager, global.meta_root, branch)? {
+        Some(version) => {
+            // El `commit_page` solo lo tiene a mano la rama tip (head global);
+            // para las demás es informativo (no lo usa la lógica).
+            let commit_page = if version == global.version {
+                global.commit_page
+            } else {
+                0
+            };
+            Ok(BranchHead {
+                version,
+                data_root: read_data_root(pager, global.meta_root, version)?,
+                commit_page,
+            })
+        }
+        None if branch == MAIN_BRANCH => Ok(BranchHead {
+            version: 0,
+            data_root: commit::genesis_head(&pager.header().file_id).data_root,
+            commit_page: 0,
+        }),
+        None => Err(Error::BranchNotFound(branch.to_owned())),
+    }
+}
+
+/// `true` si la única rama del árbol meta es `main` (precondición de `vacuum`,
+/// M9). Recorre el espacio de refs; cualquier nombre distinto de `main` ⇒ falso.
+fn has_only_main_branch(pager: &Arc<Pager>, head: &Head) -> Result<bool> {
+    let src = PagerSource(pager.clone());
+    for item in btree::scan_from(&src, head.meta_root, &[META_REF])? {
+        let (key, _) = item?;
+        if key.first() != Some(&META_REF) {
+            break; // fuera del espacio de refs
+        }
+        if &key[1..] != MAIN_BRANCH.as_bytes() {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Versión a la que apunta `ref[branch]` en un árbol meta, si existe.
+fn read_ref(pager: &Arc<Pager>, meta_root: PageId, branch: &str) -> Result<Option<u64>> {
+    let src = PagerSource(pager.clone());
+    match btree::get(&src, meta_root, &ref_key(branch))? {
+        Some(raw) => {
+            let b: [u8; 8] = raw
+                .get(0..8)
+                .ok_or(Error::CorruptRecord("ref de rama truncada"))?
+                .try_into()
+                .expect("rango fijo de 8 bytes");
+            Ok(Some(u64::from_le_bytes(b)))
+        }
+        None => Ok(None),
+    }
+}
+
+/// `data_root` de una versión vía índice histórico (versión 0 = génesis).
+fn read_data_root(pager: &Arc<Pager>, meta_root: PageId, version: u64) -> Result<PageId> {
+    if version == 0 {
+        return Ok(commit::genesis_head(&pager.header().file_id).data_root);
+    }
+    Ok(read_hist(pager, meta_root, version)?.0)
+}
+
+/// Entrada histórica completa de una versión: `(data_root, timestamp_ms,
+/// parent_version)`. Las entradas pre-M8 (16 B) traen `parent_version = 0`.
+fn read_hist(pager: &Arc<Pager>, meta_root: PageId, version: u64) -> Result<(PageId, u64, u64)> {
+    let src = PagerSource(pager.clone());
+    let raw = btree::get(&src, meta_root, &hist_key(version))?
+        .ok_or(Error::VersionNotFound(AsOf::Version(version)))?;
+    let u64_at = |off: usize| -> Result<u64> {
+        Ok(u64::from_le_bytes(
+            raw.get(off..off + 8)
+                .ok_or(Error::CorruptRecord("entrada histórica truncada"))?
+                .try_into()
+                .expect("rango fijo de 8 bytes"),
+        ))
+    };
+    let data_root = PageId(u64_at(0)?);
+    let ts = u64_at(8)?;
+    let parent = u64_at(16).unwrap_or(0); // pre-M8 (16 B): enraizada en génesis
+    Ok((data_root, ts, parent))
+}
+
+/// Versión padre (en la rama) de una versión, vía índice histórico (M8).
+fn read_parent_version(pager: &Arc<Pager>, meta_root: PageId, version: u64) -> Result<u64> {
+    if version == 0 {
+        return Ok(0);
+    }
+    Ok(read_hist(pager, meta_root, version)?.2)
+}
+
+/// Ancestro común (merge base) de dos versiones, caminando `parent_version`
+/// (M8). Génesis (0) es ancestro de todo: la búsqueda siempre termina.
+fn merge_base(pager: &Arc<Pager>, meta_root: PageId, vf: u64, vi: u64) -> Result<u64> {
+    let mut ancestors = std::collections::HashSet::new();
+    let mut v = vf;
+    loop {
+        ancestors.insert(v);
+        if v == 0 {
+            break;
+        }
+        v = read_parent_version(pager, meta_root, v)?;
+    }
+    let mut v = vi;
+    loop {
+        if ancestors.contains(&v) {
+            return Ok(v);
+        }
+        if v == 0 {
+            return Ok(0);
+        }
+        v = read_parent_version(pager, meta_root, v)?;
+    }
+}
+
+fn snapshot_of(pager: &Arc<Pager>, version: u64, data_root: PageId) -> Snapshot {
+    Snapshot {
+        pager: pager.clone(),
+        version,
+        data_root,
+    }
+}
+
+/// Estado tras 0 commits: árbol de datos vacío, ligado a la identidad del archivo.
+fn genesis_snapshot(pager: &Arc<Pager>) -> Snapshot {
+    let data_root = commit::genesis_head(&pager.header().file_id).data_root;
+    snapshot_of(pager, 0, data_root)
+}
+
+fn snapshot_at(pager: &Arc<Pager>, head: &Head, at: AsOf) -> Result<Snapshot> {
+    match at {
+        AsOf::Head => Ok(snapshot_of(pager, head.version, head.data_root)),
+        AsOf::Version(v) => snapshot_at_version(pager, head, v),
+        AsOf::Timestamp(t) => snapshot_at_timestamp(pager, head, system_time_to_ms(t)),
+    }
+}
+
+fn snapshot_at_version(pager: &Arc<Pager>, head: &Head, v: u64) -> Result<Snapshot> {
+    if v == head.version {
+        return Ok(snapshot_of(pager, head.version, head.data_root));
+    }
+    if v > head.version {
+        return Err(Error::VersionNotFound(AsOf::Version(v)));
+    }
+    if v == 0 {
+        return Ok(genesis_snapshot(pager));
+    }
+    let data_root = read_data_root(pager, head.meta_root, v)?;
+    Ok(snapshot_of(pager, v, data_root))
+}
+
+/// Mayor versión con timestamp ≤ `ms` (índice `META_TS`, ordenado por
+/// `(ts, version)` en big-endian): recorre el espacio hacia delante y se queda
+/// con la última entrada ≤ `ms`. Antes del primer commit (o de la frontera de
+/// `vacuum`) ⇒ estado génesis. Coste O(commits hasta `ms`), aceptable en v1.
+fn snapshot_at_timestamp(pager: &Arc<Pager>, head: &Head, ms: u64) -> Result<Snapshot> {
+    let src = PagerSource(pager.clone());
+    let mut best: Option<u64> = None;
+    for item in btree::scan_from(&src, head.meta_root, &[META_TS])? {
+        let (key, _) = item?;
+        if key.first() != Some(&META_TS) || key.len() != 1 + 8 + 8 {
+            break; // fuera del espacio de timestamps
+        }
+        let ts = u64::from_be_bytes(key[1..9].try_into().expect("rango fijo de 8 bytes"));
+        if ts > ms {
+            break;
+        }
+        best = Some(u64::from_be_bytes(
+            key[9..17].try_into().expect("rango fijo de 8 bytes"),
+        ));
+    }
+    match best {
+        None => Ok(genesis_snapshot(pager)),
+        Some(v) => snapshot_at_version(pager, head, v),
     }
 }
 
@@ -780,7 +1107,10 @@ impl NodeStore for TxStore {
 /// el archivo no se ha tocado más allá de su EOF lógico.
 pub struct WriteTx {
     pager: Arc<Pager>,
-    head: Arc<Mutex<Head>>,
+    /// Estado compartido del almacén: el commit publica el head nuevo aquí. El
+    /// escritor único (este `writer`) impide que `vacuum` sustituya el pager
+    /// mientras la tx vive, así que `pager` y `state.pager` coinciden al commit.
+    state: Arc<Mutex<DbState>>,
     writer: Arc<AtomicBool>,
     /// Head **global** anterior (versión, `prev_page`/`prev_chain`, `meta_root`).
     base: Head,
@@ -895,15 +1225,44 @@ impl WriteTx {
         let head = publish_commit(
             &self.pager,
             &mut self.ts,
-            &self.base,
-            &self.branch,
-            self.parent_page,
+            CommitParams::after(&self.base, &self.branch, self.parent_page),
             self.data_root,
             meta_root,
             timestamp_ms,
         )?;
-        *self.head.lock().expect("head envenenado") = head;
+        self.state.lock().expect("estado del store envenenado").head = head;
         Ok(version)
+    }
+}
+
+/// Parámetros de cabecera de un commit que no se derivan de los datos. Para un
+/// commit normal salen del head global anterior ([`CommitParams::after`]); el
+/// checkpoint de `vacuum` (M9) los fija a mano (versión K, flag checkpoint,
+/// cadena sembrada en génesis).
+struct CommitParams<'a> {
+    version: u64,
+    flags: u32,
+    /// Commit anterior en la cadena global (0 = génesis).
+    prev_page: u64,
+    /// `chain_hash` del commit anterior (génesis para el checkpoint).
+    prev_chain: [u8; 32],
+    branch: &'a str,
+    /// Commit padre en la ascendencia de datos de la rama (informativo).
+    parent_page: u64,
+}
+
+impl<'a> CommitParams<'a> {
+    /// Commit normal que sucede a `base` (el head global): versión+1 y encadena
+    /// tras él. `parent_page` es la cabeza de datos de la rama destino.
+    fn after(base: &Head, branch: &'a str, parent_page: u64) -> CommitParams<'a> {
+        CommitParams {
+            version: base.version + 1,
+            flags: 0,
+            prev_page: base.commit_page,
+            prev_chain: base.chain_hash,
+            branch,
+            parent_page,
+        }
     }
 }
 
@@ -933,20 +1292,18 @@ fn write_meta_indices(
 }
 
 /// Escribe las páginas sucias de la tx, la página de commit y publica el nuevo
-/// head (doble fsync: el punto de durabilidad de M1). `base` es el head global
-/// anterior (da `prev_page`/`prev_chain`/`meta_root`/contadores).
-#[allow(clippy::too_many_arguments)] // firma plana deliberada: el commit
+/// head (doble fsync: el punto de durabilidad de M1). Los campos de cabecera no
+/// derivados de los datos (versión, flags, `prev_page`/`prev_chain`) vienen en
+/// `params`: un commit normal los toma del head anterior; el checkpoint de
+/// `vacuum` (M9) los fija explícitamente.
 fn publish_commit(
     pager: &Pager,
     ts: &mut TxStore,
-    base: &Head,
-    branch: &str,
-    parent_page: u64,
+    params: CommitParams<'_>,
     data_root: PageId,
     meta_root: PageId,
     timestamp_ms: u64,
 ) -> Result<Head> {
-    let version = base.version + 1;
     let commit_page = PageId(ts.alloc_next);
 
     // Páginas sucias en orden de id; content_hash cubre los bodies en claro.
@@ -963,18 +1320,18 @@ fn publish_commit(
     pager.sync()?;
 
     let mut header = CommitHeader {
-        flags: 0,
-        version,
-        parent_page,
-        prev_page: base.commit_page,
+        flags: params.flags,
+        version: params.version,
+        parent_page: params.parent_page,
+        prev_page: params.prev_page,
         timestamp_ms,
         data_root,
         meta_root,
         nonce_counter: pager.nonce_counter() + 1, // +1: el sellado de esta página
         pages_written: pages_written + 1,
-        branch: branch.to_owned(),
+        branch: params.branch.to_owned(),
         content_hash: hasher.finalize().into(),
-        prev_chain: base.chain_hash,
+        prev_chain: params.prev_chain,
         chain_hash: [0; 32],
     };
     header.chain_hash = header.compute_chain();
@@ -985,7 +1342,7 @@ fn publish_commit(
     pager.sync()?;
 
     let head = Head {
-        version,
+        version: header.version,
         commit_page: commit_page.0,
         data_root,
         meta_root,
@@ -1080,11 +1437,11 @@ mod tests {
     fn empty_tx_commits_nothing() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::create(&dir.path().join("t.arkeion")).unwrap();
-        let pages_before = store.pager.n_pages();
+        let pages_before = store.pager().n_pages();
         let tx = store.begin().unwrap();
         assert_eq!(tx.commit().unwrap(), 0);
         assert_eq!(store.version(), 0);
-        assert_eq!(store.pager.n_pages(), pages_before);
+        assert_eq!(store.pager().n_pages(), pages_before);
     }
 
     #[test]
@@ -1269,8 +1626,8 @@ mod tests {
             tx.commit().unwrap();
         }
         let (head_pages, head_counter) = {
-            let h = store.head.lock().unwrap();
-            (h.n_pages, h.nonce_counter)
+            let st = store.lock();
+            (st.head.n_pages, st.head.nonce_counter)
         };
         drop(store);
 
@@ -1287,14 +1644,14 @@ mod tests {
 
         let store = Store::open_keyed(&path, Some(&key)).unwrap();
         assert_eq!(
-            store.head.lock().unwrap().n_pages,
+            store.lock().head.n_pages,
             head_pages,
             "el head no debe moverse por la cola rota"
         );
+        let counter = store.pager().nonce_counter();
         assert!(
-            store.pager.nonce_counter() >= head_counter + extra,
-            "el contador {} no superó el margen {}",
-            store.pager.nonce_counter(),
+            counter >= head_counter + extra,
+            "el contador {counter} no superó el margen {}",
             head_counter + extra
         );
     }
@@ -1560,6 +1917,342 @@ mod tests {
                 .unwrap()
                 .unwrap(),
             15i64.to_le_bytes()
+        );
+    }
+
+    // --- vacuum (M9) ---
+
+    /// Crea un almacén con `n` versiones: la versión `v` deja `key_v = "k" →
+    /// b"v{v}"` y reescribe una clave estable `b"head"` con el número de versión.
+    /// Así cada versión tiene un estado de datos distinto y verificable.
+    fn store_with_versions(path: &Path, n: u64) -> Store {
+        let store = Store::create(path).unwrap();
+        for v in 1..=n {
+            let mut tx = store.begin().unwrap();
+            tx.put(format!("k{v}").as_bytes(), format!("v{v}").as_bytes())
+                .unwrap();
+            tx.put(b"head", v.to_le_bytes().as_slice()).unwrap();
+            tx.commit().unwrap();
+        }
+        store
+    }
+
+    /// Comprueba que `AS OF VERSION v` reproduce el estado exacto: `b"head" == v`
+    /// y las claves `k1..=v` presentes, `k{v+1}..` ausentes.
+    fn assert_state_at(store: &Store, v: u64, max: u64) {
+        let snap = store.snapshot_at(AsOf::Version(v)).unwrap();
+        assert_eq!(
+            snap.get(b"head").unwrap().unwrap(),
+            v.to_le_bytes(),
+            "head en la versión {v}"
+        );
+        for j in 1..=max {
+            let got = snap.get(format!("k{j}").as_bytes()).unwrap();
+            if j <= v {
+                assert_eq!(got.unwrap(), format!("v{j}").as_bytes(), "k{j} en v{v}");
+            } else {
+                assert!(got.is_none(), "k{j} no debería existir en v{v}");
+            }
+        }
+    }
+
+    #[test]
+    fn vacuum_keeplast_retains_recent_and_compacts_old() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_with_versions(&dir.path().join("v.arkeion"), 10);
+        let pages_before = store.pager().n_pages();
+
+        let report = store.vacuum(Retention::KeepLast(3)).unwrap();
+        assert_eq!(report.head, 10);
+        assert_eq!(report.kept_from, 8); // 10 - 3 + 1
+        assert_eq!(report.reclaimed_versions, 7);
+        assert_eq!(report.pages_before, pages_before);
+        assert!(
+            report.pages_after < report.pages_before,
+            "vacuum no compactó: {} → {}",
+            report.pages_before,
+            report.pages_after
+        );
+
+        // Cadena íntegra tras compactar, y solo cuenta los commits retenidos.
+        let audit = store.verify().unwrap();
+        assert!(audit.chain_ok);
+        assert_eq!(audit.head, 10);
+        assert_eq!(audit.commits, 3); // checkpoint(8) + delta(9) + delta(10)
+
+        // Versiones retenidas: estado exacto. Compactadas: VersionNotFound.
+        for v in 8..=10 {
+            assert_state_at(&store, v, 10);
+        }
+        for v in 1..=7 {
+            assert!(
+                matches!(
+                    store.snapshot_at(AsOf::Version(v)),
+                    Err(Error::VersionNotFound(AsOf::Version(_)))
+                ),
+                "la versión {v} debería estar compactada"
+            );
+        }
+        // El head sigue siendo el presente.
+        assert_eq!(store.version(), 10);
+        assert_eq!(
+            store.snapshot().get(b"head").unwrap().unwrap(),
+            10u64.to_le_bytes()
+        );
+    }
+
+    #[test]
+    fn vacuum_keepall_is_lossless_defrag() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_with_versions(&dir.path().join("v.arkeion"), 6);
+
+        let report = store.vacuum(Retention::KeepAll).unwrap();
+        assert_eq!(report.kept_from, 1);
+        assert_eq!(report.reclaimed_versions, 0);
+
+        assert!(store.verify().unwrap().chain_ok);
+        for v in 1..=6 {
+            assert_state_at(&store, v, 6);
+        }
+        // La versión 0 sigue siendo el estado vacío de génesis.
+        assert!(
+            store
+                .snapshot_at(AsOf::Version(0))
+                .unwrap()
+                .get(b"head")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn vacuum_survives_reopen_with_data_intact() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v.arkeion");
+        let store = store_with_versions(&path, 8);
+        store.vacuum(Retention::KeepLast(4)).unwrap();
+        drop(store);
+
+        // Reabrir el archivo compactado: recover encuentra el head, verify OK.
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.version(), 8);
+        assert!(store.verify().unwrap().chain_ok);
+        for v in 5..=8 {
+            assert_state_at(&store, v, 8);
+        }
+        assert!(store.snapshot_at(AsOf::Version(4)).is_err());
+
+        // Y se puede seguir escribiendo encima.
+        let mut tx = store.begin().unwrap();
+        tx.put(b"after", b"vacuum").unwrap();
+        assert_eq!(tx.commit().unwrap(), 9);
+        assert!(store.verify().unwrap().chain_ok);
+    }
+
+    #[test]
+    fn vacuum_keeplast_one_keeps_only_head() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_with_versions(&dir.path().join("v.arkeion"), 5);
+        let report = store.vacuum(Retention::KeepLast(1)).unwrap();
+        assert_eq!(report.kept_from, 5);
+        assert_eq!(report.reclaimed_versions, 4);
+        assert!(store.verify().unwrap().chain_ok);
+        assert_state_at(&store, 5, 5);
+        assert!(store.snapshot_at(AsOf::Version(4)).is_err());
+    }
+
+    #[test]
+    fn vacuum_checkpoint_as_head_reopens_and_verifies() {
+        // K == head: el archivo compactado tiene un único commit, el checkpoint.
+        // recover (vía meta slot) y verify deben tratarlo como cabeza de cadena.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v.arkeion");
+        let store = store_with_versions(&path, 5);
+        store.vacuum(Retention::KeepLast(1)).unwrap();
+        drop(store);
+
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.version(), 5);
+        let audit = store.verify().unwrap();
+        assert!(audit.chain_ok);
+        assert_eq!(audit.head, 5);
+        assert_eq!(audit.commits, 1); // solo el checkpoint
+        assert_state_at(&store, 5, 5);
+    }
+
+    #[test]
+    fn vacuum_keepsince_extremes() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Timestamp 0: ninguna versión es anterior ⇒ se conservan todas (K=1).
+        let store = store_with_versions(&dir.path().join("a.arkeion"), 5);
+        let r = store.vacuum(Retention::KeepSince(UNIX_EPOCH)).unwrap();
+        assert_eq!(r.kept_from, 1);
+        assert_state_at(&store, 1, 5);
+
+        // Timestamp muy futuro: todas son anteriores ⇒ solo el head (K=head).
+        let store = store_with_versions(&dir.path().join("b.arkeion"), 5);
+        let future = UNIX_EPOCH + std::time::Duration::from_secs(40_000_000_000);
+        let r = store.vacuum(Retention::KeepSince(future)).unwrap();
+        assert_eq!(r.kept_from, 5);
+        assert!(store.snapshot_at(AsOf::Version(4)).is_err());
+        assert_state_at(&store, 5, 5);
+    }
+
+    #[test]
+    fn vacuum_on_empty_db_is_a_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::create(&dir.path().join("e.arkeion")).unwrap();
+        let report = store.vacuum(Retention::KeepLast(3)).unwrap();
+        assert_eq!(report.head, 0);
+        assert_eq!(report.kept_from, 0);
+        assert!(store.verify().unwrap().chain_ok);
+        // Sigue usable.
+        let mut tx = store.begin().unwrap();
+        tx.put(b"k", b"v").unwrap();
+        assert_eq!(tx.commit().unwrap(), 1);
+    }
+
+    #[test]
+    fn vacuum_is_busy_during_a_write_tx() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_with_versions(&dir.path().join("v.arkeion"), 2);
+        let tx = store.begin().unwrap();
+        assert!(matches!(store.vacuum(Retention::KeepAll), Err(Error::Busy)));
+        drop(tx);
+        store.vacuum(Retention::KeepAll).unwrap();
+    }
+
+    #[test]
+    fn snapshot_taken_before_vacuum_survives_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_with_versions(&dir.path().join("v.arkeion"), 6);
+
+        // Fija una lectura en una versión que vacuum va a compactar.
+        let pinned = store.snapshot_at(AsOf::Version(2)).unwrap();
+        store.vacuum(Retention::KeepLast(2)).unwrap(); // conserva 5,6
+
+        // El snapshot viejo sigue siendo dueño de su Arc<Pager> (inodo viejo):
+        // lee su versión 2 aunque ya esté compactada en el archivo nuevo.
+        assert_eq!(pinned.get(b"head").unwrap().unwrap(), 2u64.to_le_bytes());
+        assert_eq!(pinned.get(b"k2").unwrap().unwrap(), b"v2");
+        // Pero el almacén ya no la resuelve.
+        assert!(store.snapshot_at(AsOf::Version(2)).is_err());
+    }
+
+    #[test]
+    fn vacuum_keeps_key_and_continues_nonce_when_encrypted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("enc.arkeion");
+        let key = Key::new([0x5A; 32]);
+
+        let store = Store::create_keyed(&path, Some(&key)).unwrap();
+        for v in 1..=6 {
+            let mut tx = store.begin().unwrap();
+            tx.put(format!("k{v}").as_bytes(), format!("v{v}").as_bytes())
+                .unwrap();
+            tx.commit().unwrap();
+        }
+        let nonce_before = store.pager().nonce_counter();
+
+        store.vacuum(Retention::KeepLast(2)).unwrap();
+        // El archivo nuevo continúa el contador de nonce (jamás reinicia a 0 con
+        // la misma clave): su head queda por encima del contador previo.
+        assert!(
+            store.pager().nonce_counter() >= nonce_before,
+            "el contador de nonce no continuó: {} < {nonce_before}",
+            store.pager().nonce_counter()
+        );
+        assert!(store.verify().unwrap().chain_ok);
+        drop(store);
+
+        // Reabrir con la clave correcta: datos íntegros; sin clave, KeyRequired.
+        assert!(matches!(Store::open(&path), Err(Error::KeyRequired)));
+        let store = Store::open_keyed(&path, Some(&key)).unwrap();
+        assert_eq!(store.snapshot().get(b"k6").unwrap().unwrap(), b"v6");
+        assert!(store.verify().unwrap().chain_ok);
+    }
+
+    #[test]
+    fn vacuum_rekey_rotates_the_encryption_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rk.arkeion");
+        let old = Key::new([0x11; 32]);
+        let new = Key::new([0x22; 32]);
+
+        let store = Store::create_keyed(&path, Some(&old)).unwrap();
+        let mut tx = store.begin().unwrap();
+        tx.put(b"secret", b"value").unwrap();
+        tx.commit().unwrap();
+
+        store.vacuum_rekey(Retention::KeepAll, Some(&new)).unwrap();
+        assert!(store.verify().unwrap().chain_ok);
+        drop(store);
+
+        // La clave vieja ya no abre; la nueva sí.
+        assert!(matches!(
+            Store::open_keyed(&path, Some(&old)),
+            Err(Error::WrongKey)
+        ));
+        let store = Store::open_keyed(&path, Some(&new)).unwrap();
+        assert_eq!(store.snapshot().get(b"secret").unwrap().unwrap(), b"value");
+        assert!(store.verify().unwrap().chain_ok);
+    }
+
+    #[test]
+    fn vacuum_rekey_can_remove_encryption() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("de.arkeion");
+        let key = Key::new([0x33; 32]);
+
+        let store = Store::create_keyed(&path, Some(&key)).unwrap();
+        let mut tx = store.begin().unwrap();
+        tx.put(b"k", b"v").unwrap();
+        tx.commit().unwrap();
+
+        store.vacuum_rekey(Retention::KeepAll, None).unwrap();
+        drop(store);
+
+        // Ahora abre sin clave; pasar la vieja clave es un error de uso.
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.snapshot().get(b"k").unwrap().unwrap(), b"v");
+        assert!(store.verify().unwrap().chain_ok);
+        assert!(Store::open_keyed(&path, Some(&key)).is_err());
+    }
+
+    #[test]
+    fn vacuum_refuses_when_other_branches_exist() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_with_versions(&dir.path().join("v.arkeion"), 3);
+        store.create_branch("dev", AsOf::Head).unwrap();
+
+        // Con `dev` viva, vacuum se niega (linealizaría la historia en silencio).
+        assert!(matches!(
+            store.vacuum(Retention::KeepAll),
+            Err(Error::InvalidInput(_))
+        ));
+
+        // Tras borrar la rama, compacta sin problema.
+        store.drop_branch("dev").unwrap();
+        store.vacuum(Retention::KeepAll).unwrap();
+        assert!(store.verify().unwrap().chain_ok);
+    }
+
+    #[test]
+    fn vacuum_removes_a_stale_temp_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v.arkeion");
+        let store = store_with_versions(&path, 3);
+
+        // Simula un vacuum anterior abortado: un temporal huérfano.
+        let temp = vacuum_temp_path(&path);
+        std::fs::write(&temp, b"basura de un vacuum muerto").unwrap();
+
+        store.vacuum(Retention::KeepAll).unwrap();
+        assert!(store.verify().unwrap().chain_ok);
+        assert!(
+            !temp.exists(),
+            "el temporal huérfano debería haberse borrado"
         );
     }
 }

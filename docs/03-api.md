@@ -59,15 +59,21 @@ impl Database {
     pub fn merge(&self, from: &str, into: &str, policy: MergePolicy) -> Result<MergeReport>;
 
     pub fn verify(&self) -> Result<AuditReport>;                  // recorre la hash chain entera
-    pub fn vacuum(&self, retention: Retention) -> Result<VacuumReport>;
+    pub fn vacuum(&self, retention: Retention) -> Result<VacuumReport>;        // compacta + rename atómico
+    pub fn vacuum_rekey(&self, retention: Retention, new_key: Option<Key>)     // compacta y rota la clave
+        -> Result<VacuumReport>;
 }
 
 pub enum MergePolicy { FailOnConflict }                 // v1; futuras: Theirs, Ours, resolver
-pub enum Retention   { KeepAll, KeepVersions(u64), KeepSince(SystemTime) }
+pub enum Retention   { KeepAll, KeepLast(u64), KeepSince(SystemTime) }   // frontera K conservada
 
 pub struct Diff { pub tables: Vec<TableDiff> }          // altas/bajas/modificaciones por rowid,
                                                         // y diffs de esquema
 pub struct AuditReport { pub head: Version, pub commits: u64, pub chain_ok: bool }
+pub struct VacuumReport {                               // qué conservó y cuánto recuperó
+    pub kept_from: u64, pub head: u64, pub reclaimed_versions: u64,
+    pub pages_before: u64, pub pages_after: u64,
+}
 ```
 
 ## `Connection` — SQL, transacciones, time-travel

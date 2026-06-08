@@ -23,7 +23,8 @@ use crate::sql::{
     ast::{AsOfClause, Stmt},
 };
 use crate::tx::{
-    AsOf, BranchInfo, MAIN_BRANCH, MergePolicy, MergeReport, Snapshot, Store, WriteTx,
+    AsOf, BranchInfo, MAIN_BRANCH, MergePolicy, MergeReport, Retention, Snapshot, Store,
+    VacuumReport, WriteTx,
 };
 
 /// Opciones de apertura. *Zero-config*: los valores por defecto funcionan.
@@ -181,6 +182,49 @@ impl Database {
     /// ```
     pub fn verify(&self) -> Result<AuditReport> {
         self.store.verify()
+    }
+
+    /// Compacta el archivo según `retention` (M9): reescribe la base entera a un
+    /// archivo temporal y la publica con un **rename atómico**. Tras vacuum,
+    /// [`verify`](Database::verify) sigue dando OK (la cadena rearranca de un
+    /// checkpoint) y las versiones **retenidas** siguen respondiendo `AS OF`; las
+    /// compactadas dan [`Error::VersionNotFound`]. El presente nunca se pierde.
+    ///
+    /// Crash-safe: un kill en cualquier punto antes del rename deja el archivo
+    /// original intacto (solo queda un temporal huérfano, que el próximo vacuum
+    /// borra). El mismo handle y sus conexiones siguen válidos: las lecturas
+    /// nuevas ven el archivo compactado; un snapshot histórico ya abierto sigue
+    /// leyendo su versión hasta soltarse.
+    ///
+    /// Conserva la clave de cifrado actual. Requiere una sola rama: con otras
+    /// ramas vivas devuelve [`Error::InvalidInput`] (vacuum linealiza la
+    /// historia); fusiónalas o bórralas antes de compactar.
+    ///
+    /// ```
+    /// use arkeion::{Database, Options, Retention};
+    ///
+    /// let dir = tempfile::tempdir().unwrap();
+    /// let db = Database::open(dir.path().join("t.arkeion"), Options::default()).unwrap();
+    /// let conn = db.connect().unwrap();
+    /// conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER)", &[]).unwrap();
+    /// for i in 0..50 {
+    ///     conn.execute("INSERT INTO t (n) VALUES (?1)", &arkeion::params![i]).unwrap();
+    /// }
+    /// let report = db.vacuum(Retention::KeepLast(5)).unwrap();
+    /// assert!(report.pages_after <= report.pages_before);
+    /// assert!(db.verify().unwrap().chain_ok);
+    /// ```
+    pub fn vacuum(&self, retention: Retention) -> Result<VacuumReport> {
+        self.store.vacuum(retention)
+    }
+
+    /// Como [`vacuum`](Database::vacuum) pero además **rota la clave** de cifrado
+    /// a `new_key` (M9, D6): `Some(k)` recifra con `k` desde la primera página;
+    /// `None` desactiva el cifrado. El archivo nuevo se sella entero con la clave
+    /// destino, así que es la vía soportada para cambiar de clave. Úsala con una
+    /// clave genuinamente nueva.
+    pub fn vacuum_rekey(&self, retention: Retention, new_key: Option<Key>) -> Result<VacuumReport> {
+        self.store.vacuum_rekey(retention, new_key.as_ref())
     }
 }
 

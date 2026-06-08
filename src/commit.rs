@@ -215,7 +215,15 @@ pub fn recover(pager: &Pager) -> Result<Head> {
         let Some(h) = CommitHeader::decode(buf.body()) else {
             continue; // página de datos de un commit posterior: seguir
         };
-        if h.version == head.version + 1 && h.prev_chain == head.chain_hash && h.self_consistent() {
+        // Adopta el commit si encadena con el head (versión consecutiva y cadena
+        // enlazada) o si es el checkpoint que arranca un archivo compactado
+        // (vacuum, M9): desde génesis, un checkpoint cuyo `prev_chain` enlaza con
+        // el eslabón cero abre una cadena que numera desde su propia versión.
+        let chained = h.version == head.version + 1 && h.prev_chain == head.chain_hash;
+        let checkpoint_start = head.commit_page == 0
+            && h.flags & COMMIT_FLAG_CHECKPOINT != 0
+            && h.prev_chain == head.chain_hash;
+        if (chained || checkpoint_start) && h.self_consistent() {
             head = head_from(&h, page);
         } else {
             // Commit que no encadena: imposible con escritor serial salvo
@@ -231,7 +239,8 @@ pub fn recover(pager: &Pager) -> Result<Head> {
 pub struct AuditReport {
     /// Versión del head auditado.
     pub head: u64,
-    /// Commits recorridos desde génesis (== `head` salvo manipulación).
+    /// Commits recorridos hasta el head: == `head` en un archivo sin compactar;
+    /// tras `vacuum` (M9), los retenidos (`head - K + 1`, desde el checkpoint).
     pub commits: u64,
     /// Siempre `true` cuando `verify` devuelve `Ok`: un fallo es `ChainBroken`,
     /// no un informe negativo.
@@ -272,9 +281,16 @@ pub fn verify(pager: &Pager, head: &Head) -> Result<AuditReport> {
     }
     headers.reverse(); // génesis → head
 
-    // 2. Verificar en orden, recomputando la cadena desde el eslabón cero.
+    // 2. Verificar en orden, recomputando la cadena desde el eslabón cero. Un
+    //    archivo compactado (vacuum, M9) empieza por un checkpoint que numera
+    //    desde su versión K: la cadena sigue arrancando de `genesis_chain` (el
+    //    checkpoint enlaza ahí), pero la versión esperada parte de K-1. Sin
+    //    checkpoint, K=1 y esto es el arranque de siempre desde 0.
     let mut prev_chain = genesis_chain(&pager.header().file_id);
-    let mut expected_version = 0u64;
+    let mut expected_version = match headers.first() {
+        Some((_, h)) if h.flags & COMMIT_FLAG_CHECKPOINT != 0 => h.version.saturating_sub(1),
+        _ => 0,
+    };
     for (pid, header) in &headers {
         expected_version += 1;
         if header.version != expected_version {
@@ -317,7 +333,9 @@ pub fn verify(pager: &Pager, head: &Head) -> Result<AuditReport> {
     }
     Ok(AuditReport {
         head: head.version,
-        commits: head.version,
+        // Commits realmente recorridos: == `head` en un archivo íntegro sin
+        // compactar; tras `vacuum` (M9) son los retenidos (head - K + 1).
+        commits: headers.len() as u64,
         chain_ok: true,
     })
 }

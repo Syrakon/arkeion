@@ -63,7 +63,9 @@ pub use commit::AuditReport;
 pub use crypto::Key;
 pub use error::{Error, Result};
 pub use record::Value;
-pub use tx::{AsOf, BranchInfo, MergeConflict, MergePolicy, MergeReport, Retention, VacuumReport};
+pub use tx::{
+    AsOf, BranchInfo, MergeConflict, MergePolicy, MergeReport, Retention, Revision, VacuumReport,
+};
 
 // Módulos internos: públicos solo para que los hitos se construyan incrementalmente
 // sin marcar código de fundación como muerto. NO son API estable.

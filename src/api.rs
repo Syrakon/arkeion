@@ -23,7 +23,7 @@ use crate::sql::{
     ast::{AsOfClause, Stmt},
 };
 use crate::tx::{
-    AsOf, BranchInfo, MAIN_BRANCH, MergePolicy, MergeReport, Retention, Snapshot, Store,
+    AsOf, BranchInfo, MAIN_BRANCH, MergePolicy, MergeReport, Retention, Revision, Snapshot, Store,
     VacuumReport, WriteTx,
 };
 
@@ -182,6 +182,29 @@ impl Database {
     /// ```
     pub fn verify(&self) -> Result<AuditReport> {
         self.store.verify()
+    }
+
+    /// Línea temporal de versiones confirmadas, de la más antigua a la más nueva:
+    /// el "git log" de los datos. Cada [`Revision`] es consultable con `AS OF`
+    /// (vía SQL o [`Connection::snapshot`]). Tras `vacuum` solo aparecen las
+    /// versiones retenidas.
+    ///
+    /// ```
+    /// use arkeion::{Database, Options};
+    ///
+    /// let dir = tempfile::tempdir().unwrap();
+    /// let db = Database::open(dir.path().join("t.arkeion"), Options::default()).unwrap();
+    /// let conn = db.connect().unwrap();
+    /// conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER)", &[]).unwrap();
+    /// conn.execute("INSERT INTO t (n) VALUES (1)", &[]).unwrap();
+    ///
+    /// let log = db.history().unwrap();
+    /// assert_eq!(log.len(), 2); // CREATE TABLE + INSERT
+    /// assert_eq!(log[0].version, 1);
+    /// assert_eq!(log[1].version, 2);
+    /// ```
+    pub fn history(&self) -> Result<Vec<Revision>> {
+        self.store.history()
     }
 
     /// Compacta el archivo según `retention` (M9): reescribe la base entera a un

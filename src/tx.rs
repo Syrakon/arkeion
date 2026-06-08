@@ -66,6 +66,18 @@ pub struct BranchInfo {
     pub head: u64,
 }
 
+/// Una entrada de la línea temporal de versiones: el "git log" de los datos
+/// (post-M9). Cada commit confirmado es una revisión consultable con `AS OF`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Revision {
+    /// Número de versión (monótono global).
+    pub version: u64,
+    /// Timestamp del commit (informativo; la versión es la autoridad, D12).
+    pub timestamp: SystemTime,
+    /// Versión padre en la ascendencia de datos (0 = enraizada en génesis).
+    pub parent: u64,
+}
+
 /// Política de resolución de conflictos de `merge` (M8). v1: solo abortar; las
 /// políticas `Theirs`/`Ours`/resolver llegan en v1.x.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -534,6 +546,43 @@ impl Store {
 
     pub fn version(&self) -> u64 {
         self.lock().head.version
+    }
+
+    /// Línea temporal de versiones confirmadas, de la más antigua a la más nueva
+    /// (post-M9): el "git log" de los datos. Solo las versiones **retenidas**
+    /// (vacuum compacta el resto). Cada una es consultable con `AS OF`. Lee el
+    /// índice histórico `META_HIST` del head actual.
+    pub fn history(&self) -> Result<Vec<Revision>> {
+        let (pager, head) = {
+            let st = self.lock();
+            (st.pager.clone(), st.head.clone())
+        };
+        let src = PagerSource(pager);
+        let mut out = Vec::new();
+        for item in btree::scan_from(&src, head.meta_root, &[META_HIST])? {
+            let (key, val) = item?;
+            if key.first() != Some(&META_HIST) || key.len() != 1 + 8 {
+                break; // fuera del espacio histórico
+            }
+            let version = u64::from_be_bytes(key[1..9].try_into().expect("rango fijo de 8 bytes"));
+            // hist_val = data_root(8) ‖ ts(8) ‖ parent(8).
+            let ms = u64::from_le_bytes(
+                val.get(8..16)
+                    .ok_or(Error::CorruptRecord("entrada histórica truncada"))?
+                    .try_into()
+                    .expect("rango fijo de 8 bytes"),
+            );
+            let parent = val
+                .get(16..24)
+                .map(|b| u64::from_le_bytes(b.try_into().expect("rango fijo de 8 bytes")))
+                .unwrap_or(0); // entradas pre-M8 (16 B): enraizadas en génesis
+            out.push(Revision {
+                version,
+                timestamp: ms_to_system_time(ms),
+                parent,
+            });
+        }
+        Ok(out)
     }
 
     /// Auditoría completa de la hash chain hasta el head actual (M6). Devuelve
@@ -1442,6 +1491,10 @@ fn decode_i64_le(b: &[u8]) -> i64 {
 
 fn system_time_to_ms(t: SystemTime) -> u64 {
     t.duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64
+}
+
+fn ms_to_system_time(ms: u64) -> SystemTime {
+    UNIX_EPOCH + std::time::Duration::from_millis(ms)
 }
 
 /// Lector de páginas inmutables del pager: recorre el árbol meta (índice
@@ -2419,5 +2472,37 @@ mod tests {
         assert_eq!(snap.get(b"k2").unwrap().unwrap(), b"v2");
         assert!(snap.get(b"k3").unwrap().is_none(), "v3 no debe verse");
         assert!(store.verify().unwrap().chain_ok);
+    }
+
+    /// `history()` enumera la línea temporal de versiones; tras `vacuum` solo las
+    /// retenidas.
+    #[test]
+    fn history_lists_the_version_timeline() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("h.arkeion");
+        let store = store_with_versions(&path, 4); // versiones 1..=4
+
+        let log = store.history().unwrap();
+        assert_eq!(
+            log.iter().map(|r| r.version).collect::<Vec<_>>(),
+            vec![1, 2, 3, 4]
+        );
+        // Ascendencia lineal: cada versión enraíza en la anterior.
+        assert_eq!(log[0].parent, 0);
+        assert_eq!(log[3].parent, 3);
+        // Timestamps no decrecientes.
+        assert!(log.windows(2).all(|w| w[0].timestamp <= w[1].timestamp));
+
+        // Tras vacuum, solo aparecen las versiones retenidas.
+        store.vacuum(Retention::KeepLast(2)).unwrap();
+        assert_eq!(
+            store
+                .history()
+                .unwrap()
+                .iter()
+                .map(|r| r.version)
+                .collect::<Vec<_>>(),
+            vec![3, 4]
+        );
     }
 }

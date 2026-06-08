@@ -3,6 +3,10 @@
 use crate::catalog::ColType;
 use crate::record::Value;
 
+// `Select` es bastante más grande que el resto de variantes, pero `Stmt` es un
+// AST transitorio (se parsea, se ejecuta y se descarta; nunca se almacena en
+// masa), así que la diferencia de tamaño no penaliza nada y no merece un `Box`.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq)]
 pub enum Stmt {
     CreateTable {
@@ -84,6 +88,11 @@ pub struct SelectStmt {
     pub from: TableRef,
     pub joins: Vec<Join>,
     pub where_clause: Option<Expr>,
+    /// `GROUP BY e1, e2, …`: agrupa las filas por el valor de estas expresiones
+    /// (normalmente columnas) y pliega los agregados de la proyección por grupo.
+    pub group_by: Vec<Expr>,
+    /// `HAVING`: filtro sobre los grupos ya agregados (solo con `GROUP BY`).
+    pub having: Option<Expr>,
     pub order_by: Vec<OrderBy>,
     pub limit: Option<Expr>,
     pub offset: Option<Expr>,

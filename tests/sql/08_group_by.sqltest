@@ -1,0 +1,65 @@
+-- GROUP BY / HAVING (post-M9): agrupar filas y plegar agregados por grupo.
+
+> CREATE TABLE emp (id INTEGER PRIMARY KEY, dept TEXT, salary INTEGER);
+ok
+
+> INSERT INTO emp (dept, salary) VALUES ('eng', 100), ('eng', 120), ('sales', 80), ('sales', 90), ('sales', 70), ('hr', 60);
+affected 6
+
+-- Una fila por departamento (ordenado para que el test sea determinista).
+> SELECT dept, COUNT(*), SUM(salary) FROM emp GROUP BY dept ORDER BY dept;
+eng|2|220
+hr|1|60
+sales|3|240
+
+-- MIN/MAX/AVG por grupo (AVG promociona a REAL).
+> SELECT dept, MIN(salary), MAX(salary), AVG(salary) FROM emp GROUP BY dept ORDER BY dept;
+eng|100|120|110.0
+hr|60|60|60.0
+sales|70|90|80.0
+
+-- Sin ORDER BY, los grupos salen en orden de primera aparición (eng, sales, hr).
+> SELECT dept, COUNT(*) FROM emp GROUP BY dept;
+eng|2
+sales|3
+hr|1
+
+-- HAVING filtra grupos por su agregado.
+> SELECT dept, COUNT(*) FROM emp GROUP BY dept HAVING COUNT(*) > 1 ORDER BY dept;
+eng|2
+sales|3
+
+-- HAVING sobre un agregado que no está en la proyección.
+> SELECT dept FROM emp GROUP BY dept HAVING SUM(salary) > 200 ORDER BY dept;
+eng
+sales
+
+-- WHERE filtra ANTES de agrupar; expresión sobre agregado en la proyección.
+> SELECT dept, SUM(salary) * 2 FROM emp WHERE salary >= 80 GROUP BY dept ORDER BY dept;
+eng|440
+sales|340
+
+-- LIMIT sobre la salida ya agrupada.
+> SELECT dept, COUNT(*) FROM emp GROUP BY dept ORDER BY dept LIMIT 2;
+eng|2
+hr|1
+
+-- Una columna desnuda fuera del GROUP BY es un error (SQL estándar).
+> SELECT dept, salary, COUNT(*) FROM emp GROUP BY dept;
+error GROUP BY
+
+-- '*' no se combina con GROUP BY.
+> SELECT * FROM emp GROUP BY dept;
+error GROUP BY
+
+-- GROUP BY por dos columnas.
+> CREATE TABLE sale (id INTEGER PRIMARY KEY, region TEXT, prod TEXT, qty INTEGER);
+ok
+
+> INSERT INTO sale (region, prod, qty) VALUES ('N', 'a', 1), ('N', 'a', 2), ('N', 'b', 5), ('S', 'a', 3);
+affected 4
+
+> SELECT region, prod, SUM(qty) FROM sale GROUP BY region, prod ORDER BY region, prod;
+N|a|3
+N|b|5
+S|a|3

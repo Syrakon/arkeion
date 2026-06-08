@@ -1,6 +1,6 @@
 //! Ejecutor SQL (docs/04-sql.md): planificador mínimo (full scan o *point
-//! lookup* por rowid), joins nested-loop, agregados sin GROUP BY y evaluación
-//! de expresiones con lógica trivalente.
+//! lookup* por rowid), joins nested-loop, agregados con/sin `GROUP BY` (+ `HAVING`)
+//! y evaluación de expresiones con lógica trivalente.
 //!
 //! Filosofía de tipos (human-first): comparar tipos distintos es un error,
 //! no una coerción silenciosa. Única promoción: INTEGER ↔ REAL.
@@ -490,18 +490,38 @@ pub fn run_select(src: &impl DataSource, stmt: &SelectStmt, params: &[Value]) ->
         rows = kept;
     }
 
-    // Agregados sin GROUP BY: el resultado es una única fila; ORDER BY es un
-    // no-op sobre ella y se ignora.
+    // GROUP BY: una fila por grupo (HAVING filtra grupos, ORDER BY ordena la
+    // salida). Camino propio.
+    if !stmt.group_by.is_empty() {
+        return run_grouped(stmt, &schema, rows, params);
+    }
+
+    // Agregados sin GROUP BY: el resultado es una única fila (un grupo implícito);
+    // ORDER BY es un no-op sobre ella. HAVING, si está, la filtra.
     let has_agg = stmt
         .projection
         .iter()
-        .any(|i| matches!(i, SelectItem::Expr(e) if e.has_aggregate()));
+        .any(|i| matches!(i, SelectItem::Expr(e) if e.has_aggregate()))
+        || stmt.having.as_ref().is_some_and(|h| h.has_aggregate());
     if has_agg {
         let (columns, row) = aggregate_projection(&stmt.projection, &schema, &rows, params)?;
+        if let Some(h) = &stmt.having {
+            validate_columns(h, &schema)?;
+            let folded = fold_aggregates(h, &schema, &rows, params)?;
+            if !truthy(eval_const(&folded, params)?)? {
+                return Ok(SelectOut {
+                    columns,
+                    rows: vec![],
+                });
+            }
+        }
         return Ok(SelectOut {
             columns,
             rows: limit_offset(vec![row], stmt, params)?,
         });
+    }
+    if stmt.having.is_some() {
+        return Err(sql_err("HAVING requiere GROUP BY o agregados"));
     }
 
     if !stmt.order_by.is_empty() {
@@ -662,6 +682,172 @@ fn col_outside_agg(e: &Expr) -> Option<&str> {
             col_outside_agg(expr).or_else(|| col_outside_agg(pattern))
         }
     }
+}
+
+// --- GROUP BY (post-M9) ---
+
+/// Identidad de una columna referenciada: `(tabla opcional, nombre)`.
+type ColRef = (Option<String>, String);
+
+/// Recolecta las columnas de `e`, `skip_agg=true` ignora las que estén dentro de
+/// un agregado (las que deben estar en GROUP BY son justo esas: las de fuera).
+fn collect_columns(e: &Expr, skip_agg: bool, out: &mut Vec<ColRef>) {
+    match e {
+        Expr::Column { table, name } => out.push((table.clone(), name.clone())),
+        Expr::Literal(_) | Expr::Param(_) => {}
+        Expr::Unary(_, x) => collect_columns(x, skip_agg, out),
+        Expr::IsNull { expr, .. } => collect_columns(expr, skip_agg, out),
+        Expr::Binary(a, _, b) => {
+            collect_columns(a, skip_agg, out);
+            collect_columns(b, skip_agg, out);
+        }
+        Expr::Like { expr, pattern, .. } => {
+            collect_columns(expr, skip_agg, out);
+            collect_columns(pattern, skip_agg, out);
+        }
+        Expr::Aggregate { arg, .. } => {
+            if !skip_agg && let Some(a) = arg {
+                collect_columns(a, skip_agg, out);
+            }
+        }
+    }
+}
+
+/// `GROUP BY`: agrupa por el valor de las expresiones del GROUP BY y emite una
+/// fila por grupo, plegando los agregados de la proyección sobre cada grupo. Una
+/// columna fuera de un agregado debe aparecer en el GROUP BY (SQL estándar);
+/// `HAVING` filtra grupos; `ORDER BY`/`LIMIT` actúan sobre la salida.
+fn run_grouped(
+    stmt: &SelectStmt,
+    schema: &QuerySchema,
+    rows: Vec<Vec<Value>>,
+    params: &[Value],
+) -> Result<SelectOut> {
+    // Columnas del GROUP BY (para validar que la proyección no use otras sueltas).
+    let mut group_cols: Vec<ColRef> = Vec::new();
+    for e in &stmt.group_by {
+        validate_columns(e, schema)?;
+        collect_columns(e, false, &mut group_cols);
+    }
+    let in_group = |c: &ColRef| {
+        group_cols
+            .iter()
+            .any(|g| g.1 == c.1 && (g.0.is_none() || c.0.is_none() || g.0 == c.0))
+    };
+    let check_grouped = |e: &Expr| -> Result<()> {
+        validate_columns(e, schema)?;
+        let mut cols = Vec::new();
+        collect_columns(e, true, &mut cols);
+        for c in &cols {
+            if !in_group(c) {
+                return Err(sql_err(format!(
+                    "la columna {} debe ir en GROUP BY o dentro de un agregado",
+                    c.1
+                )));
+            }
+        }
+        Ok(())
+    };
+    for item in &stmt.projection {
+        match item {
+            SelectItem::Star => return Err(sql_err("'*' no se puede combinar con GROUP BY")),
+            SelectItem::Expr(e) => check_grouped(e)?,
+        }
+    }
+    if let Some(h) = &stmt.having {
+        check_grouped(h)?;
+    }
+
+    // Particionar en grupos por el valor (serializado) de las claves de GROUP BY,
+    // preservando el orden de primera aparición.
+    let mut groups: Vec<Vec<Vec<Value>>> = Vec::new();
+    let mut index: std::collections::HashMap<Vec<u8>, usize> = std::collections::HashMap::new();
+    for row in rows {
+        let key: Vec<Value> = stmt
+            .group_by
+            .iter()
+            .map(|e| eval(e, Some((schema, &row)), params))
+            .collect::<Result<_>>()?;
+        let kbytes = crate::record::encode_values(&key);
+        match index.get(&kbytes) {
+            Some(&i) => groups[i].push(row),
+            None => {
+                index.insert(kbytes, groups.len());
+                groups.push(vec![row]);
+            }
+        }
+    }
+
+    // Nombres de columnas de salida (las columnas conservan su nombre; las demás
+    // expresiones, `colN`).
+    let columns: Vec<String> = stmt
+        .projection
+        .iter()
+        .enumerate()
+        .map(|(i, item)| match item {
+            SelectItem::Expr(Expr::Column { name, .. }) => name.clone(),
+            _ => format!("col{}", i + 1),
+        })
+        .collect();
+
+    // Una fila por grupo; HAVING filtra. La fila representante da el valor de las
+    // columnas del grupo (constantes dentro del grupo); los agregados se pliegan.
+    let mut out_rows: Vec<Vec<Value>> = Vec::new();
+    for group in &groups {
+        let rep = &group[0];
+        if let Some(h) = &stmt.having {
+            let folded = fold_aggregates(h, schema, group, params)?;
+            if !truthy(eval(&folded, Some((schema, rep)), params)?)? {
+                continue;
+            }
+        }
+        let mut out = Vec::with_capacity(columns.len());
+        for item in &stmt.projection {
+            let SelectItem::Expr(e) = item else {
+                unreachable!("'*' ya rechazado")
+            };
+            let folded = fold_aggregates(e, schema, group, params)?;
+            out.push(eval(&folded, Some((schema, rep)), params)?);
+        }
+        out_rows.push(out);
+    }
+
+    // ORDER BY sobre las columnas de SALIDA, por nombre.
+    if !stmt.order_by.is_empty() {
+        let order: Vec<(usize, bool)> = stmt
+            .order_by
+            .iter()
+            .map(|o| {
+                let idx = columns.iter().position(|c| c == &o.column).ok_or_else(|| {
+                    sql_err(format!("ORDER BY: «{}» no está en la proyección", o.column))
+                })?;
+                Ok((idx, o.desc))
+            })
+            .collect::<Result<_>>()?;
+        let mut first_err: Option<Error> = None;
+        out_rows.sort_by(|a, b| {
+            for (idx, desc) in &order {
+                match cmp_nulls_first(&a[*idx], &b[*idx]) {
+                    Ok(Ordering::Equal) => continue,
+                    Ok(o) => return if *desc { o.reverse() } else { o },
+                    Err(e) => {
+                        first_err.get_or_insert(e);
+                        return Ordering::Equal;
+                    }
+                }
+            }
+            Ordering::Equal
+        });
+        if let Some(e) = first_err {
+            return Err(e);
+        }
+    }
+
+    let out_rows = limit_offset(out_rows, stmt, params)?;
+    Ok(SelectOut {
+        columns,
+        rows: out_rows,
+    })
 }
 
 /// Sustituye cada nodo `Aggregate` por su valor calculado sobre `rows`; el

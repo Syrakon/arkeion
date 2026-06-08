@@ -318,6 +318,21 @@ impl Parser {
         } else {
             None
         };
+        let mut group_by = Vec::new();
+        if self.eat_kw(Kw::Group) {
+            self.expect_kw(Kw::By, "BY")?;
+            loop {
+                group_by.push(self.expr()?);
+                if !self.eat(&Tok::Comma) {
+                    break;
+                }
+            }
+        }
+        let having = if self.eat_kw(Kw::Having) {
+            Some(self.expr()?)
+        } else {
+            None
+        };
         let mut order_by = Vec::new();
         if self.eat_kw(Kw::Order) {
             self.expect_kw(Kw::By, "BY")?;
@@ -358,6 +373,8 @@ impl Parser {
             from,
             joins,
             where_clause,
+            group_by,
+            having,
             order_by,
             limit,
             offset,

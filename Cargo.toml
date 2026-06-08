@@ -19,6 +19,19 @@ sha2 = "0.10"
 getrandom = { version = "0.3", features = ["std"] }
 aes-gcm = "0.10"
 zeroize = "1"
+# Solo para el harness de benchmarks (M9), tras la feature `bench-sqlite`. Es
+# `optional` (las dev-dependencies no pueden serlo) y no se compila por defecto:
+# el build y los tests normales siguen con las 4 dependencias de runtime de D8.
+rusqlite = { version = "0.37", features = ["bundled"], optional = true }
 
 [dev-dependencies]
 tempfile = "3"
+
+[features]
+# Activa la comparación con SQLite en el bench: `cargo bench --features bench-sqlite`.
+bench-sqlite = ["dep:rusqlite"]
+
+# Harness CRUD hecho a mano (sin criterion, D8): mide con `std::time`.
+[[bench]]
+name = "crud"
+harness = false

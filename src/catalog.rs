@@ -357,58 +357,98 @@ fn validated_record(table: &TableDef, values: &[Value], rowid: i64) -> Result<Ve
     Ok(record)
 }
 
-/// Inserta con rowid automático o explícito (si la columna alias trae un
-/// entero). Falla con `Constraint` si el rowid explícito ya existe.
+/// Rowid explícito de `values` (si la columna alias trae un entero), validando
+/// el tipo. `None` ⇒ rowid automático.
+pub(crate) fn explicit_rowid(table: &TableDef, values: &[Value]) -> Result<Option<i64>> {
+    match table.rowid_alias {
+        Some(i) => match values.get(i) {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::Integer(n)) => Ok(Some(*n)),
+            Some(_) => Err(Error::Constraint("la PRIMARY KEY debe ser un entero")),
+        },
+        None => Ok(None),
+    }
+}
+
+/// Próximo rowid del contador de la tabla (1 si aún no existe).
+pub(crate) fn read_counter<S: NodeSource>(src: &S, root: PageId, table_id: u32) -> Result<i64> {
+    match btree::get(src, root, &counter_key(table_id))? {
+        Some(v) => Ok(i64::from_le_bytes(
+            v.as_slice()
+                .try_into()
+                .map_err(|_| Error::CorruptRecord("contador de rowid"))?,
+        )),
+        None => Ok(1),
+    }
+}
+
+/// Resuelve `(rowid, próximo_contador)` a partir del explícito y el contador
+/// actual. Dup-check del rowid explícito: `Constraint` si la fila ya existe.
+pub(crate) fn resolve_rowid<S: NodeSource>(
+    src: &S,
+    root: PageId,
+    table_id: u32,
+    explicit: Option<i64>,
+    next: i64,
+) -> Result<(i64, i64)> {
+    match explicit {
+        None => Ok((
+            next,
+            next.checked_add(1)
+                .ok_or(Error::Constraint("rowids agotados"))?,
+        )),
+        Some(n) => {
+            if btree::contains(src, root, &row_key(table_id, n))? {
+                return Err(Error::Constraint("rowid duplicado"));
+            }
+            Ok((n, if n >= next { n.saturating_add(1) } else { next }))
+        }
+    }
+}
+
+/// Escribe el contador de rowid de una tabla.
+pub(crate) fn write_counter<S: NodeStore>(
+    s: &mut S,
+    root: PageId,
+    table_id: u32,
+    next: i64,
+) -> Result<PageId> {
+    btree::insert(s, root, &counter_key(table_id), &next.to_le_bytes())
+}
+
+/// Inserta una fila con su rowid **ya resuelto**, sin tocar el contador: valida
+/// el registro y escribe su clave. La capa de transacción usa esto + el contador
+/// cacheado para no reescribir la hoja del contador en cada fila.
+pub(crate) fn put_row<S: NodeStore>(
+    s: &mut S,
+    root: PageId,
+    table: &TableDef,
+    rowid: i64,
+    values: &[Value],
+) -> Result<PageId> {
+    let record = validated_record(table, values, rowid)?;
+    btree::insert(
+        s,
+        root,
+        &row_key(table.table_id, rowid),
+        &record::encode_values(&record),
+    )
+}
+
+/// Inserta con rowid automático o explícito, contador incluido (camino directo
+/// para llamadores sin caché de contador: tests y usos puntuales). Falla con
+/// `Constraint` si el rowid explícito ya existe.
 pub fn insert_row<S: NodeStore>(
     s: &mut S,
     root: PageId,
     table: &TableDef,
     values: &[Value],
 ) -> Result<(PageId, i64)> {
-    let explicit = match table.rowid_alias {
-        Some(i) => match values.get(i) {
-            None | Some(Value::Null) => None,
-            Some(Value::Integer(n)) => Some(*n),
-            Some(_) => return Err(Error::Constraint("la PRIMARY KEY debe ser un entero")),
-        },
-        None => None,
-    };
-
-    let next = match btree::get(s, root, &counter_key(table.table_id))? {
-        Some(v) => i64::from_le_bytes(
-            v.as_slice()
-                .try_into()
-                .map_err(|_| Error::CorruptRecord("contador de rowid"))?,
-        ),
-        None => 1,
-    };
-    let (rowid, new_next) = match explicit {
-        None => (
-            next,
-            next.checked_add(1)
-                .ok_or(Error::Constraint("rowids agotados"))?,
-        ),
-        Some(n) => {
-            if btree::contains(s, root, &row_key(table.table_id, n))? {
-                return Err(Error::Constraint("rowid duplicado"));
-            }
-            (n, if n >= next { n.saturating_add(1) } else { next })
-        }
-    };
-
-    let record = validated_record(table, values, rowid)?;
-    let mut root = btree::insert(
-        s,
-        root,
-        &counter_key(table.table_id),
-        &new_next.to_le_bytes(),
-    )?;
-    root = btree::insert(
-        s,
-        root,
-        &row_key(table.table_id, rowid),
-        &record::encode_values(&record),
-    )?;
+    let explicit = explicit_rowid(table, values)?;
+    let next = read_counter(s, root, table.table_id)?;
+    let (rowid, new_next) = resolve_rowid(s, root, table.table_id, explicit, next)?;
+    let root = write_counter(s, root, table.table_id, new_next)?;
+    let root = put_row(s, root, table, rowid, values)?;
     Ok((root, rowid))
 }
 

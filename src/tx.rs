@@ -261,6 +261,7 @@ impl Store {
             data_root: bh.data_root,
             meta_root: global.meta_root,
             base: global,
+            rowid_cache: HashMap::new(),
         })
     }
 
@@ -1123,6 +1124,11 @@ pub struct WriteTx {
     data_root: PageId,
     meta_root: PageId,
     ts: TxStore,
+    /// Contadores de rowid pendientes por `table_id` (M9-perf): se leen del árbol
+    /// la primera vez, se incrementan en memoria y se vuelcan **una vez** en el
+    /// commit. Evita reescribir la hoja del contador en cada `insert_row`. El
+    /// resultado en disco es idéntico (solo persiste el valor final).
+    rowid_cache: HashMap<u32, i64>,
 }
 
 impl Drop for WriteTx {
@@ -1163,6 +1169,11 @@ impl WriteTx {
     }
 
     pub fn drop_table(&mut self, name: &str) -> Result<bool> {
+        // Si la tabla tenía un contador en vuelo, descártalo: el commit no debe
+        // recrearlo tras borrarla.
+        if let Some(def) = catalog::get_table(&self.ts, self.data_root, name)? {
+            self.rowid_cache.remove(&def.table_id);
+        }
         let (root, dropped) = catalog::drop_table(&mut self.ts, self.data_root, name)?;
         self.data_root = root;
         Ok(dropped)
@@ -1173,9 +1184,20 @@ impl WriteTx {
     }
 
     /// Inserta y devuelve el rowid (automático o explícito vía columna alias).
+    /// El contador de rowid se cachea en la tx y se vuelca en el commit, así que
+    /// solo se escribe la hoja de la fila (no la del contador) por inserción.
     pub fn insert_row(&mut self, table: &TableDef, values: &[Value]) -> Result<i64> {
-        let (root, rowid) = catalog::insert_row(&mut self.ts, self.data_root, table, values)?;
-        self.data_root = root;
+        let explicit = catalog::explicit_rowid(table, values)?;
+        let next = match self.rowid_cache.get(&table.table_id) {
+            Some(&c) => c,
+            None => catalog::read_counter(&self.ts, self.data_root, table.table_id)?,
+        };
+        let (rowid, new_next) =
+            catalog::resolve_rowid(&self.ts, self.data_root, table.table_id, explicit, next)?;
+        // Solo se persiste tras escribir la fila: un insert fallido no deja
+        // contador a medias en la caché.
+        self.data_root = catalog::put_row(&mut self.ts, self.data_root, table, rowid, values)?;
+        self.rowid_cache.insert(table.table_id, new_next);
         Ok(rowid)
     }
 
@@ -1206,6 +1228,12 @@ impl WriteTx {
     pub fn commit(mut self) -> Result<u64> {
         if self.ts.dirty.is_empty() && self.data_root == self.base.data_root {
             return Ok(self.parent_version);
+        }
+        // Volcar los contadores de rowid cacheados al árbol (una sola escritura
+        // por tabla tocada, en vez de una por fila).
+        let counters: Vec<(u32, i64)> = self.rowid_cache.iter().map(|(&k, &v)| (k, v)).collect();
+        for (table_id, next) in counters {
+            self.data_root = catalog::write_counter(&mut self.ts, self.data_root, table_id, next)?;
         }
         let version = self.base.version + 1;
         let timestamp_ms = now_ms();
@@ -2254,5 +2282,74 @@ mod tests {
             !temp.exists(),
             "el temporal huérfano debería haberse borrado"
         );
+    }
+
+    /// El contador de rowid se cachea y se vuelca en el commit (M9-perf), pero el
+    /// comportamiento observable es idéntico al de escribirlo por fila: secuencia
+    /// dentro de la tx, persistencia entre commits y reabriendo, y reset en
+    /// rollback.
+    #[test]
+    fn deferred_rowid_counter_is_observably_unchanged() {
+        use crate::catalog::{ColType, ColumnSpec};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("r.arkeion");
+        let store = Store::create(&path).unwrap();
+        let spec = TableSpec {
+            name: "t".into(),
+            columns: vec![
+                ColumnSpec {
+                    name: "id".into(),
+                    col_type: ColType::Integer,
+                    not_null: false,
+                    primary_key: true,
+                    default: None,
+                },
+                ColumnSpec {
+                    name: "n".into(),
+                    col_type: ColType::Integer,
+                    not_null: true,
+                    primary_key: false,
+                    default: None,
+                },
+            ],
+        };
+        let def = {
+            let mut tx = store.begin().unwrap();
+            let d = tx.create_table(&spec).unwrap();
+            tx.commit().unwrap();
+            d
+        };
+        let auto = |n: i64| [Value::Null, Value::Integer(n)];
+
+        // Secuencia dentro de una sola tx: 1,2,3.
+        let mut tx = store.begin().unwrap();
+        for (i, want) in (10..40).step_by(10).zip(1..=3) {
+            assert_eq!(tx.insert_row(&def, &auto(i)).unwrap(), want);
+        }
+        tx.commit().unwrap();
+
+        // Continúa entre commits (no reinicia): 4.
+        let mut tx = store.begin().unwrap();
+        assert_eq!(tx.insert_row(&def, &auto(40)).unwrap(), 4);
+        tx.commit().unwrap();
+
+        // Rollback: la tx avanza el contador en memoria y se suelta sin commit.
+        {
+            let mut tx = store.begin().unwrap();
+            assert_eq!(tx.insert_row(&def, &auto(50)).unwrap(), 5);
+            // soltar sin commit = rollback
+        }
+        // El contador durable no avanzó: el siguiente reusa el 5.
+        let mut tx = store.begin().unwrap();
+        assert_eq!(tx.insert_row(&def, &auto(55)).unwrap(), 5);
+        tx.commit().unwrap();
+
+        // El contador persistió en disco: tras reabrir, el siguiente es 6.
+        drop(store);
+        let store = Store::open(&path).unwrap();
+        let mut tx = store.begin().unwrap();
+        assert_eq!(tx.insert_row(&def, &auto(60)).unwrap(), 6);
+        tx.commit().unwrap();
+        assert!(store.verify().unwrap().chain_ok);
     }
 }

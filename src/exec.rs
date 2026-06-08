@@ -234,6 +234,33 @@ pub fn run_execute(tx: &mut WriteTx, stmt: &Stmt, params: &[Value]) -> Result<us
     }
 }
 
+/// Filas candidatas a un UPDATE/DELETE. Si el `WHERE` es exactamente
+/// `alias_rowid = const`, va por el **point lookup** (`get_row`, O(log n)) — la
+/// misma optimización que `run_select`; si no, full scan. Sin esto, tocar una
+/// sola fila por PK recorría toda la tabla (O(filas)).
+fn candidate_rows(
+    tx: &WriteTx,
+    def: &TableDef,
+    schema: &QuerySchema,
+    where_clause: Option<&Expr>,
+    params: &[Value],
+) -> Result<Vec<(i64, Vec<Value>)>> {
+    if let Some(key_expr) = point_lookup_key(schema, where_clause)
+        && let Value::Integer(rowid) = eval_const(key_expr, params)?
+    {
+        return Ok(tx
+            .get_row(def, rowid)?
+            .map(|row| (rowid, row))
+            .into_iter()
+            .collect());
+    }
+    let mut all = Vec::new();
+    for item in tx.scan_table(def)? {
+        all.push(item?);
+    }
+    Ok(all)
+}
+
 fn run_update(
     tx: &mut WriteTx,
     table: &str,
@@ -265,10 +292,10 @@ fn run_update(
         validate_columns(cond, &schema)?;
     }
 
-    // Materializar primero: el scan toma prestada la tx.
+    // Materializar primero (point lookup por PK o full scan): el scan toma
+    // prestada la tx, que luego necesitamos en exclusiva para escribir.
     let mut updates: Vec<(i64, Vec<Value>)> = Vec::new();
-    for item in tx.scan_table(&def)? {
-        let (rowid, row) = item?;
+    for (rowid, row) in candidate_rows(tx, &def, &schema, where_clause, params)? {
         if let Some(cond) = where_clause
             && !truthy(eval(cond, Some((&schema, &row)), params)?)?
         {
@@ -303,8 +330,7 @@ fn run_delete(
         validate_columns(cond, &schema)?;
     }
     let mut doomed = Vec::new();
-    for item in tx.scan_table(&def)? {
-        let (rowid, row) = item?;
+    for (rowid, row) in candidate_rows(tx, &def, &schema, where_clause, params)? {
         if let Some(cond) = where_clause
             && !truthy(eval(cond, Some((&schema, &row)), params)?)?
         {

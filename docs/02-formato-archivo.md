@@ -178,10 +178,19 @@ reescribir filas).
 Escritura (escritor único):
 
 ```
-1. páginas nuevas (CoW) → append            2. fdatasync
-3. página de commit → append                4. fdatasync     ← punto de durabilidad
-5. meta slot alternado → write in-place         (lazy; fsync periódico)
+1. páginas nuevas (CoW) → append
+2. página de commit → append
+3. fdatasync                                    ← punto de durabilidad (uno solo)
+4. meta slot alternado → write in-place         (lazy; sin fsync, es una pista)
 ```
+
+**Un solo fsync** (M9-perf): no hace falta una barrera entre las páginas de datos
+y la de commit. El tag de integridad por página vuelve **ilegible** cualquier
+página escrita a medias o no escrita, y la recuperación escanea en orden y para
+en la primera ilegible; como las páginas de datos van antes que la de commit, un
+commit a medio escribir nunca se adopta. Solo se adopta uno cuyas páginas son
+todas legibles (el fsync llegó a completar). Duplica el ritmo de escrituras
+durables (≈2.7× vs SQLite rollback-journal, a la par con WAL).
 
 Apertura / recuperación:
 

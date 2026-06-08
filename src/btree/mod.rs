@@ -66,23 +66,48 @@ pub fn get<S: NodeSource>(src: &S, root: PageId, key: &[u8]) -> Result<Option<Ve
         let body = src.body(id)?;
         match node::node_type(body.bytes()) {
             node::TYPE_INNER => {
-                let (cells, rightmost) = node::parse_inner(id.0, body.bytes())?;
-                let idx = cells.partition_point(|c| c.key.as_slice() <= key);
-                let child = if idx < cells.len() {
-                    cells[idx].child
-                } else {
-                    rightmost
-                };
+                let child = node::inner_child(id.0, body.bytes(), key)?;
                 drop(body);
                 id = child;
             }
             node::TYPE_LEAF => {
-                let cells = node::parse_leaf(id.0, body.bytes())?;
+                let found = node::leaf_find(id.0, body.bytes(), key)?;
                 drop(body);
-                let Ok(idx) = cells.binary_search_by(|c| c.key.as_slice().cmp(key)) else {
-                    return Ok(None);
+                return match found {
+                    // Inline ya copió el valor en `leaf_find`: no lo re-clones.
+                    Some(Payload::Inline(v)) => Ok(Some(v)),
+                    Some(payload) => Ok(Some(read_value(src, &payload)?)),
+                    None => Ok(None),
                 };
-                return Ok(Some(read_value(src, &cells[idx].payload)?));
+            }
+            _ => {
+                return Err(Error::Corrupt {
+                    page: id.0,
+                    reason: "tipo de nodo inesperado",
+                });
+            }
+        }
+    }
+}
+
+/// `true` si la clave existe, sin materializar su valor (dup-checks baratos).
+pub fn contains<S: NodeSource>(src: &S, root: PageId, key: &[u8]) -> Result<bool> {
+    if root == NO_ROOT {
+        return Ok(false);
+    }
+    let mut id = root;
+    loop {
+        let body = src.body(id)?;
+        match node::node_type(body.bytes()) {
+            node::TYPE_INNER => {
+                let child = node::inner_child(id.0, body.bytes(), key)?;
+                drop(body);
+                id = child;
+            }
+            node::TYPE_LEAF => {
+                let found = node::leaf_contains(id.0, body.bytes(), key)?;
+                drop(body);
+                return Ok(found);
             }
             _ => {
                 return Err(Error::Corrupt {
@@ -210,16 +235,24 @@ fn insert_rec<S: NodeStore>(
             })
         }
         node::TYPE_INNER => {
+            // Descenso sin materializar el nodo (camino caliente).
+            let child = node::inner_child(id.0, body.bytes(), key)?;
+            drop(body);
+            let out = insert_rec(s, child, key, payload)?;
+
+            // Atajo CoW: si el hijo no cambió de id (ya estaba sucio en esta tx)
+            // y no hubo split, este nodo interno —forzosamente ya sucio, pues un
+            // padre limpio solo apunta a hijos limpios— sigue siendo válido tal
+            // cual. Evita re-parsear y re-encodar todo el camino en cada insert.
+            if out.split.is_none() && out.id == child {
+                return Ok(InsertOutcome { id, split: None });
+            }
+
+            // Algo cambió: ahora sí materializar para mutar y re-encodar.
+            let body = s.body(id)?;
             let (mut cells, mut rightmost) = node::parse_inner(id.0, body.bytes())?;
             drop(body);
             let idx = cells.partition_point(|c| c.key.as_slice() <= key);
-            let child = if idx < cells.len() {
-                cells[idx].child
-            } else {
-                rightmost
-            };
-            let out = insert_rec(s, child, key, payload)?;
-
             if idx < cells.len() {
                 cells[idx].child = out.id;
             } else {
@@ -298,16 +331,19 @@ fn delete_rec<S: NodeStore>(s: &mut S, id: PageId, key: &[u8]) -> Result<(Option
             Ok((Some(id), true))
         }
         node::TYPE_INNER => {
+            let child = node::inner_child(id.0, body.bytes(), key)?;
+            drop(body);
+            let (new_child, existed) = delete_rec(s, child, key)?;
+
+            // Atajo CoW (igual que en insert): hijo intacto ⇒ nada que reescribir.
+            if new_child == Some(child) {
+                return Ok((Some(id), existed));
+            }
+
+            let body = s.body(id)?;
             let (mut cells, mut rightmost) = node::parse_inner(id.0, body.bytes())?;
             drop(body);
             let idx = cells.partition_point(|c| c.key.as_slice() <= key);
-            let child = if idx < cells.len() {
-                cells[idx].child
-            } else {
-                rightmost
-            };
-            let (new_child, existed) = delete_rec(s, child, key)?;
-
             match new_child {
                 Some(nc) => {
                     if idx < cells.len() {

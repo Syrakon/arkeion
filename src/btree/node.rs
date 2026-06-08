@@ -199,6 +199,96 @@ pub fn encode_inner(cells: &[InnerCell], rightmost: PageId, body: &mut [u8]) -> 
     true
 }
 
+// --- búsqueda in-page sin materializar celdas (camino caliente) ---
+//
+// El formato es idéntico al de `parse_*`; estas funciones recorren las celdas
+// serializadas comparando claves **sin asignar** un `Vec` por celda. Es la
+// ganancia del camino de lectura (`get`/`contains`) y del descenso de escritura.
+// Los chequeos de orden de `parse_*` (defensa en profundidad) los cubre aquí el
+// tag de integridad de la página: un body con tag válido es exactamente el que
+// se escribió, con claves ordenadas por construcción.
+
+/// Hijo a seguir en un nodo interno para `key`. Equivale a
+/// `parse_inner(..).partition_point(c.key <= key) → child|rightmost`.
+pub fn inner_child(page: u64, body: &[u8], key: &[u8]) -> Result<PageId> {
+    if body[0] != TYPE_INNER {
+        return Err(corrupt(page, "se esperaba un nodo interno"));
+    }
+    let ncells = u16::from_le_bytes([body[2], body[3]]) as usize;
+    let rightmost = PageId(u64::from_le_bytes(
+        body[4..12].try_into().expect("rango fijo de 8 bytes"),
+    ));
+    let mut pos = INNER_HDR;
+    for _ in 0..ncells {
+        let klen = get_varint(page, body, &mut pos)? as usize;
+        let ckey = get_slice(page, body, &mut pos, klen)?;
+        let child = PageId(get_u64(page, body, &mut pos)?);
+        // Primer separador con clave > `key` (cota superior exclusiva): su hijo
+        // cubre `key`. Si ninguno, va al rightmost.
+        if ckey > key {
+            return Ok(child);
+        }
+    }
+    Ok(rightmost)
+}
+
+/// `Some((pos_payload, flags))` con `pos` al inicio del payload de la celda de
+/// `key`, o `None` si no está. Escanea sin asignar.
+fn leaf_seek(page: u64, body: &[u8], key: &[u8]) -> Result<Option<(usize, u8)>> {
+    if body[0] != TYPE_LEAF {
+        return Err(corrupt(page, "se esperaba una hoja"));
+    }
+    let ncells = u16::from_le_bytes([body[2], body[3]]) as usize;
+    let mut pos = LEAF_HDR;
+    for _ in 0..ncells {
+        let flags = *body.get(pos).ok_or(corrupt(page, "celda truncada"))?;
+        pos += 1;
+        let klen = get_varint(page, body, &mut pos)? as usize;
+        let ckey = get_slice(page, body, &mut pos, klen)?;
+        match ckey.cmp(key) {
+            std::cmp::Ordering::Equal => return Ok(Some((pos, flags))),
+            std::cmp::Ordering::Greater => return Ok(None), // ordenadas: ya pasamos el punto
+            std::cmp::Ordering::Less => skip_leaf_payload(page, body, &mut pos, flags)?,
+        }
+    }
+    Ok(None)
+}
+
+fn skip_leaf_payload(page: u64, body: &[u8], pos: &mut usize, flags: u8) -> Result<()> {
+    if flags & CELL_OVERFLOW_FLAG != 0 {
+        let _ = get_varint(page, body, pos)?; // total_len
+        let _ = get_u64(page, body, pos)?; // first
+    } else {
+        let vlen = get_varint(page, body, pos)? as usize;
+        let _ = get_slice(page, body, pos, vlen)?;
+    }
+    Ok(())
+}
+
+fn read_leaf_payload(page: u64, body: &[u8], pos: &mut usize, flags: u8) -> Result<Payload> {
+    if flags & CELL_OVERFLOW_FLAG != 0 {
+        let total_len = get_varint(page, body, pos)?;
+        let first = PageId(get_u64(page, body, pos)?);
+        Ok(Payload::Overflow { total_len, first })
+    } else {
+        let vlen = get_varint(page, body, pos)? as usize;
+        Ok(Payload::Inline(get_slice(page, body, pos, vlen)?.to_vec()))
+    }
+}
+
+/// Payload de `key` en una hoja, sin materializar las demás celdas.
+pub fn leaf_find(page: u64, body: &[u8], key: &[u8]) -> Result<Option<Payload>> {
+    match leaf_seek(page, body, key)? {
+        Some((mut pos, flags)) => Ok(Some(read_leaf_payload(page, body, &mut pos, flags)?)),
+        None => Ok(None),
+    }
+}
+
+/// Existencia de `key` en una hoja, sin copiar el valor (para dup-checks).
+pub fn leaf_contains(page: u64, body: &[u8], key: &[u8]) -> Result<bool> {
+    Ok(leaf_seek(page, body, key)?.is_some())
+}
+
 // --- overflow ---
 
 pub fn encode_overflow(chunk: &[u8], next: PageId, body: &mut [u8]) {
@@ -299,6 +389,100 @@ mod tests {
         let (parsed, rightmost) = parse_inner(0, &body).unwrap();
         assert_eq!(parsed, cells);
         assert_eq!(rightmost, PageId(11));
+    }
+
+    /// La búsqueda in-page del descenso debe coincidir con `parse_inner` +
+    /// `partition_point` para **toda** clave (el camino caliente no puede
+    /// divergir del de referencia).
+    #[test]
+    fn inner_child_matches_parse_inner() {
+        let cells: Vec<InnerCell> = ["d", "h", "m", "s"]
+            .iter()
+            .enumerate()
+            .map(|(i, k)| InnerCell {
+                key: k.as_bytes().to_vec(),
+                child: PageId(10 + i as u64),
+            })
+            .collect();
+        let mut body = vec![0u8; BODY_SIZE];
+        assert!(encode_inner(&cells, PageId(99), &mut body));
+
+        for probe in [
+            &b""[..],
+            b"a",
+            b"d",
+            b"dd",
+            b"h",
+            b"m",
+            b"mz",
+            b"s",
+            b"sz",
+            b"zzz",
+        ] {
+            let (parsed, rightmost) = parse_inner(0, &body).unwrap();
+            let idx = parsed.partition_point(|c| c.key.as_slice() <= probe);
+            let expected = if idx < parsed.len() {
+                parsed[idx].child
+            } else {
+                rightmost
+            };
+            assert_eq!(
+                inner_child(0, &body, probe).unwrap(),
+                expected,
+                "descenso diverge para {probe:?}"
+            );
+        }
+    }
+
+    /// `leaf_find`/`leaf_contains` deben coincidir con `parse_leaf` +
+    /// `binary_search` para claves presentes y ausentes, con payload inline y
+    /// overflow.
+    #[test]
+    fn leaf_find_matches_parse_leaf() {
+        let cells = vec![
+            cell(b"alfa", b"1"),
+            cell(b"beta", b""),
+            LeafCell {
+                key: b"gamma".to_vec(),
+                payload: Payload::Overflow {
+                    total_len: 5000,
+                    first: PageId(77),
+                },
+            },
+            cell(b"delta", b"4444"),
+        ];
+        // Las celdas deben ir ordenadas por clave al codificar.
+        let mut sorted = cells.clone();
+        sorted.sort_by(|a, b| a.key.cmp(&b.key));
+        let mut body = vec![0u8; BODY_SIZE];
+        assert!(encode_leaf(&sorted, &mut body));
+
+        for probe in [
+            &b"aa"[..],
+            b"alfa",
+            b"beta",
+            b"betaa",
+            b"delta",
+            b"gamma",
+            b"gammaz",
+            b"zzz",
+        ] {
+            let parsed = parse_leaf(0, &body).unwrap();
+            let expected = parsed
+                .binary_search_by(|c| c.key.as_slice().cmp(probe))
+                .ok()
+                .map(|i| parsed[i].payload.clone());
+            assert_eq!(
+                leaf_find(0, &body, probe).unwrap(),
+                expected,
+                "leaf_find diverge para {probe:?}"
+            );
+            assert_eq!(
+                leaf_contains(0, &body, probe).unwrap(),
+                expected.is_some(),
+                "leaf_contains diverge para {probe:?}"
+            );
+        }
     }
 
     #[test]

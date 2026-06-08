@@ -389,7 +389,7 @@ pub fn insert_row<S: NodeStore>(
                 .ok_or(Error::Constraint("rowids agotados"))?,
         ),
         Some(n) => {
-            if btree::get(s, root, &row_key(table.table_id, n))?.is_some() {
+            if btree::contains(s, root, &row_key(table.table_id, n))? {
                 return Err(Error::Constraint("rowid duplicado"));
             }
             (n, if n >= next { n.saturating_add(1) } else { next })

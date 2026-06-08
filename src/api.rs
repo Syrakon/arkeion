@@ -284,6 +284,22 @@ fn sql_err(msg: impl Into<String>) -> Error {
     }
 }
 
+/// Construye el vector posicional para una sentencia con parámetros nombrados,
+/// a partir del binding `(:nombre, valor)`. El nombre del binding puede llevar
+/// los dos puntos o no. Falla si falta el valor de algún parámetro de la query.
+fn bind_named(names: &[String], bindings: &[(&str, Value)]) -> Result<Vec<Value>> {
+    names
+        .iter()
+        .map(|name| {
+            bindings
+                .iter()
+                .find(|(k, _)| k.trim_start_matches(':') == name)
+                .map(|(_, v)| v.clone())
+                .ok_or_else(|| sql_err(format!("falta el parámetro :{name}")))
+        })
+        .collect()
+}
+
 /// Traduce el `AS OF` ya parseado de un SELECT al punto temporal del almacén.
 fn clause_to_asof(clause: &AsOfClause) -> AsOf {
     match *clause {
@@ -366,11 +382,40 @@ impl Connection {
         }
     }
 
+    /// Como [`execute`](Connection::execute) pero con parámetros **nombrados**
+    /// (`:nombre`), enlazados por nombre (los dos puntos del binding son
+    /// opcionales). Cómodo con muchos parámetros o cuando se repite el mismo.
+    ///
+    /// ```
+    /// use arkeion::{Database, Options, named_params};
+    ///
+    /// let dir = tempfile::tempdir().unwrap();
+    /// let db = Database::open(dir.path().join("t.arkeion"), Options::default()).unwrap();
+    /// let conn = db.connect().unwrap();
+    /// conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER)", &[]).unwrap();
+    /// conn.execute_named(
+    ///     "INSERT INTO t (a, b) VALUES (:x, :x)",  // el mismo parámetro repetido
+    ///     &named_params! { ":x" => 7 },
+    /// ).unwrap();
+    /// let n = conn.query("SELECT a FROM t WHERE a = b", &[]).unwrap().count();
+    /// assert_eq!(n, 1);
+    /// ```
+    pub fn execute_named(&self, sql: &str, params: &[(&str, Value)]) -> Result<usize> {
+        let (stmt, names) = sql::parse_full(sql)?;
+        self.execute_stmt(&stmt, &bind_named(&names, params)?)
+    }
+
     /// Consultas. Devuelve las filas materializadas del snapshot actual; con
     /// una transacción abierta (`BEGIN`), de la transacción (que ve sus
     /// propias escrituras).
     pub fn query(&self, sql: &str, params: &[Value]) -> Result<Rows> {
         self.query_stmt(&sql::parse(sql)?, params)
+    }
+
+    /// Como [`query`](Connection::query) pero con parámetros **nombrados**.
+    pub fn query_named(&self, sql: &str, params: &[(&str, Value)]) -> Result<Rows> {
+        let (stmt, names) = sql::parse_full(sql)?;
+        self.query_stmt(&stmt, &bind_named(&names, params)?)
     }
 
     fn query_stmt(&self, stmt: &Stmt, params: &[Value]) -> Result<Rows> {
@@ -405,9 +450,11 @@ impl Connection {
     /// Sentencia preparada: se parsea una vez y se ejecuta cuantas veces
     /// haga falta, con parámetros distintos.
     pub fn prepare(&self, sql: &str) -> Result<Statement<'_>> {
+        let (stmt, param_names) = sql::parse_full(sql)?;
         Ok(Statement {
             conn: self,
-            stmt: sql::parse(sql)?,
+            stmt,
+            param_names,
         })
     }
 
@@ -482,6 +529,9 @@ impl Connection {
 pub struct Statement<'conn> {
     conn: &'conn Connection,
     stmt: Stmt,
+    /// Nombres de los parámetros `:nombre` (índice → nombre); vacío si la
+    /// sentencia usa parámetros posicionales `?N`.
+    param_names: Vec<String>,
 }
 
 impl Statement<'_> {
@@ -493,6 +543,18 @@ impl Statement<'_> {
     /// Como [`Connection::query`], sin reparsear el SQL.
     pub fn query(&self, params: &[Value]) -> Result<Rows> {
         self.conn.query_stmt(&self.stmt, params)
+    }
+
+    /// Como [`execute`](Statement::execute) con parámetros **nombrados**.
+    pub fn execute_named(&self, params: &[(&str, Value)]) -> Result<usize> {
+        self.conn
+            .execute_stmt(&self.stmt, &bind_named(&self.param_names, params)?)
+    }
+
+    /// Como [`query`](Statement::query) con parámetros **nombrados**.
+    pub fn query_named(&self, params: &[(&str, Value)]) -> Result<Rows> {
+        self.conn
+            .query_stmt(&self.stmt, &bind_named(&self.param_names, params)?)
     }
 }
 
@@ -752,6 +814,14 @@ impl<T: Into<Value>> From<Option<T>> for Value {
 macro_rules! params {
     () => { [] as [$crate::Value; 0] };
     ($($v:expr),+ $(,)?) => { [$($crate::Value::from($v)),+] };
+}
+
+/// Parámetros nombrados: `&named_params!{ ":id" => 1, ":n" => "x" }` ⇒
+/// `&[(&str, Value)]`. Los dos puntos del nombre son opcionales.
+#[macro_export]
+macro_rules! named_params {
+    () => { [] as [(&str, $crate::Value); 0] };
+    ($($k:expr => $v:expr),+ $(,)?) => { [$(($k, $crate::Value::from($v))),+] };
 }
 
 #[cfg(test)]

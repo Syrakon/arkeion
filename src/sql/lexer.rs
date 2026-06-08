@@ -13,6 +13,9 @@ pub enum Tok {
     Blob(Vec<u8>),
     /// Parámetro posicional `?N` (1-based).
     Param(usize),
+    /// Parámetro nombrado `:nombre` (sin los dos puntos). El parser le asigna un
+    /// índice posicional por orden de aparición (reusando los repetidos).
+    NamedParam(String),
     Eq,
     Ne,
     Lt,
@@ -239,6 +242,23 @@ pub fn lex(sql: &str) -> Result<Vec<Spanned>> {
                     tok: Tok::Param(n),
                     pos: start,
                 });
+            }
+            b':' => {
+                i += 1;
+                let s = i;
+                if i < bytes.len() && (bytes[i].is_ascii_alphabetic() || bytes[i] == b'_') {
+                    i += 1;
+                    while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_')
+                    {
+                        i += 1;
+                    }
+                    out.push(Spanned {
+                        tok: Tok::NamedParam(sql[s..i].to_owned()),
+                        pos: start,
+                    });
+                } else {
+                    return Err(err(start, "parámetro nombrado sin nombre: usa :nombre"));
+                }
             }
             b'\'' => {
                 let (s, next) = lex_string(sql, start)?;

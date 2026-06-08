@@ -16,19 +16,30 @@ use crate::sql::ast::*;
 use crate::sql::datetime;
 use crate::sql::lexer::{Kw, Spanned, Tok, lex};
 
+const MIX_PARAMS: &str = "no se pueden mezclar parámetros posicionales (?N) y nombrados (:nombre)";
+
 pub fn parse(sql: &str) -> Result<Stmt> {
+    Ok(parse_full(sql)?.0)
+}
+
+/// Como [`parse`] pero devuelve además los nombres de los parámetros `:nombre`
+/// (índice → nombre); vacío con parámetros posicionales. Lo usa el binding por
+/// nombre de la API para construir el vector posicional.
+pub fn parse_full(sql: &str) -> Result<(Stmt, Vec<String>)> {
     let toks = lex(sql)?;
     let mut p = Parser {
         toks,
         i: 0,
         end: sql.len(),
+        param_names: Vec::new(),
+        positional_seen: false,
     };
     let stmt = p.statement()?;
     p.eat(&Tok::Semi);
     if let Some(s) = p.peek_spanned() {
         return Err(err_at(s.pos, "se esperaba el final de la sentencia"));
     }
-    Ok(stmt)
+    Ok((stmt, p.param_names))
 }
 
 fn err_at(pos: usize, msg: impl Into<String>) -> Error {
@@ -42,6 +53,11 @@ struct Parser {
     toks: Vec<Spanned>,
     i: usize,
     end: usize,
+    /// Nombres de los parámetros `:nombre` por orden de aparición (índice → nombre,
+    /// reusado para repetidos). Vacío con parámetros posicionales `?N`.
+    param_names: Vec<String>,
+    /// `true` si se ha visto algún `?N`: no se mezcla con `:nombre`.
+    positional_seen: bool,
 }
 
 impl Parser {
@@ -576,7 +592,26 @@ impl Parser {
             Some(Tok::Kw(Kw::Null)) => Ok(Expr::Literal(Value::Null)),
             Some(Tok::Kw(Kw::True)) => Ok(Expr::Literal(Value::Bool(true))),
             Some(Tok::Kw(Kw::False)) => Ok(Expr::Literal(Value::Bool(false))),
-            Some(Tok::Param(n)) => Ok(Expr::Param(n)),
+            Some(Tok::Param(n)) => {
+                if !self.param_names.is_empty() {
+                    return Err(err_at(pos, MIX_PARAMS));
+                }
+                self.positional_seen = true;
+                Ok(Expr::Param(n))
+            }
+            Some(Tok::NamedParam(name)) => {
+                if self.positional_seen {
+                    return Err(err_at(pos, MIX_PARAMS));
+                }
+                let idx = match self.param_names.iter().position(|n| n == &name) {
+                    Some(i) => i,
+                    None => {
+                        self.param_names.push(name);
+                        self.param_names.len() - 1
+                    }
+                };
+                Ok(Expr::Param(idx + 1))
+            }
             Some(Tok::Ident(name)) => {
                 // tabla.columna
                 if self.eat(&Tok::Dot) {

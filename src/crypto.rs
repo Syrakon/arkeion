@@ -3,10 +3,41 @@
 //! deja el backend sustituible (p. ej. por una implementación europea
 //! certificada) sin tocar formato ni motor.
 
+use aes_gcm::aead::AeadInPlace;
+use aes_gcm::{Aes256Gcm, KeyInit, Nonce, Tag};
 use sha2::{Digest, Sha256};
+use zeroize::Zeroize;
 
 use crate::error::{Error, Result};
-use crate::format::{PageBuf, PageId, TAG_LEN};
+use crate::format::{NONCE_LEN, PageBuf, PageId, TAG_LEN};
+
+/// Clave de cifrado cruda de 32 bytes (AES-256). El KDF queda **fuera** del
+/// motor (D7): el llamador entrega los 32 B ya derivados desde su keystore. Se
+/// zeroiza al soltarla y su `Debug` está redactado para que no aflore en logs.
+#[derive(Clone)]
+pub struct Key([u8; 32]);
+
+impl Key {
+    pub fn new(bytes: [u8; 32]) -> Key {
+        Key(bytes)
+    }
+
+    pub(crate) fn bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+impl Drop for Key {
+    fn drop(&mut self) {
+        self.0.zeroize();
+    }
+}
+
+impl std::fmt::Debug for Key {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Key(***)")
+    }
+}
 
 /// Transforma páginas en el borde del disco. En caché y en el motor las
 /// páginas viven siempre en claro.
@@ -62,6 +93,67 @@ impl CryptoProvider for PlainProvider {
     }
 }
 
+/// Cifrado en reposo con AES-256-GCM por página (D6). El nonce de 96 bits es el
+/// contador monótono persistido (`nonce_counter`); el `page_id` va como AAD, de
+/// modo que una página recolocada falla la autenticación (igual que el tag en
+/// claro liga contenido a posición). El body se cifra in place; tag y nonce van
+/// en la reserva criptográfica de la página.
+pub struct Aes256GcmProvider {
+    cipher: Aes256Gcm,
+}
+
+impl Aes256GcmProvider {
+    pub fn new(key: &Key) -> Aes256GcmProvider {
+        Aes256GcmProvider {
+            // 32 bytes exactos: la construcción no puede fallar.
+            cipher: Aes256Gcm::new_from_slice(key.bytes()).expect("clave AES-256 de 32 B"),
+        }
+    }
+
+    /// Nonce de 96 bits = contador `u64` en LE + 4 bytes de padding a cero. La
+    /// unicidad del contador (D6, garantizada por el pager) garantiza la del
+    /// nonce: nunca se reutiliza un par (clave, nonce).
+    fn nonce_bytes(counter: u64) -> [u8; NONCE_LEN] {
+        let mut nonce = [0u8; NONCE_LEN];
+        nonce[..8].copy_from_slice(&counter.to_le_bytes());
+        nonce
+    }
+}
+
+impl CryptoProvider for Aes256GcmProvider {
+    fn seal(&self, page: &mut PageBuf, page_id: PageId, nonce_counter: u64) {
+        let nonce = Self::nonce_bytes(nonce_counter);
+        let aad = page_id.0.to_le_bytes();
+        let tag = self
+            .cipher
+            .encrypt_in_place_detached(Nonce::from_slice(&nonce), &aad, page.body_mut())
+            .expect("AES-GCM no falla cifrando un body de tamaño fijo");
+        page.nonce_mut().copy_from_slice(&nonce);
+        page.tag_mut().copy_from_slice(&tag);
+    }
+
+    fn open(&self, page: &mut PageBuf, page_id: PageId) -> Result<()> {
+        // Copiar nonce y tag antes del préstamo mutable del body.
+        let mut nonce = [0u8; NONCE_LEN];
+        nonce.copy_from_slice(page.nonce());
+        let mut tag = [0u8; TAG_LEN];
+        tag.copy_from_slice(page.tag());
+        let aad = page_id.0.to_le_bytes();
+
+        self.cipher
+            .decrypt_in_place_detached(
+                Nonce::from_slice(&nonce),
+                &aad,
+                page.body_mut(),
+                Tag::from_slice(&tag),
+            )
+            .map_err(|_| Error::Corrupt {
+                page: page_id.0,
+                reason: "fallo de autenticación AES-GCM",
+            })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -102,5 +194,89 @@ mod tests {
             PlainProvider.open(&mut page, PageId(8)),
             Err(Error::Corrupt { page: 8, .. })
         ));
+    }
+
+    // --- AES-256-GCM (M7) ---
+
+    fn key_of(b: u8) -> Key {
+        Key::new([b; 32])
+    }
+
+    /// Página con un patrón reconocible en el body, sellada con AES-GCM.
+    fn aes_sealed(key: &Key, page_id: PageId, counter: u64) -> PageBuf {
+        let mut page = PageBuf::zeroed();
+        for (i, b) in page.body_mut().iter_mut().enumerate() {
+            *b = (i % 256) as u8;
+        }
+        Aes256GcmProvider::new(key).seal(&mut page, page_id, counter);
+        page
+    }
+
+    #[test]
+    fn aes_seal_open_roundtrip() {
+        let key = key_of(0x42);
+        let provider = Aes256GcmProvider::new(&key);
+        let mut page = aes_sealed(&key, PageId(7), 99);
+        provider.open(&mut page, PageId(7)).unwrap();
+        for (i, &b) in page.body().iter().enumerate() {
+            assert_eq!(b, (i % 256) as u8, "body[{i}] no se recuperó");
+        }
+    }
+
+    #[test]
+    fn aes_wrong_key_fails_without_corrupting() {
+        let page = aes_sealed(&key_of(0x01), PageId(3), 1);
+        let mut attempt = page.clone();
+        // Clave distinta ⇒ fallo de autenticación, no datos en claro.
+        assert!(
+            Aes256GcmProvider::new(&key_of(0x02))
+                .open(&mut attempt, PageId(3))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn aes_detects_flip_of_any_byte() {
+        let key = key_of(0x5A);
+        let reference = aes_sealed(&key, PageId(11), 7);
+        let provider = Aes256GcmProvider::new(&key);
+        for i in 0..reference.as_bytes().len() {
+            let mut page = reference.clone();
+            page.as_bytes_mut()[i] ^= 0x01;
+            assert!(
+                provider.open(&mut page, PageId(11)).is_err(),
+                "flip en el byte {i} no detectado"
+            );
+        }
+    }
+
+    #[test]
+    fn aes_detects_relocated_page() {
+        // El page_id va como AAD: descifrar en otra posición falla.
+        let key = key_of(0x33);
+        let mut page = aes_sealed(&key, PageId(5), 3);
+        assert!(
+            Aes256GcmProvider::new(&key)
+                .open(&mut page, PageId(6))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn aes_distinct_counters_diverge_and_hide_plaintext() {
+        let key = key_of(0x77);
+        let a = aes_sealed(&key, PageId(3), 1);
+        let b = aes_sealed(&key, PageId(3), 2);
+        // Mismo plaintext y posición, distinto contador ⇒ nonce y ciphertext
+        // distintos: nunca se reutiliza el par (clave, nonce).
+        assert_ne!(a.nonce(), b.nonce());
+        assert_ne!(a.body(), b.body());
+
+        // El plaintext conocido (0,1,2,3,4,5,6,7) no aparece en la página sellada.
+        let needle = [0u8, 1, 2, 3, 4, 5, 6, 7];
+        assert!(
+            !a.as_bytes().windows(needle.len()).any(|w| w == needle),
+            "el plaintext aflora en la página cifrada"
+        );
     }
 }

@@ -22,6 +22,10 @@ pub enum Error {
     UnsupportedPageSize { page_size: u32 },
     /// El archivo está cifrado y no se proporcionó clave.
     KeyRequired,
+    /// El archivo está cifrado y la clave proporcionada no lo descifra (M7):
+    /// el tag GCM no valida sobre una página que debería. Nunca devuelve datos
+    /// corruptos en su lugar.
+    WrongKey,
     /// Corrupción detectada al validar una página.
     Corrupt { page: u64, reason: &'static str },
     /// Argumento inválido del llamador (p. ej. clave demasiado larga).
@@ -64,6 +68,7 @@ impl fmt::Display for Error {
                 write!(f, "tamaño de página {page_size} no soportado")
             }
             Error::KeyRequired => write!(f, "el archivo está cifrado: se requiere clave"),
+            Error::WrongKey => write!(f, "clave incorrecta: el archivo cifrado no descifra"),
             Error::Corrupt { page, reason } => {
                 write!(f, "corrupción en la página {page}: {reason}")
             }

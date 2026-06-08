@@ -18,6 +18,7 @@ use sha2::{Digest, Sha256};
 use crate::btree::{self, Body, Cursor, NodeSource, NodeStore};
 use crate::catalog::{self, TableDef, TableScan, TableSpec};
 use crate::commit::{self, CommitHeader, Head};
+use crate::crypto::Key;
 use crate::error::{Error, Result};
 use crate::format::{PageBuf, PageId};
 use crate::pager::Pager;
@@ -56,7 +57,12 @@ pub struct Store {
 
 impl Store {
     pub fn create(path: &Path) -> Result<Store> {
-        let pager = Pager::create(path)?;
+        Self::create_keyed(path, None)
+    }
+
+    /// Crea el almacén; con `key`, cifrado en reposo (M7, D6).
+    pub fn create_keyed(path: &Path, key: Option<&Key>) -> Result<Store> {
+        let pager = Pager::create_keyed(path, key)?;
         let head = commit::genesis_head(&pager.header().file_id);
         Ok(Store {
             pager: Arc::new(pager),
@@ -66,12 +72,21 @@ impl Store {
     }
 
     pub fn open(path: &Path) -> Result<Store> {
-        let pager = Pager::open(path)?;
+        Self::open_keyed(path, None)
+    }
+
+    /// Abre el almacén; con `key`, descifra la zona append (M7). `KeyRequired`
+    /// si el archivo está cifrado y falta clave; `WrongKey` si no encaja.
+    pub fn open_keyed(path: &Path, key: Option<&Key>) -> Result<Store> {
+        let pager = Pager::open_keyed(path, key)?;
         let head = commit::recover(&pager)?;
-        // Truncado lógico: la cola rota se sobrescribirá; contador de nonces
-        // restaurado del último commit (M7 añadirá reserva por bloques, D6).
+        // Margen de nonce (D6, R7): la cola rota ocupa como mucho
+        // `físicas - n_pages` posiciones, selladas con contadores a partir de
+        // `head.nonce_counter`. Retomar pasado ese margen hace estructuralmente
+        // imposible reutilizar un nonce, incluso tras crashes repetidos.
+        let torn_tail = pager.n_pages().saturating_sub(head.n_pages);
         pager.set_n_pages(head.n_pages);
-        pager.set_nonce_counter(head.nonce_counter);
+        pager.set_nonce_counter(head.nonce_counter + torn_tail);
         Ok(Store {
             pager: Arc::new(pager),
             head: Arc::new(Mutex::new(head)),
@@ -696,6 +711,83 @@ mod tests {
         drop(store);
         let store = Store::open(&path).unwrap();
         assert!(store.verify().unwrap().chain_ok);
+    }
+
+    /// M7: el almacén cifrado hace round-trip y se audita; clave errónea ⇒
+    /// `WrongKey`.
+    #[test]
+    fn encrypted_store_roundtrips_and_audits() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("e.arkeion");
+        let key = Key::new([0x44; 32]);
+
+        let store = Store::create_keyed(&path, Some(&key)).unwrap();
+        for i in 1..=6 {
+            let mut tx = store.begin().unwrap();
+            tx.put(format!("k{i:02}").as_bytes(), b"valor").unwrap();
+            assert_eq!(tx.commit().unwrap(), i);
+        }
+        assert!(store.verify().unwrap().chain_ok);
+        drop(store);
+
+        // Reabrir cifrado: datos y cadena intactos.
+        let store = Store::open_keyed(&path, Some(&key)).unwrap();
+        assert_eq!(store.snapshot().get(b"k03").unwrap().unwrap(), b"valor");
+        assert!(store.verify().unwrap().chain_ok);
+        drop(store);
+
+        // Clave errónea ⇒ WrongKey.
+        assert!(matches!(
+            Store::open_keyed(&path, Some(&Key::new([0x99; 32]))),
+            Err(Error::WrongKey)
+        ));
+    }
+
+    /// M7 (D6, R7): tras una cola rota, el contador de nonces retoma pasado el
+    /// margen físico, haciendo imposible reutilizar un nonce.
+    #[test]
+    fn nonce_counter_resumes_past_a_torn_tail() {
+        use std::io::Write;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("n.arkeion");
+        let key = Key::new([0x55; 32]);
+
+        let store = Store::create_keyed(&path, Some(&key)).unwrap();
+        for i in 1..=3 {
+            let mut tx = store.begin().unwrap();
+            tx.put(format!("k{i}").as_bytes(), b"v").unwrap();
+            tx.commit().unwrap();
+        }
+        let (head_pages, head_counter) = {
+            let h = store.head.lock().unwrap();
+            (h.n_pages, h.nonce_counter)
+        };
+        drop(store);
+
+        // Cola rota: `extra` páginas de basura tras el head (commit abortado).
+        let extra = 5u64;
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        f.write_all(&vec![0u8; extra as usize * crate::format::PAGE_SIZE])
+            .unwrap();
+        f.sync_all().unwrap();
+        drop(f);
+
+        let store = Store::open_keyed(&path, Some(&key)).unwrap();
+        assert_eq!(
+            store.head.lock().unwrap().n_pages,
+            head_pages,
+            "el head no debe moverse por la cola rota"
+        );
+        assert!(
+            store.pager.nonce_counter() >= head_counter + extra,
+            "el contador {} no superó el margen {}",
+            store.pager.nonce_counter(),
+            head_counter + extra
+        );
     }
 
     /// M6: voltear un byte de una página histórica ⇒ `ChainBroken`.

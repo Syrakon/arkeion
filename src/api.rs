@@ -13,6 +13,7 @@ use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
 
 use crate::commit::AuditReport;
+use crate::crypto::Key;
 use crate::error::{Error, Result};
 use crate::exec;
 use crate::record::Value;
@@ -26,13 +27,16 @@ use crate::tx::{AsOf, Snapshot, Store, WriteTx};
 #[derive(Clone, Debug)]
 pub struct Options {
     pub create_if_missing: bool,
-    // M7: key: Option<Key> (cifrado en reposo).
+    /// Clave de cifrado en reposo (M7, D7). `Some` ⇒ al crear se cifra el
+    /// archivo, al abrir se descifra. `None` ⇒ sin cifrado.
+    pub key: Option<Key>,
 }
 
 impl Default for Options {
     fn default() -> Options {
         Options {
             create_if_missing: true,
+            key: None,
         }
     }
 }
@@ -40,6 +44,35 @@ impl Default for Options {
 impl Options {
     pub fn create_if_missing(mut self, create: bool) -> Options {
         self.create_if_missing = create;
+        self
+    }
+
+    /// Activa el cifrado en reposo con una clave cruda de 32 B (M7). El KDF
+    /// queda fuera del motor (D7): el llamador entrega la clave ya derivada.
+    /// Abrir un archivo cifrado sin clave da [`Error::KeyRequired`]; con una
+    /// clave que no encaja, [`Error::WrongKey`].
+    ///
+    /// ```
+    /// use arkeion::{Database, Key, Options};
+    ///
+    /// let dir = tempfile::tempdir().unwrap();
+    /// let path = dir.path().join("cifrada.arkeion");
+    /// let clave = || Key::new([0x42; 32]);
+    ///
+    /// // Crear cifrada y escribir.
+    /// let db = Database::open(&path, Options::default().key(clave())).unwrap();
+    /// db.connect()
+    ///     .unwrap()
+    ///     .execute("CREATE TABLE t (id INTEGER PRIMARY KEY)", &[])
+    ///     .unwrap();
+    /// drop(db);
+    ///
+    /// // Reabrir exige la clave correcta.
+    /// assert!(Database::open(&path, Options::default().create_if_missing(false)).is_err());
+    /// assert!(Database::open(&path, Options::default().key(clave())).is_ok());
+    /// ```
+    pub fn key(mut self, key: Key) -> Options {
+        self.key = Some(key);
         self
     }
 }
@@ -54,17 +87,18 @@ pub struct Database {
 impl Database {
     pub fn open(path: impl AsRef<Path>, opts: Options) -> Result<Database> {
         let path = path.as_ref();
+        let key = opts.key.as_ref();
         let store = if opts.create_if_missing {
-            match Store::create(path) {
+            match Store::create_keyed(path, key) {
                 Ok(s) => s,
                 // Ya existe (o carrera con otro creador): abrir.
                 Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                    Store::open(path)?
+                    Store::open_keyed(path, key)?
                 }
                 Err(e) => return Err(e),
             }
         } else {
-            Store::open(path)?
+            Store::open_keyed(path, key)?
         };
         Ok(Database {
             store: Arc::new(store),

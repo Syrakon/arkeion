@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use crate::crypto::{CryptoProvider, PlainProvider};
+use crate::crypto::{Aes256GcmProvider, CryptoProvider, Key, PlainProvider};
 use crate::error::{Error, Result};
 use crate::format::{
     FIRST_DATA_PAGE, FLAG_ENCRYPTED, FileHeader, HEADER_PAGE, MAGIC_HEADER, META_PAGE_A,
@@ -24,7 +24,7 @@ pub struct Pager {
     header: FileHeader,
     /// Páginas estructurales (cabecera, meta): siempre en claro (docs/02).
     plain: PlainProvider,
-    /// Zona append. En M0 solo `PlainProvider`; AES-256-GCM llega en M7.
+    /// Zona append: `PlainProvider` sin cifrado, `Aes256GcmProvider` con clave (M7).
     crypto: Arc<dyn CryptoProvider>,
     /// Caché de páginas inmutables. Sin tope en M0; eviction en M9.
     cache: Mutex<HashMap<PageId, Arc<PageBuf>>>,
@@ -40,9 +40,16 @@ struct AppendState {
 }
 
 impl Pager {
-    /// Crea una base de datos nueva: cabecera + meta slots v0, fsync de datos
-    /// y de directorio.
+    /// Crea una base de datos nueva sin cifrar.
     pub fn create(path: &Path) -> Result<Pager> {
+        Self::create_keyed(path, None)
+    }
+
+    /// Crea una base de datos nueva: cabecera + meta slots v0, fsync de datos
+    /// y de directorio. Con `key`, marca el archivo como cifrado (D6) y la zona
+    /// append se sella con AES-256-GCM; cabecera y meta slots van siempre en
+    /// claro (no contienen datos de usuario).
+    pub fn create_keyed(path: &Path, key: Option<&Key>) -> Result<Pager> {
         let file = DbFile::create_new(path)?;
         if !file.try_lock_exclusive()? {
             return Err(Error::Busy);
@@ -53,16 +60,20 @@ impl Pager {
         let mut kdf_salt = [0u8; 16];
         getrandom::fill(&mut kdf_salt).map_err(|e| Error::Io(std::io::Error::other(e)))?;
         let header = FileHeader {
-            flags: 0,
+            flags: if key.is_some() { FLAG_ENCRYPTED } else { 0 },
             file_id,
             kdf_salt,
+        };
+        let crypto: Arc<dyn CryptoProvider> = match key {
+            Some(k) => Arc::new(Aes256GcmProvider::new(k)),
+            None => Arc::new(PlainProvider),
         };
 
         let pager = Pager {
             file,
             header,
             plain: PlainProvider,
-            crypto: Arc::new(PlainProvider),
+            crypto,
             cache: Mutex::new(HashMap::new()),
             state: Mutex::new(AppendState {
                 next_page: FIRST_DATA_PAGE.0,
@@ -91,9 +102,20 @@ impl Pager {
         Ok(pager)
     }
 
+    /// Abre una base existente sin cifrar (o cifrada si se pasa clave: ver
+    /// [`open_keyed`](Pager::open_keyed)).
+    pub fn open(path: &Path) -> Result<Pager> {
+        Self::open_keyed(path, None)
+    }
+
     /// Abre una base existente: valida cabecera y exige al menos un meta slot
     /// válido. Una cola rota (append sin commit) se ignora por construcción.
-    pub fn open(path: &Path) -> Result<Pager> {
+    ///
+    /// Cifrado (M7): si el archivo tiene el bit `FLAG_ENCRYPTED`, se requiere
+    /// `key` ([`Error::KeyRequired`] si falta) y se valida descifrando la
+    /// primera página de datos ([`Error::WrongKey`] si la clave no encaja).
+    /// Pasar clave para un archivo sin cifrar es un error de uso.
+    pub fn open_keyed(path: &Path, key: Option<&Key>) -> Result<Pager> {
         let file = DbFile::open_rw(path)?;
         if !file.try_lock_exclusive()? {
             return Err(Error::Busy);
@@ -112,16 +134,23 @@ impl Pager {
         }
         PlainProvider.open(&mut page, HEADER_PAGE)?;
         let header = FileHeader::decode(page.body())?;
-        if header.flags & FLAG_ENCRYPTED != 0 {
-            // M7: aquí se construirá Aes256GcmProvider con la clave de Options.
-            return Err(Error::KeyRequired);
-        }
+        let encrypted = header.flags & FLAG_ENCRYPTED != 0;
+        let crypto: Arc<dyn CryptoProvider> = match (encrypted, key) {
+            (true, Some(k)) => Arc::new(Aes256GcmProvider::new(k)),
+            (true, None) => return Err(Error::KeyRequired),
+            (false, None) => Arc::new(PlainProvider),
+            (false, Some(_)) => {
+                return Err(Error::InvalidInput(
+                    "se proporcionó clave para un archivo sin cifrar",
+                ));
+            }
+        };
 
         let pager = Pager {
             file,
             header,
             plain: PlainProvider,
-            crypto: Arc::new(PlainProvider),
+            crypto,
             cache: Mutex::new(HashMap::new()),
             // floor: una página final a medio escribir queda fuera y será
             // sobrescrita por el siguiente append (truncado lógico).
@@ -131,6 +160,15 @@ impl Pager {
             }),
         };
         pager.read_meta()?;
+
+        // Validación de clave (M7): la primera página de datos debe descifrar.
+        // Una clave errónea aflora aquí como `WrongKey`, no como una base vacía
+        // (la recuperación, sin esto, descartaría todo commit que no abre).
+        if encrypted && pager.n_pages() > FIRST_DATA_PAGE.0 {
+            pager
+                .read_page(FIRST_DATA_PAGE)
+                .map_err(|_| Error::WrongKey)?;
+        }
         Ok(pager)
     }
 
@@ -549,5 +587,75 @@ mod tests {
         std::fs::write(&path, bytes).unwrap();
 
         assert!(matches!(Pager::open(&path), Err(Error::KeyRequired)));
+    }
+
+    #[test]
+    fn encrypted_roundtrip_key_required_and_wrong_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = db_path(&dir);
+        let key = Key::new([0x11; 32]);
+
+        let pager = Pager::create_keyed(&path, Some(&key)).unwrap();
+        let ids: Vec<PageId> = (0..6)
+            .map(|i| pager.append_page(pattern(i)).unwrap())
+            .collect();
+        pager.sync().unwrap();
+        drop(pager);
+
+        // Sin clave ⇒ KeyRequired.
+        assert!(matches!(Pager::open(&path), Err(Error::KeyRequired)));
+
+        // Con la clave correcta ⇒ datos íntegros.
+        let pager = Pager::open_keyed(&path, Some(&key)).unwrap();
+        for (i, id) in ids.iter().enumerate() {
+            let page = pager.read_page(*id).unwrap();
+            let mut expected = vec![0u8; BODY_SIZE];
+            pattern(i as u64)(&mut expected);
+            assert_eq!(
+                page.body(),
+                &expected[..],
+                "página {i} difiere tras reabrir"
+            );
+        }
+        drop(pager);
+
+        // Clave errónea ⇒ WrongKey, nunca datos en claro.
+        assert!(matches!(
+            Pager::open_keyed(&path, Some(&Key::new([0x22; 32]))),
+            Err(Error::WrongKey)
+        ));
+    }
+
+    #[test]
+    fn encrypted_file_hides_plaintext() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = db_path(&dir);
+        let key = Key::new([0x33; 32]);
+
+        let pager = Pager::create_keyed(&path, Some(&key)).unwrap();
+        let needle = [0xACu8; 48];
+        pager
+            .append_page(|body| body[..needle.len()].copy_from_slice(&needle))
+            .unwrap();
+        pager.sync().unwrap();
+        drop(pager);
+
+        let raw = std::fs::read(&path).unwrap();
+        let data = &raw[FIRST_DATA_PAGE.byte_offset() as usize..];
+        assert!(
+            !data.windows(needle.len()).any(|w| w == needle),
+            "el plaintext aflora en la zona append cifrada"
+        );
+    }
+
+    #[test]
+    fn key_on_a_plaintext_file_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = db_path(&dir);
+        Pager::create(&path).unwrap(); // sin cifrar
+        assert!(matches!(
+            Pager::open_keyed(&path, Some(&Key::new([1; 32]))),
+            Err(Error::InvalidInput(_))
+        ));
     }
 }

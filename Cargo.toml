@@ -11,10 +11,14 @@ publish = false
 # Supply chain mínima y justificada (docs/05-decisiones.md, D8):
 #   sha2      — SHA-256 (FIPS 180-4): tags de integridad y hash chain. RustCrypto, Rust puro.
 #   getrandom — entropía del SO para file_id y kdf_salt en la creación del archivo.
-# Llegarán en M7 (cifrado): aes-gcm, zeroize. Nada más.
+#   aes-gcm   — AES-256-GCM (FIPS 197 / SP 800-38D): cifrado en reposo por página (M7, D6).
+#   zeroize   — borrado seguro de la clave cruda en memoria (M7, D7).
+# Nada más: parser, B-tree, encodings, varint y caché van a mano (D8).
 [dependencies]
 sha2 = "0.10"
 getrandom = { version = "0.3", features = ["std"] }
+aes-gcm = "0.10"
+zeroize = "1"
 
 [dev-dependencies]
 tempfile = "3"

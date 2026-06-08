@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
 
 use crate::branch::Diff;
-use crate::commit::AuditReport;
+use crate::commit::{AuditAnchor, AuditReport};
 use crate::crypto::Key;
 use crate::error::{Error, Result};
 use crate::exec;
@@ -208,6 +208,34 @@ impl Database {
     /// ```
     pub fn verify(&self) -> Result<AuditReport> {
         self.store.verify()
+    }
+
+    /// Auditoría **contra un ancla externa** guardada antes (post-M9): además de
+    /// la integridad completa que hace [`verify`](Database::verify), prueba que a
+    /// la versión del ancla el `chain_hash` sigue siendo el mismo. Cierra el
+    /// hueco de `verify`: detecta que alguien **trunque o reescriba** la historia
+    /// para fabricar una cadena válida más corta (no podrá reproducir el hash
+    /// anclado). Crea el ancla con [`AuditReport::anchor`] y guárdala/publícala.
+    ///
+    /// ```
+    /// use arkeion::{Database, Options};
+    ///
+    /// let dir = tempfile::tempdir().unwrap();
+    /// let path = dir.path().join("t.arkeion");
+    /// let db = Database::open(&path, Options::default()).unwrap();
+    /// let conn = db.connect().unwrap();
+    /// conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER)", &[]).unwrap();
+    /// conn.execute("INSERT INTO t (n) VALUES (1)", &[]).unwrap();
+    ///
+    /// // Ancla este estado y guárdala fuera.
+    /// let anchor = db.verify().unwrap().anchor();
+    ///
+    /// // Más adelante (incluso con más commits) sigue cuadrando.
+    /// conn.execute("INSERT INTO t (n) VALUES (2)", &[]).unwrap();
+    /// assert!(db.verify_anchor(&anchor).is_ok());
+    /// ```
+    pub fn verify_anchor(&self, anchor: &AuditAnchor) -> Result<AuditReport> {
+        self.store.verify_anchor(anchor)
     }
 
     /// Línea temporal de versiones confirmadas, de la más antigua a la más nueva:

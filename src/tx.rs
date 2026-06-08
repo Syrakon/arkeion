@@ -611,6 +611,17 @@ impl Store {
         commit::verify(&pager, &head)
     }
 
+    /// Auditoría + comprobación de un ancla externa (post-M9): además de la
+    /// integridad, prueba que a la versión anclada el `chain_hash` sigue siendo
+    /// el guardado. Detecta truncado/reescritura de la historia.
+    pub fn verify_anchor(&self, anchor: &commit::AuditAnchor) -> Result<commit::AuditReport> {
+        let (pager, head) = {
+            let st = self.lock();
+            (st.pager.clone(), st.head.clone())
+        };
+        commit::verify_anchored(&pager, &head, Some(anchor))
+    }
+
     /// Snapshot histórico (M5, time-travel). `AsOf::Head` equivale a
     /// [`snapshot`](Store::snapshot). Funciona porque el b-tree es CoW
     /// append-only: la raíz de cada versión sigue en disco hasta que `vacuum`
@@ -2560,5 +2571,61 @@ mod tests {
             store.diff_versions(2, 99),
             Err(Error::VersionNotFound(_))
         ));
+    }
+
+    /// El ancla de auditoría detecta reescritura (chain_hash distinto) y truncado
+    /// (versión futura), y sigue cuadrando aunque se añadan commits.
+    #[test]
+    fn audit_anchor_catches_rewrite_and_truncation() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_with_versions(&dir.path().join("a.arkeion"), 4);
+        let anchor = store.verify().unwrap().anchor();
+        assert_eq!(anchor.version, 4);
+
+        // Más commits: el ancla (v4) sigue cuadrando.
+        {
+            let mut tx = store.begin().unwrap();
+            tx.put(b"x", b"y").unwrap();
+            tx.commit().unwrap();
+        }
+        assert!(store.verify_anchor(&anchor).is_ok());
+
+        // chain_hash equivocado ⇒ historia reescrita.
+        let mut bad = anchor;
+        bad.chain_hash[0] ^= 0xFF;
+        assert!(matches!(
+            store.verify_anchor(&bad),
+            Err(Error::ChainBroken { .. })
+        ));
+
+        // Ancla a una versión futura ⇒ faltan commits (truncado).
+        let future = commit::AuditAnchor {
+            version: 999,
+            chain_hash: anchor.chain_hash,
+        };
+        assert!(matches!(
+            store.verify_anchor(&future),
+            Err(Error::ChainBroken { .. })
+        ));
+    }
+
+    /// Un ancla a una versión que `vacuum` compactó ya no se puede comprobar.
+    #[test]
+    fn audit_anchor_for_a_compacted_version_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_with_versions(&dir.path().join("a.arkeion"), 2);
+        let anchor = store.verify().unwrap().anchor(); // v2
+        for v in 3..=6u64 {
+            let mut tx = store.begin().unwrap();
+            tx.put(format!("k{v}").as_bytes(), b"v").unwrap();
+            tx.commit().unwrap();
+        }
+        store.vacuum(Retention::KeepLast(2)).unwrap(); // K=5: compacta 1..4
+        assert!(matches!(
+            store.verify_anchor(&anchor),
+            Err(Error::ChainBroken { .. })
+        ));
+        // Sin ancla, la auditoría del archivo compactado sigue OK.
+        assert!(store.verify().unwrap().chain_ok);
     }
 }

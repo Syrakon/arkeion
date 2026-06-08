@@ -59,6 +59,11 @@ impl Database {
     pub fn merge(&self, from: &str, into: &str, policy: MergePolicy) -> Result<MergeReport>;
 
     pub fn verify(&self) -> Result<AuditReport>;                  // recorre la hash chain entera
+    pub fn verify_anchor(&self, anchor: &AuditAnchor) -> Result<AuditReport>;  // + ancla: detecta truncado/reescritura
+
+    pub fn history(&self) -> Result<Vec<Revision>>;               // "git log": línea temporal de versiones
+    pub fn diff_versions(&self, from: u64, to: u64) -> Result<Diff>;           // "git diff" entre dos versiones
+
     pub fn vacuum(&self, retention: Retention) -> Result<VacuumReport>;        // compacta + rename atómico
     pub fn vacuum_rekey(&self, retention: Retention, new_key: Option<Key>)     // compacta y rota la clave
         -> Result<VacuumReport>;
@@ -69,7 +74,9 @@ pub enum Retention   { KeepAll, KeepLast(u64), KeepSince(SystemTime) }   // fron
 
 pub struct Diff { pub tables: Vec<TableDiff> }          // altas/bajas/modificaciones por rowid,
                                                         // y diffs de esquema
-pub struct AuditReport { pub head: Version, pub commits: u64, pub chain_ok: bool }
+pub struct AuditReport { pub head: u64, pub commits: u64, pub chain_ok: bool, pub chain_hash: [u8; 32] }
+pub struct AuditAnchor { pub version: u64, pub chain_hash: [u8; 32] }   // AuditReport::anchor() lo crea
+pub struct Revision { pub version: u64, pub timestamp: SystemTime, pub parent: u64 }
 pub struct VacuumReport {                               // qué conservó y cuánto recuperó
     pub kept_from: u64, pub head: u64, pub reclaimed_versions: u64,
     pub pages_before: u64, pub pages_after: u64,

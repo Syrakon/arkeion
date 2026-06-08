@@ -245,6 +245,33 @@ pub struct AuditReport {
     /// Siempre `true` cuando `verify` devuelve `Ok`: un fallo es `ChainBroken`,
     /// no un informe negativo.
     pub chain_ok: bool,
+    /// `chain_hash` del head: el "eslabón raíz de confianza". Guárdalo como
+    /// [`AuditAnchor`] para detectar después un truncado/reescritura de la
+    /// historia que `verify` por sí solo no puede ver (post-M9).
+    pub chain_hash: [u8; 32],
+}
+
+impl AuditReport {
+    /// Ancla externa de este estado: `(head, chain_hash)`. Publícala/guárdala y
+    /// pásala luego a `verify_anchor` para probar que la historia hasta esa
+    /// versión sigue intacta (y que no se quitaron commits).
+    pub fn anchor(&self) -> AuditAnchor {
+        AuditAnchor {
+            version: self.head,
+            chain_hash: self.chain_hash,
+        }
+    }
+}
+
+/// Punto de confianza externo de la hash chain: a la versión `version`, el
+/// `chain_hash` valía esto (post-M9). Lo produce [`AuditReport::anchor`]; lo
+/// comprueba `verify_anchor`. Detecta el ataque que `verify` no ve por sí solo:
+/// **truncar o reescribir** la historia para producir una cadena válida más
+/// corta (el atacante no puede reproducir el `chain_hash` anclado).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AuditAnchor {
+    pub version: u64,
+    pub chain_hash: [u8; 32],
 }
 
 /// Auditoría completa: recorre la cadena de génesis a `head` y comprueba, en
@@ -261,6 +288,18 @@ pub struct AuditReport {
 ///   manipulación de campos de cabecera y el re-encadenado.
 /// - **continuidad de versión**: génesis→head sin saltos.
 pub fn verify(pager: &Pager, head: &Head) -> Result<AuditReport> {
+    verify_anchored(pager, head, None)
+}
+
+/// Como [`verify`] pero, si se da un `anchor`, comprueba además que a la versión
+/// anclada el `chain_hash` coincide con el guardado (post-M9). Esto cierra el
+/// hueco de `verify`: detecta que se haya **truncado o reescrito** la historia
+/// (versión anclada futura ⇒ faltan commits; `chain_hash` distinto ⇒ reescrita).
+pub fn verify_anchored(
+    pager: &Pager,
+    head: &Head,
+    anchor: Option<&AuditAnchor>,
+) -> Result<AuditReport> {
     let broken = |at: u64, reason: &'static str| Error::ChainBroken { at, reason };
 
     // 1. Enumerar las cabeceras de commit caminando hacia atrás por `prev_page`
@@ -291,6 +330,7 @@ pub fn verify(pager: &Pager, head: &Head) -> Result<AuditReport> {
         Some((_, h)) if h.flags & COMMIT_FLAG_CHECKPOINT != 0 => h.version.saturating_sub(1),
         _ => 0,
     };
+    let mut anchor_seen = false;
     for (pid, header) in &headers {
         expected_version += 1;
         if header.version != expected_version {
@@ -321,6 +361,19 @@ pub fn verify(pager: &Pager, head: &Head) -> Result<AuditReport> {
         if header.chain_hash != header.compute_chain() {
             return Err(broken(header.version, "chain_hash inconsistente"));
         }
+        // Comprobación del ancla: a la versión anclada, el chain_hash debe ser
+        // el guardado (una historia reescrita produce otro).
+        if let Some(a) = anchor
+            && header.version == a.version
+        {
+            if header.chain_hash != a.chain_hash {
+                return Err(broken(
+                    header.version,
+                    "el ancla no coincide: la historia fue reescrita",
+                ));
+            }
+            anchor_seen = true;
+        }
         prev_chain = header.chain_hash;
     }
 
@@ -331,12 +384,31 @@ pub fn verify(pager: &Pager, head: &Head) -> Result<AuditReport> {
     if prev_chain != head.chain_hash {
         return Err(broken(head.version, "el chain_hash del head no coincide"));
     }
+    // El ancla, si se dio, debe haberse encontrado durante el recorrido.
+    if let Some(a) = anchor
+        && !anchor_seen
+    {
+        return Err(if a.version > head.version {
+            // La cadena es más corta que el ancla: se quitaron commits.
+            broken(
+                head.version,
+                "el ancla apunta a una versión futura: faltan commits",
+            )
+        } else {
+            // La versión anclada quedó por debajo del checkpoint de vacuum.
+            broken(
+                a.version,
+                "la versión del ancla ya no está (compactada por vacuum)",
+            )
+        });
+    }
     Ok(AuditReport {
         head: head.version,
         // Commits realmente recorridos: == `head` en un archivo íntegro sin
         // compactar; tras `vacuum` (M9) son los retenidos (head - K + 1).
         commits: headers.len() as u64,
         chain_ok: true,
+        chain_hash: head.chain_hash,
     })
 }
 

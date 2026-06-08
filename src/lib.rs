@@ -59,7 +59,7 @@ pub use api::{
     ColIndex, Connection, Database, FromValue, Options, Row, Rows, Statement, Transaction,
 };
 pub use branch::{ChangeKind, Diff, RowChange, SchemaChange};
-pub use commit::AuditReport;
+pub use commit::{AuditAnchor, AuditReport};
 pub use crypto::Key;
 pub use error::{Error, Result};
 pub use record::Value;

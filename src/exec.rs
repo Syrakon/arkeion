@@ -609,9 +609,74 @@ fn col_index(def: &TableDef, name: &str) -> Result<usize> {
 
 // --- SELECT ---
 
+/// `SELECT <expr>, …` sin `FROM`: evalúa expresiones constantes contra una única
+/// fila implícita (estilo SQLite). Sin tabla no hay columnas, así que `eval` con
+/// fila `None` rechaza por sí mismo cualquier columna/agregado; aquí solo se
+/// vetan las cláusulas que necesitan filas y la proyección `*`.
+fn run_select_no_from(stmt: &SelectStmt, params: &[Value]) -> Result<SelectOut> {
+    if !stmt.joins.is_empty() {
+        return Err(sql_err("JOIN requiere FROM"));
+    }
+    if !stmt.group_by.is_empty() {
+        return Err(sql_err("GROUP BY requiere FROM"));
+    }
+    if stmt.having.is_some() {
+        return Err(sql_err("HAVING requiere FROM"));
+    }
+    if !stmt.order_by.is_empty() {
+        return Err(sql_err("ORDER BY requiere FROM"));
+    }
+    if stmt.as_of.is_some() {
+        return Err(sql_err("AS OF requiere FROM"));
+    }
+
+    // Nombres de columna (sin evaluar: las columnas existen aunque la fila se
+    // filtre) y las expresiones a proyectar. Nombre = alias, el de la propia
+    // expresión, o `colN`, igual que con FROM.
+    let mut columns = Vec::with_capacity(stmt.projection.len());
+    let mut exprs: Vec<&Expr> = Vec::with_capacity(stmt.projection.len());
+    for (i, item) in stmt.projection.iter().enumerate() {
+        let SelectItem::Expr { expr, alias } = item else {
+            return Err(sql_err("SELECT * requiere FROM"));
+        };
+        if expr.has_aggregate() {
+            return Err(sql_err("un agregado requiere FROM"));
+        }
+        columns.push(alias.clone().unwrap_or_else(|| match expr {
+            Expr::Column { name, .. } => name.clone(),
+            _ => format!("col{}", i + 1),
+        }));
+        exprs.push(expr);
+    }
+
+    // ¿Sobrevive la única fila implícita? El `WHERE` constante y `LIMIT/OFFSET`
+    // deciden ANTES de materializar la proyección, igual que el camino con FROM
+    // (que filtra y recorta y solo entonces proyecta): así un error de proyección
+    // sobre una fila ya excluida no aflora (`SELECT 'a' + 1 WHERE 0` → cero filas).
+    let keep = match &stmt.where_clause {
+        Some(cond) => truthy(eval_const(cond, params)?)?,
+        None => true,
+    };
+    let placeholder = if keep { vec![Vec::new()] } else { Vec::new() };
+    let rows = if limit_offset(placeholder, stmt, params)?.is_empty() {
+        Vec::new()
+    } else {
+        let row = exprs
+            .iter()
+            .map(|e| eval_const(e, params))
+            .collect::<Result<Vec<_>>>()?;
+        vec![row]
+    };
+    Ok(SelectOut { columns, rows })
+}
+
 pub fn run_select(src: &impl DataSource, stmt: &SelectStmt, params: &[Value]) -> Result<SelectOut> {
-    let from_def = lookup(src, &stmt.from)?;
-    let mut schema = QuerySchema::single(stmt.from.qualifier(), from_def.clone());
+    // `SELECT <expr>, …` sin `FROM`: no hay tabla que escanear.
+    let Some(from_ref) = &stmt.from else {
+        return run_select_no_from(stmt, params);
+    };
+    let from_def = lookup(src, from_ref)?;
+    let mut schema = QuerySchema::single(from_ref.qualifier(), from_def.clone());
 
     // Planificador (solo sin joins): point lookup por PK (`alias_rowid = const`),
     // si no, index scan por un índice secundario (`col_indexada = const`), si no,
@@ -1746,17 +1811,21 @@ fn arith(op: BinOp, a: Value, b: Value) -> Result<Value> {
                 BinOp::Add => x.checked_add(y),
                 BinOp::Sub => x.checked_sub(y),
                 BinOp::Mul => x.checked_mul(y),
+                // División/módulo por cero → NULL (compat SQLite), no error.
                 BinOp::Div => {
                     if y == 0 {
-                        return Err(sql_err("división por cero"));
+                        return Ok(Null);
                     }
                     x.checked_div(y)
                 }
                 BinOp::Mod => {
                     if y == 0 {
-                        return Err(sql_err("división por cero"));
+                        return Ok(Null);
                     }
-                    x.checked_rem(y)
+                    // `i64::MIN % -1`: `checked_rem` da `None` por un quirk de la
+                    // instrucción de CPU, pero el resultado real es 0 (`x % -1 ≡ 0`)
+                    // y no hay desbordamiento. La división sí desborda ahí (→ error).
+                    Some(x.checked_rem(y).unwrap_or(0))
                 }
                 _ => unreachable!("solo aritmética"),
             };
@@ -1765,14 +1834,23 @@ fn arith(op: BinOp, a: Value, b: Value) -> Result<Value> {
         (a @ (Integer(_) | Real(_)), b @ (Integer(_) | Real(_))) => {
             let x = as_f64(&a);
             let y = as_f64(&b);
-            Ok(Real(match op {
+            // División/módulo por cero → NULL (compat SQLite): el `/0.0` daría ±inf
+            // y el `%0.0` daría NaN; SQLite devuelve NULL en ambos.
+            if matches!(op, BinOp::Div | BinOp::Mod) && y == 0.0 {
+                return Ok(Null);
+            }
+            let r = match op {
                 BinOp::Add => x + y,
                 BinOp::Sub => x - y,
                 BinOp::Mul => x * y,
-                BinOp::Div => x / y, // IEEE: ±inf
+                BinOp::Div => x / y,
                 BinOp::Mod => x % y,
                 _ => unreachable!("solo aritmética"),
-            }))
+            };
+            // NaN (p. ej. `inf - inf`, `inf / inf`) no es almacenable ni comparable;
+            // SQLite lo normaliza a NULL. `±inf` (p. ej. `1e308 * 10`) sí se conserva,
+            // como en SQLite, porque está totalmente ordenado.
+            Ok(if r.is_nan() { Null } else { Real(r) })
         }
         (a, b) => Err(sql_err(format!(
             "aritmética sobre {} y {}",
@@ -1857,7 +1935,7 @@ mod tests {
     }
 
     #[test]
-    fn integer_overflow_and_div_zero_are_errors() {
+    fn integer_overflow_errors_but_div_zero_is_null() {
         let bin = |a: i64, op: BinOp, b: i64| {
             eval(
                 &Expr::Binary(
@@ -1870,9 +1948,38 @@ mod tests {
             )
         };
         assert!(bin(i64::MAX, BinOp::Add, 1).is_err());
-        assert!(bin(7, BinOp::Div, 0).is_err());
-        assert!(bin(7, BinOp::Mod, 0).is_err());
+        // División/módulo por cero → NULL (compat SQLite), no error.
+        assert_eq!(bin(7, BinOp::Div, 0).unwrap(), Value::Null);
+        assert_eq!(bin(7, BinOp::Mod, 0).unwrap(), Value::Null);
         assert_eq!(bin(7, BinOp::Div, 2).unwrap(), Value::Integer(3));
+        // `i64::MIN / -1` desborda (error, coherente con +/-/*); `i64::MIN % -1`
+        // es 0 (sin desbordamiento real).
+        assert!(bin(i64::MIN, BinOp::Div, -1).is_err());
+        assert_eq!(bin(i64::MIN, BinOp::Mod, -1).unwrap(), Value::Integer(0));
+    }
+
+    #[test]
+    fn real_nan_is_null_but_inf_is_kept() {
+        let bin = |a: f64, op: BinOp, b: f64| {
+            eval(
+                &Expr::Binary(
+                    Box::new(Expr::Literal(Value::Real(a))),
+                    op,
+                    Box::new(Expr::Literal(Value::Real(b))),
+                ),
+                None,
+                &[],
+            )
+            .unwrap()
+        };
+        let inf = f64::INFINITY;
+        // NaN (inf−inf, inf/inf) → NULL, como SQLite.
+        assert_eq!(bin(inf, BinOp::Sub, inf), Value::Null);
+        assert_eq!(bin(inf, BinOp::Div, inf), Value::Null);
+        // Overflow a ±inf se conserva (totalmente ordenado), como SQLite.
+        assert_eq!(bin(1e308, BinOp::Mul, 10.0), Value::Real(inf));
+        // División real por cero → NULL (no ±inf).
+        assert_eq!(bin(7.0, BinOp::Div, 0.0), Value::Null);
     }
 
     #[test]

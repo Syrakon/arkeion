@@ -274,6 +274,17 @@ pub fn lex(sql: &str) -> Result<Vec<Spanned>> {
                 });
                 i = next;
             }
+            b'"' => {
+                // Identificador entre comillas dobles (SQL estándar): permite
+                // palabras reservadas, espacios y unicode como nombres. Nunca es
+                // palabra clave ni cadena: sale como `Ident` literal.
+                let (name, next) = lex_quoted_ident(sql, start)?;
+                out.push(Spanned {
+                    tok: Tok::Ident(name),
+                    pos: start,
+                });
+                i = next;
+            }
             b'x' | b'X' if bytes.get(i + 1) == Some(&b'\'') => {
                 let (raw, next) = lex_string(sql, start + 1)?;
                 if raw.len() % 2 != 0 || !raw.bytes().all(|c| c.is_ascii_hexdigit()) {
@@ -343,8 +354,15 @@ pub fn lex(sql: &str) -> Result<Vec<Spanned>> {
                     });
                 }
             }
-            c if c.is_ascii_alphabetic() || c == b'_' => {
-                while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+            c if c.is_ascii_alphabetic() || c == b'_' || c >= 0x80 => {
+                // Identificador sin comillas. Los bytes ≥ 0x80 (cuerpo de un
+                // carácter UTF-8 multibyte) cuentan como letra, así que se admiten
+                // identificadores unicode (`café`, `名前`) como en SQLite. El corte
+                // siempre cae en un byte ASCII (frontera de carácter): el slice es
+                // UTF-8 válido.
+                while i < bytes.len()
+                    && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_' || bytes[i] >= 0x80)
+                {
                     i += 1;
                 }
                 let word = &sql[start..i];
@@ -371,6 +389,35 @@ pub fn lex(sql: &str) -> Result<Vec<Spanned>> {
 fn push(out: &mut Vec<Spanned>, tok: Tok, pos: usize, i: &mut usize) {
     out.push(Spanned { tok, pos });
     *i += 1;
+}
+
+/// Identificador entre comillas dobles `"…"` con escape `""` (SQL estándar).
+/// Devuelve (nombre, byte siguiente). Rechaza `""` (un nombre vacío no es válido).
+fn lex_quoted_ident(sql: &str, quote: usize) -> Result<(String, usize)> {
+    let bytes = sql.as_bytes();
+    debug_assert_eq!(bytes[quote], b'"');
+    let mut s = String::new();
+    let mut i = quote + 1;
+    loop {
+        match bytes.get(i) {
+            None => return Err(err(quote, "identificador entre comillas sin cerrar")),
+            Some(b'"') if bytes.get(i + 1) == Some(&b'"') => {
+                s.push('"');
+                i += 2;
+            }
+            Some(b'"') => {
+                if s.is_empty() {
+                    return Err(err(quote, "identificador entre comillas vacío"));
+                }
+                return Ok((s, i + 1));
+            }
+            Some(_) => {
+                let ch = sql[i..].chars().next().expect("índice en frontera de char");
+                s.push(ch);
+                i += ch.len_utf8();
+            }
+        }
+    }
 }
 
 /// Cadena `'…'` con escape `''`. Devuelve (contenido, byte siguiente).
@@ -427,6 +474,37 @@ mod tests {
                 Tok::Param(2),
             ]
         );
+    }
+
+    #[test]
+    fn quoted_and_unicode_identifiers() {
+        // Comillas dobles: palabra reservada y espacios como nombre; escape `""`.
+        assert_eq!(
+            toks(r#"SELECT "select", "mi col", "a""b" FROM t"#),
+            vec![
+                Tok::Kw(Kw::Select),
+                Tok::Ident("select".into()),
+                Tok::Comma,
+                Tok::Ident("mi col".into()),
+                Tok::Comma,
+                Tok::Ident("a\"b".into()),
+                Tok::Kw(Kw::From),
+                Tok::Ident("t".into()),
+            ]
+        );
+        // Identificador unicode sin comillas (como SQLite: bytes ≥ 0x80 son letra).
+        assert_eq!(
+            toks("SELECT café, 名前"),
+            vec![
+                Tok::Kw(Kw::Select),
+                Tok::Ident("café".into()),
+                Tok::Comma,
+                Tok::Ident("名前".into()),
+            ]
+        );
+        // `""` y comilla sin cerrar son errores con posición.
+        assert!(matches!(lex(r#"SELECT """#), Err(Error::Sql { .. })));
+        assert!(matches!(lex(r#"SELECT "abc"#), Err(Error::Sql { .. })));
     }
 
     #[test]

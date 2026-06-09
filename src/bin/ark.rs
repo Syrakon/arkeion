@@ -474,17 +474,22 @@ fn plural(n: usize) -> &'static str {
     if n == 1 { "" } else { "s" }
 }
 
-/// Quita un comentario de línea `-- …` (hasta el fin de línea) respetando las
-/// cadenas entre comillas simples, para que el buffering/enrutado por `;` no se
-/// confunda con un comentario al final de una sentencia o en su propia línea.
+/// Quita un comentario de línea `-- …` (hasta el fin de línea) respetando tanto
+/// las cadenas entre comillas simples (`'…'`) como los identificadores entre
+/// comillas dobles (`"…"`), para que el buffering/enrutado por `;` no se confunda
+/// con un comentario al final de una sentencia o en su propia línea. Un `--`
+/// dentro de cualquiera de los dos no es comentario. (Aproximación de línea: no
+/// modela los escapes `''`/`""`, como el resto del enrutado del REPL.)
 fn strip_comment(line: &str) -> &str {
     let b = line.as_bytes();
     let mut in_str = false;
+    let mut in_ident = false;
     let mut i = 0;
     while i < b.len() {
         match b[i] {
-            b'\'' => in_str = !in_str,
-            b'-' if !in_str && b.get(i + 1) == Some(&b'-') => return &line[..i],
+            b'\'' if !in_ident => in_str = !in_str,
+            b'"' if !in_str => in_ident = !in_ident,
+            b'-' if !in_str && !in_ident && b.get(i + 1) == Some(&b'-') => return &line[..i],
             _ => {}
         }
         i += 1;
@@ -564,4 +569,26 @@ fn help() {
 fn fail(msg: &str) -> ! {
     eprintln!("ark: {msg}");
     std::process::exit(2);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::strip_comment;
+
+    #[test]
+    fn strip_comment_respects_quotes() {
+        // Comentario real al final / en su línea.
+        assert_eq!(strip_comment("SELECT 1; -- nota"), "SELECT 1; ");
+        assert_eq!(strip_comment("-- toda la línea"), "");
+        // `--` dentro de una cadena entre comillas simples no es comentario.
+        assert_eq!(strip_comment("SELECT 'a--b';"), "SELECT 'a--b';");
+        // `--` dentro de un identificador entre comillas dobles tampoco (regresión:
+        // antes se truncaba y la sentencia se perdía en silencio).
+        assert_eq!(
+            strip_comment(r#"SELECT 1 AS "a--b";"#),
+            r#"SELECT 1 AS "a--b";"#
+        );
+        // Comillas dobles tras cerrar una cadena simple: el `--` posterior sí corta.
+        assert_eq!(strip_comment(r#"SELECT "x"; -- c"#), r#"SELECT "x"; "#);
+    }
 }

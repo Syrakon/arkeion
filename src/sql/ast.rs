@@ -104,7 +104,11 @@ pub struct OrderBy {
 #[derive(Clone, Debug, PartialEq)]
 pub struct SelectStmt {
     pub projection: Vec<SelectItem>,
-    pub from: TableRef,
+    /// `FROM` es opcional: `SELECT <expr>, …` sin `FROM` evalúa expresiones
+    /// constantes contra una única fila implícita (estilo SQLite). Sin tabla, la
+    /// proyección no puede referenciar columnas/`*`/agregados y las cláusulas que
+    /// necesitan filas (JOIN/GROUP BY/HAVING/ORDER BY/AS OF) se rechazan en exec.
+    pub from: Option<TableRef>,
     pub joins: Vec<Join>,
     pub where_clause: Option<Expr>,
     /// `GROUP BY e1, e2, …`: agrupa las filas por el valor de estas expresiones

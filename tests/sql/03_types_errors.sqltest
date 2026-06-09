@@ -29,8 +29,13 @@ error tipos incomparables
 > INSERT INTO t (a) VALUES ('texto');
 error tipo de valor incompatible
 
+-- División/módulo por cero → NULL (compat SQLite), no error: `a / 0` es NULL,
+-- así que `NULL > 1` es NULL y el WHERE no conserva la fila.
 > SELECT a FROM t WHERE a / 0 > 1;
-error división por cero
+empty
+
+> SELECT a / 0, a % 0, 5.0 / 0 FROM t;
+NULL|NULL|NULL
 
 > SELECT nope FROM t;
 error columna desconocida

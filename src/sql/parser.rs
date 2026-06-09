@@ -393,25 +393,32 @@ impl Parser {
         while self.eat(&Tok::Comma) {
             projection.push(self.select_item()?);
         }
-        self.expect_kw(Kw::From, "FROM")?;
-        let from = self.table_ref()?;
+        // `FROM` es opcional: `SELECT <expr>, …` evalúa expresiones constantes sin
+        // tabla. Sin `FROM` no hay base para joins, así que el bucle se omite.
+        let from = if self.eat_kw(Kw::From) {
+            Some(self.table_ref()?)
+        } else {
+            None
+        };
         let mut joins = Vec::new();
-        loop {
-            let kind = if self.eat_kw(Kw::Inner) {
-                self.expect_kw(Kw::Join, "JOIN")?;
-                JoinKind::Inner
-            } else if self.eat_kw(Kw::Left) {
-                self.expect_kw(Kw::Join, "JOIN")?;
-                JoinKind::Left
-            } else if self.eat_kw(Kw::Join) {
-                JoinKind::Inner
-            } else {
-                break;
-            };
-            let table = self.table_ref()?;
-            self.expect_kw(Kw::On, "ON")?;
-            let on = self.expr()?;
-            joins.push(Join { kind, table, on });
+        if from.is_some() {
+            loop {
+                let kind = if self.eat_kw(Kw::Inner) {
+                    self.expect_kw(Kw::Join, "JOIN")?;
+                    JoinKind::Inner
+                } else if self.eat_kw(Kw::Left) {
+                    self.expect_kw(Kw::Join, "JOIN")?;
+                    JoinKind::Left
+                } else if self.eat_kw(Kw::Join) {
+                    JoinKind::Inner
+                } else {
+                    break;
+                };
+                let table = self.table_ref()?;
+                self.expect_kw(Kw::On, "ON")?;
+                let on = self.expr()?;
+                joins.push(Join { kind, table, on });
+            }
         }
         let where_clause = if self.eat_kw(Kw::Where) {
             Some(self.expr()?)
@@ -543,8 +550,13 @@ impl Parser {
             return Ok(SelectItem::Star);
         }
         let expr = self.expr()?;
-        // Alias de columna: `expr AS nombre` (explícito, sin ambigüedad).
-        let alias = if self.eat_kw(Kw::As) {
+        // Alias de columna: `expr AS nombre` (explícito, sin ambigüedad). Pero
+        // `AS OF` es la cláusula temporal de sentencia, no un alias: no la consumas
+        // (igual que en `table_ref`). Así `SELECT 1 AS OF VERSION n` parsea con
+        // `from: None` y exec da el diagnóstico claro «AS OF requiere FROM».
+        let as_of_ahead =
+            self.peek() == Some(&Tok::Kw(Kw::As)) && self.peek2() == Some(&Tok::Kw(Kw::Of));
+        let alias = if !as_of_ahead && self.eat_kw(Kw::As) {
             Some(self.ident("un alias de columna tras AS")?)
         } else {
             None
@@ -803,10 +815,10 @@ mod tests {
         assert_eq!(s.projection.len(), 2);
         assert_eq!(
             s.from,
-            TableRef {
+            Some(TableRef {
                 name: "facturas".into(),
                 alias: None
-            }
+            })
         );
         assert!(s.joins.is_empty());
         assert!(s.where_clause.is_some());
@@ -841,10 +853,10 @@ mod tests {
         };
         assert_eq!(
             s.from,
-            TableRef {
+            Some(TableRef {
                 name: "facturas".into(),
                 alias: Some("f".into())
-            }
+            })
         );
         assert_eq!(s.joins.len(), 1);
         let j = &s.joins[0];
@@ -880,7 +892,7 @@ mod tests {
         else {
             panic!()
         };
-        assert_eq!(s.from.alias, None);
+        assert_eq!(s.from.as_ref().unwrap().alias, None);
         assert_eq!(s.as_of, Some(AsOfClause::Timestamp(250)));
 
         // Sin AS OF, sigue siendo None; y un alias real sigue funcionando.
@@ -888,7 +900,7 @@ mod tests {
             panic!()
         };
         assert_eq!(s.as_of, None);
-        assert_eq!(s.from.alias.as_deref(), Some("f"));
+        assert_eq!(s.from.as_ref().unwrap().alias.as_deref(), Some("f"));
     }
 
     #[test]
@@ -902,6 +914,35 @@ mod tests {
         assert!(matches!(err, Error::Sql { pos: Some(_), .. }));
         // AS OF solo cierra la sentencia: nada después.
         assert!(parse("SELECT * FROM t AS OF VERSION 1 LIMIT 5").is_err());
+    }
+
+    #[test]
+    fn select_without_from() {
+        // `FROM` opcional: la proyección queda con `from: None` y sin joins.
+        let Stmt::Select(s) = parse("SELECT 1 + 1, UPPER('hi') AS g").unwrap() else {
+            panic!()
+        };
+        assert_eq!(s.from, None);
+        assert!(s.joins.is_empty());
+        assert_eq!(s.projection.len(), 2);
+        assert!(matches!(
+            &s.projection[1],
+            SelectItem::Expr { alias: Some(a), .. } if a == "g"
+        ));
+        // Un `WHERE` constante sigue parseando sin `FROM`.
+        let Stmt::Select(s) = parse("SELECT 1 WHERE 1 = 0").unwrap() else {
+            panic!()
+        };
+        assert_eq!(s.from, None);
+        assert!(s.where_clause.is_some());
+
+        // `AS OF` sin `FROM` no se confunde con un alias `expr AS nombre`: parsea
+        // con `from: None` y `as_of: Some` (exec lo rechaza con un mensaje claro).
+        let Stmt::Select(s) = parse("SELECT 1 AS OF VERSION 5").unwrap() else {
+            panic!()
+        };
+        assert_eq!(s.from, None);
+        assert_eq!(s.as_of, Some(AsOfClause::Version(5)));
     }
 
     #[test]

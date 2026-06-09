@@ -1,5 +1,10 @@
 # 10 — Índices secundarios (diseño + plan)
 
+> **Estado: COMPLETO.** 1a (codificador `keyenc`), 1b (CREATE/DROP INDEX, plan,
+> mantenimiento, backfill), #3 (array de punteros a celda → búsqueda binaria,
+> formato v3) y slice 2 (UNIQUE, rangos, multi-columna) hechos, testeados y
+> pusheados. Tests en `tests/secondary_indexes.rs`.
+
 El último grande del frente "SQL completo": `WHERE` sobre columna no-PK pasa de
 **O(filas)** (full scan) a **O(log n)** (descenso por un b-tree de índice). El
 formato lo reserva desde el día 0 (keyspace `0x02`, ver `docs/02`).

@@ -38,6 +38,10 @@ pub struct Options {
     /// header); al abrir un archivo existente se respeta lo que diga el header.
     /// `false` por defecto (D8: el core mínimo no comprime).
     pub compress: bool,
+    /// Corrección de errores por página (M10): bytes de paridad Reed-Solomon por
+    /// bloque de 255 (par; corrige `ecc_nsym/2` bytes corruptos por bloque). Solo
+    /// aplica **al crear**. `0` = sin ECC (por defecto, D8).
+    pub ecc_nsym: u8,
 }
 
 impl Default for Options {
@@ -46,6 +50,7 @@ impl Default for Options {
             create_if_missing: true,
             key: None,
             compress: false,
+            ecc_nsym: 0,
         }
     }
 }
@@ -93,6 +98,16 @@ impl Options {
         self.compress = on;
         self
     }
+
+    /// Activa la corrección de errores por página al crear (M10): `nsym` bytes de
+    /// paridad Reed-Solomon por bloque de 255 (debe ser par; corrige `nsym/2`
+    /// bytes corruptos por bloque). Convierte la detección en recuperación dentro
+    /// del presupuesto; fuera de él, falla limpio. `0` = off. Gasta una fracción
+    /// del espacio (≈ `nsym/255`); combínalo con compresión para netos pequeños.
+    pub fn ecc(mut self, nsym: u8) -> Options {
+        self.ecc_nsym = nsym;
+        self
+    }
 }
 
 /// Una base de datos Arkeion: un único archivo. Handle clonable y compartible
@@ -107,7 +122,7 @@ impl Database {
         let path = path.as_ref();
         let key = opts.key.as_ref();
         let store = if opts.create_if_missing {
-            match Store::create_with(path, key, opts.compress) {
+            match Store::create_with(path, key, opts.compress, opts.ecc_nsym) {
                 Ok(s) => s,
                 // Ya existe (o carrera con otro creador): abrir.
                 Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::AlreadyExists => {

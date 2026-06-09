@@ -15,6 +15,7 @@ use std::sync::{Arc, Mutex};
 use crate::commit::Head;
 use crate::compress::{Compressor, Lz};
 use crate::crypto::{Aes256GcmProvider, CryptoProvider, Key, PlainProvider};
+use crate::ecc;
 use crate::error::{Error, Result};
 use crate::format::{
     CRYPTO_RESERVE, FIRST_DATA_PAGE, FLAG_COMPRESSED, FLAG_ENCRYPTED, FileHeader, HEADER_PAGE,
@@ -164,7 +165,7 @@ impl Pager {
     /// append se sella con AES-256-GCM; cabecera y meta slots van siempre en
     /// claro (no contienen datos de usuario).
     pub fn create_keyed(path: &Path, key: Option<&Key>) -> Result<Pager> {
-        Self::create_with_crypto(path, key.is_some(), provider_for(key), None)
+        Self::create_with_crypto(path, key.is_some(), provider_for(key), None, 0)
     }
 
     /// Núcleo de la creación, parametrizado por el proveedor cripto y el
@@ -178,6 +179,7 @@ impl Pager {
         encrypted: bool,
         crypto: Arc<dyn CryptoProvider>,
         compressor: Option<Arc<dyn Compressor>>,
+        ecc_nsym: u8,
     ) -> Result<Pager> {
         let file = DbFile::create_new(path)?;
         if !file.try_lock_exclusive()? {
@@ -198,6 +200,7 @@ impl Pager {
             flags,
             file_id,
             kdf_salt,
+            ecc_nsym,
         };
 
         let pager = Pager {
@@ -337,16 +340,25 @@ impl Pager {
             }
             let stored_len = u32::from_le_bytes(prefix);
             let payload = offset + LEN_PREFIX_LEN as u64;
-            // Un payload menor que la reserva cripto, o que no cabe en el archivo,
-            // marca el inicio de la cola rota: para aquí.
-            if (stored_len as usize) < CRYPTO_RESERVE || payload + stored_len as u64 > file_len {
+            // La paridad ECC sigue al payload; su longitud se deriva del header.
+            let nsym = self.header.ecc_nsym as usize;
+            let plen = if nsym > 0 {
+                ecc::parity_len(stored_len as usize, nsym) as u64
+            } else {
+                0
+            };
+            // Un payload menor que la reserva cripto, o un registro (payload +
+            // paridad) que no cabe en el archivo, marca el inicio de la cola rota.
+            if (stored_len as usize) < CRYPTO_RESERVE
+                || payload + stored_len as u64 + plen > file_len
+            {
                 break;
             }
             state.dir.push(PhysLoc {
                 offset: payload,
                 len: stored_len,
             });
-            offset = payload + stored_len as u64;
+            offset = payload + stored_len as u64 + plen;
         }
         state.next_page = FIRST_DATA_PAGE.0 + state.dir.len() as u64;
         state.write_offset = offset;
@@ -367,7 +379,7 @@ impl Pager {
         let offset = state.write_offset;
         let to_seal = self.body_to_seal(trim_trailing_zeros(page.body()));
         let stored = self.crypto.seal_bytes(&to_seal, id, state.nonce_counter);
-        let framed = frame(&stored);
+        let framed = self.framed_record(&stored);
         self.file.write_all_at(&framed, offset)?;
         state.dir.push(PhysLoc {
             offset: offset + LEN_PREFIX_LEN as u64,
@@ -412,7 +424,7 @@ impl Pager {
 
         let mut stored = vec![0u8; loc.len as usize];
         self.file.read_exact_at(&mut stored, loc.offset)?;
-        let body = self.decode_body(self.crypto.open_bytes(&stored, id)?, id)?;
+        let body = self.decode_body(self.open_with_ecc(&stored, id, loc)?, id)?;
         let mut page = PageBuf::zeroed();
         page.body_mut()[..body.len()].copy_from_slice(&body);
         let page = Arc::new(page);
@@ -426,6 +438,44 @@ impl Pager {
     /// fsync de datos: el punto de durabilidad del protocolo de commit.
     pub fn sync(&self) -> Result<()> {
         self.file.sync_data().map_err(Error::from)
+    }
+
+    /// Registro enmarcado de un payload sellado: `[u32 len][payload]` y, si el
+    /// ECC está activo, la paridad RS del payload a continuación (v2, M10). La
+    /// paridad protege los **bytes finales** (lo que sufre bit-rot); su longitud
+    /// se deriva del `len` y `ecc_nsym`, así que no se guarda en el marco.
+    fn framed_record(&self, stored: &[u8]) -> Vec<u8> {
+        let mut out = frame(stored);
+        let nsym = self.header.ecc_nsym as usize;
+        if nsym > 0 {
+            out.extend_from_slice(&ecc::parity(stored, nsym));
+        }
+        out
+    }
+
+    /// Abre el payload sellado de una página; si falla la autenticación y el ECC
+    /// está activo, lee la paridad e intenta **corregir** los bytes corruptos
+    /// antes de reintentar (M10, estabilidad #3). Camino rápido (sin corrupción):
+    /// una sola lectura y `open`, sin tocar la paridad. Si la corrección no cabe
+    /// en el presupuesto, falla limpio con el error original (nunca dato malo).
+    fn open_with_ecc(&self, payload: &[u8], id: PageId, loc: PhysLoc) -> Result<Vec<u8>> {
+        match self.crypto.open_bytes(payload, id) {
+            Ok(body) => Ok(body),
+            Err(e) => {
+                let nsym = self.header.ecc_nsym as usize;
+                if nsym == 0 {
+                    return Err(e);
+                }
+                let plen = ecc::parity_len(payload.len(), nsym);
+                let mut parity = vec![0u8; plen];
+                self.file
+                    .read_exact_at(&mut parity, loc.offset + loc.len as u64)?;
+                let fixed = ecc::correct(payload, &parity, nsym).ok_or(e)?;
+                // Reverifica el tag sobre los bytes corregidos: si aún no abre,
+                // el daño excedía lo corregible ⇒ Corrupt (jamás dato plausible).
+                self.crypto.open_bytes(&fixed, id)
+            }
+        }
     }
 
     /// Bytes a sellar para una página de datos (v2, M10): el body recortado tal
@@ -490,7 +540,7 @@ impl Pager {
         };
         let to_seal = self.body_to_seal(trim_trailing_zeros(body));
         let stored = self.crypto.seal_bytes(&to_seal, id, counter);
-        let framed = frame(&stored);
+        let framed = self.framed_record(&stored);
         self.file.write_all_at(&framed, offset)?;
         let loc = PhysLoc {
             offset: offset + LEN_PREFIX_LEN as u64,
@@ -537,8 +587,17 @@ impl Pager {
     pub(crate) fn truncate_to_head(&self, head: &Head) {
         let mut state = self.state.lock().expect("estado del pager envenenado");
         let keep = head.n_pages.saturating_sub(FIRST_DATA_PAGE.0) as usize;
+        let nsym = self.header.ecc_nsym as usize;
         let write_offset = match keep.checked_sub(1).and_then(|i| state.dir.get(i)) {
-            Some(last) => last.offset + last.len as u64,
+            // Fin del último registro retenido = payload + su paridad ECC.
+            Some(last) => {
+                let plen = if nsym > 0 {
+                    ecc::parity_len(last.len as usize, nsym) as u64
+                } else {
+                    0
+                };
+                last.offset + last.len as u64 + plen
+            }
             None => FIRST_DATA_PAGE.byte_offset(),
         };
         state.dir.truncate(keep);
@@ -923,6 +982,7 @@ mod tests {
             flags: FLAG_ENCRYPTED,
             file_id: [1; 16],
             kdf_salt: [2; 16],
+            ecc_nsym: 0,
         };
         let mut page = PageBuf::zeroed();
         header.encode_into(page.body_mut());

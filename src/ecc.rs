@@ -263,6 +263,12 @@ fn data_per_block(nsym: usize) -> usize {
     BLOCK - nsym
 }
 
+/// Longitud de la paridad que produce [`parity`] para `data_len` bytes: el
+/// pager la deriva (no la guarda) para barrer y leer registros con ECC.
+pub fn parity_len(data_len: usize, nsym: usize) -> usize {
+    data_len.div_ceil(data_per_block(nsym)) * nsym
+}
+
 /// Paridad RS de `data` con `nsym` bytes de paridad por bloque de 255. La
 /// longitud devuelta es `ceil(len/k) · nsym`. `nsym` par y en [2, 254].
 pub fn parity(data: &[u8], nsym: usize) -> Vec<u8> {

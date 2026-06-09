@@ -132,14 +132,17 @@ impl std::fmt::Debug for PageBuf {
 ///
 /// ```text
 /// 0..8    magic "ARKEION1"      8..12   format_version u32
-/// 12..16  page_size u32         16..20  flags u32 (bit0 = cifrado)
+/// 12..16  page_size u32         16..20  flags u32 (bit0 = cifrado, bit1 = comprimido)
 /// 20..36  file_id [16]          36..52  kdf_salt [16] (reservado, v1 sin KDF)
+/// 52..53  ecc_nsym u8 (M10: bytes de paridad RS por bloque; 0 = sin ECC)
 /// ```
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FileHeader {
     pub flags: u32,
     pub file_id: [u8; 16],
     pub kdf_salt: [u8; 16],
+    /// Bytes de paridad Reed-Solomon por bloque (v2, M10). 0 = sin corrección.
+    pub ecc_nsym: u8,
 }
 
 impl FileHeader {
@@ -150,6 +153,7 @@ impl FileHeader {
         body[16..20].copy_from_slice(&self.flags.to_le_bytes());
         body[20..36].copy_from_slice(&self.file_id);
         body[36..52].copy_from_slice(&self.kdf_salt);
+        body[52] = self.ecc_nsym;
     }
 
     pub fn decode(body: &[u8]) -> Result<FileHeader> {
@@ -172,6 +176,7 @@ impl FileHeader {
             flags: le_u32(body, 16),
             file_id,
             kdf_salt,
+            ecc_nsym: body[52],
         })
     }
 }
@@ -278,6 +283,7 @@ mod tests {
             flags: 0,
             file_id: [7; 16],
             kdf_salt: [9; 16],
+            ecc_nsym: 16,
         };
         let mut body = vec![0u8; BODY_SIZE];
         h.encode_into(&mut body);
@@ -299,6 +305,7 @@ mod tests {
             flags: 0,
             file_id: [0; 16],
             kdf_salt: [0; 16],
+            ecc_nsym: 0,
         };
         let mut body = vec![0u8; BODY_SIZE];
         h.encode_into(&mut body);

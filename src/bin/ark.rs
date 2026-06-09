@@ -98,7 +98,7 @@ fn repl(db: &Database, mut conn: arkeion::Connection, path: &str) {
                 break;
             }
         }
-        let line = line.trim_end();
+        let line = strip_comment(&line).trim_end();
 
         // Meta-comando solo cuando no estamos a media sentencia SQL. Toleramos un
         // `;` final por si el dedo lo añade por costumbre (los meta no lo usan).
@@ -208,16 +208,34 @@ fn meta(db: &Database, conn: &arkeion::Connection, line: &str) -> Action {
             Err(e) => eprintln!("error: {e}"),
         },
         ".scrub" => {
+            // `scrub` es un DIAGNÓSTICO: el ECC corrige al leer (en memoria), pero
+            // un store append-only no reescribe in situ — la reparación durable es
+            // `vacuum` o restaurar de la historia. No sobrevender ("corrige").
             let r = db.scrub();
             println!(
-                "scrub · {} páginas · {} corregidas (bit-rot) · {} rotas",
+                "scrub · {} páginas · {} con bit-rot (corregido al leer, NO persistido → re-vacuum) · {} irrecuperables",
                 r.pages, r.corrected, r.broken
             );
+            if r.corrected > 0 {
+                println!(
+                    "  ⚠ disco degradándose: re-ejecuta `.vacuum` o restaura una versión íntegra"
+                );
+            }
         }
         ".vacuum" => {
-            let ret = match p.next().and_then(|s| s.parse::<u64>().ok()) {
-                Some(n) => Retention::KeepLast(n),
+            // Validar el arg: un `.vacuum xyz` no debe compactar SILENCIOSAMENTE
+            // toda la historia (riesgo de pérdida por typo); sin arg = conserva todo.
+            let ret = match p.next() {
                 None => Retention::KeepAll,
+                Some(s) => match s.parse::<u64>() {
+                    Ok(n) => Retention::KeepLast(n),
+                    Err(_) => {
+                        eprintln!(
+                            "uso: .vacuum [n]  (n = nº de versiones a conservar; sin n = toda)"
+                        );
+                        return Action::Continue;
+                    }
+                },
             };
             match db.vacuum(ret) {
                 Ok(rep) => println!(
@@ -416,6 +434,24 @@ fn plural(n: usize) -> &'static str {
     if n == 1 { "" } else { "s" }
 }
 
+/// Quita un comentario de línea `-- …` (hasta el fin de línea) respetando las
+/// cadenas entre comillas simples, para que el buffering/enrutado por `;` no se
+/// confunda con un comentario al final de una sentencia o en su propia línea.
+fn strip_comment(line: &str) -> &str {
+    let b = line.as_bytes();
+    let mut in_str = false;
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'\'' => in_str = !in_str,
+            b'-' if !in_str && b.get(i + 1) == Some(&b'-') => return &line[..i],
+            _ => {}
+        }
+        i += 1;
+    }
+    line
+}
+
 fn epoch(t: std::time::SystemTime) -> u64 {
     t.duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs())
@@ -466,9 +502,9 @@ fn help() {
          \x20 .branch <n> [v]         crea la rama n (desde v o head)\n\
          \x20 .checkout <rama>        cambia a una rama\n\
          \x20 .merge <orig> <dest>    fusiona orig en dest\n\
-         \x20 .verify                 verifica la cadena de auditoría\n\
-         \x20 .scrub                  barrido de integridad (corrige bit-rot ECC)\n\
-         \x20 .vacuum [n]             compacta (KeepLast n, o todo)\n\
+         \x20 .verify                 verifica la cadena de auditoría (la historia presente)\n\
+         \x20 .scrub                  diagnóstico de integridad (detecta bit-rot; reparar = vacuum/restaurar)\n\
+         \x20 .vacuum [n]             compacta (conserva n versiones, o todas)\n\
          \x20 .help   .quit\n\
          SQL: cualquier sentencia terminada en ';'."
     );

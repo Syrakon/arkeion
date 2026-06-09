@@ -464,7 +464,16 @@ impl Store {
     /// Cambios introducidos por un commit concreto (post-M9): el "git show" de
     /// la versión `version` (equivale a `diff_versions(version-1, version)`).
     pub fn changes(&self, version: u64) -> Result<Vec<btree::KeyDiff>> {
-        self.diff_versions(version.saturating_sub(1), version)
+        // El delta de un commit es contra su **padre registrado**, no contra el
+        // predecesor numérico `version-1`: en merges y puntos de bifurcación
+        // `version-1` no es el padre, y diffear contra él inventa borrados/oculta
+        // inserts (procedencia falsa en una herramienta de auditoría).
+        let (pager, head) = {
+            let st = self.lock();
+            (st.pager.clone(), st.head.clone())
+        };
+        let parent = read_parent_version(&pager, head.meta_root, version)?;
+        self.diff_versions(parent, version)
     }
 
     /// Diferencias del árbol de datos entre dos **versiones** (post-M9): el "git

@@ -551,10 +551,17 @@ fn insert_values(
         .map(|e| eval_const(e, params))
         .collect::<Result<_>>()?;
     match columns {
-        // Posicional: las columnas finales ausentes toman DEFAULT en catalog.
+        // Posicional (sin lista de columnas): hay que dar un valor por **cada**
+        // columna, ni más ni menos (como SQLite). Aceptar de menos rellenaría
+        // columnas con NULL que el usuario no escribió — para nombrar un
+        // subconjunto está la forma `INSERT … (col, …) VALUES …`.
         None => {
-            if values.len() > def.columns.len() {
-                return Err(sql_err("más valores que columnas"));
+            if values.len() != def.columns.len() {
+                return Err(sql_err(format!(
+                    "la tabla tiene {} columnas pero se dieron {} valores",
+                    def.columns.len(),
+                    values.len()
+                )));
             }
             Ok(values)
         }

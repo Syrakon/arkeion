@@ -33,6 +33,7 @@ pub fn parse_full(sql: &str) -> Result<(Stmt, Vec<String>)> {
         end: sql.len(),
         param_names: Vec::new(),
         positional_seen: false,
+        depth: 0,
     };
     let stmt = p.statement()?;
     p.eat(&Tok::Semi);
@@ -58,7 +59,16 @@ struct Parser {
     param_names: Vec<String>,
     /// `true` si se ha visto algún `?N`: no se mezcla con `:nombre`.
     positional_seen: bool,
+    /// Profundidad de anidamiento de expresiones en curso. El parser es de
+    /// descenso recursivo (un marco de pila por nivel de paréntesis/operador), así
+    /// que sin tope una expresión muy anidada desbordaría la pila y **abortaría el
+    /// proceso** — inaceptable en un motor embebido que prohíbe `unsafe`. Se acota.
+    depth: usize,
 }
+
+/// Tope de anidamiento de expresiones (paréntesis/operadores). Holgado para SQL
+/// humano, muy por debajo del desbordamiento de pila.
+const MAX_EXPR_DEPTH: usize = 256;
 
 impl Parser {
     fn peek_spanned(&self) -> Option<&Spanned> {
@@ -537,7 +547,15 @@ impl Parser {
     // --- expresiones ---
 
     fn expr(&mut self) -> Result<Expr> {
-        self.or_expr()
+        // Cada nivel de anidamiento (paréntesis) reentra por aquí: acota la pila.
+        self.depth += 1;
+        if self.depth > MAX_EXPR_DEPTH {
+            self.depth -= 1;
+            return Err(err_at(self.pos(), "expresión demasiado anidada"));
+        }
+        let r = self.or_expr();
+        self.depth -= 1;
+        r
     }
 
     fn or_expr(&mut self) -> Result<Expr> {

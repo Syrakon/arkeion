@@ -17,7 +17,9 @@
 use std::io::{self, BufRead, IsTerminal, Write};
 
 use arkeion::catalog::TableDef;
-use arkeion::{AsOf, ChangeKind, Database, Diff, Key, MergePolicy, Options, Retention, Value};
+use arkeion::{
+    AsOf, AuditAnchor, ChangeKind, Database, Diff, Key, MergePolicy, Options, Retention, Value,
+};
 
 fn main() {
     let mut args = std::env::args().skip(1);
@@ -197,14 +199,50 @@ fn meta(db: &Database, conn: &arkeion::Connection, line: &str) -> Action {
             }),
             Err(e) => eprintln!("error: {e}"),
         },
-        ".verify" => match db.verify() {
-            Ok(rep) => println!(
-                "cadena {} · {} commits · head v{} · hash {}…",
-                if rep.chain_ok { "OK ✓" } else { "ROTA ✗" },
-                rep.commits,
-                rep.head,
-                hex8(&rep.chain_hash),
-            ),
+        ".verify" => match (p.next(), p.next()) {
+            // Con `<versión> <hash>`: verifica contra un ANCLA previa. Esto sí
+            // detecta un rollback/truncado (un `.verify` pelado solo valida la
+            // cadena que EXISTE, que tras un truncado es una cadena más corta y
+            // válida — usa `.anchor` para capturar un ancla y guardarla aparte).
+            (Some(vs), Some(hs)) => match (vs.parse::<u64>(), parse_hash(hs)) {
+                (Ok(v), Some(chain_hash)) => {
+                    let anchor = AuditAnchor {
+                        version: v,
+                        chain_hash,
+                    };
+                    match db.verify_anchor(&anchor) {
+                        Ok(rep) => println!(
+                            "ancla v{v}: cadena OK ✓ — sin rollback (head v{})",
+                            rep.head
+                        ),
+                        Err(e) => eprintln!(
+                            "ancla v{v} NO casa: {e}  ← rollback / truncado / reescritura de la historia"
+                        ),
+                    }
+                }
+                _ => eprintln!("uso: .verify [<versión> <hash-hex-64>]"),
+            },
+            _ => match db.verify() {
+                Ok(rep) => println!(
+                    "cadena {} · {} commits · head v{} · hash {}…",
+                    if rep.chain_ok { "OK ✓" } else { "ROTA ✗" },
+                    rep.commits,
+                    rep.head,
+                    hex8(&rep.chain_hash),
+                ),
+                Err(e) => eprintln!("error: {e}"),
+            },
+        },
+        ".anchor" => match db.verify() {
+            Ok(rep) => {
+                let a = rep.anchor();
+                println!("ancla  v{}  {}", a.version, hex_full(&a.chain_hash));
+                println!(
+                    "  (guárdala aparte; luego `.verify {} {}` delata un rollback/truncado)",
+                    a.version,
+                    hex_full(&a.chain_hash)
+                );
+            }
             Err(e) => eprintln!("error: {e}"),
         },
         ".scrub" => {
@@ -463,7 +501,8 @@ fn hex8(h: &[u8; 32]) -> String {
     h[..4].iter().map(|b| format!("{b:02x}")).collect()
 }
 
-fn parse_key(h: &str) -> Option<Key> {
+/// 64 dígitos hex → 32 bytes (clave o hash de ancla).
+fn parse_hash(h: &str) -> Option<[u8; 32]> {
     if h.len() != 64 {
         return None;
     }
@@ -471,7 +510,15 @@ fn parse_key(h: &str) -> Option<Key> {
     for (i, b) in bytes.iter_mut().enumerate() {
         *b = u8::from_str_radix(h.get(i * 2..i * 2 + 2)?, 16).ok()?;
     }
-    Some(Key::new(bytes))
+    Some(bytes)
+}
+
+fn parse_key(h: &str) -> Option<Key> {
+    parse_hash(h).map(Key::new)
+}
+
+fn hex_full(h: &[u8; 32]) -> String {
+    h.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 fn usage() {
@@ -505,6 +552,8 @@ fn help() {
          \x20 .checkout <rama>        cambia a una rama\n\
          \x20 .merge <orig> <dest>    fusiona orig en dest\n\
          \x20 .verify                 verifica la cadena de auditoría (la historia presente)\n\
+         \x20 .anchor                 captura un ancla (versión+hash) para detectar rollbacks luego\n\
+         \x20 .verify <v> <hash>      verifica contra un ancla previa (delata truncado/reescritura)\n\
          \x20 .scrub                  diagnóstico de integridad (detecta bit-rot; reparar = vacuum/restaurar)\n\
          \x20 .vacuum [n]             compacta (conserva n versiones, o todas)\n\
          \x20 .help   .quit\n\

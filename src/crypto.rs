@@ -9,7 +9,7 @@ use sha2::{Digest, Sha256};
 use zeroize::Zeroize;
 
 use crate::error::{Error, Result};
-use crate::format::{NONCE_LEN, PageBuf, PageId, TAG_LEN};
+use crate::format::{BODY_SIZE, CRYPTO_RESERVE, NONCE_LEN, PAGE_SIZE, PageBuf, PageId, TAG_LEN};
 
 /// Clave de cifrado cruda de 32 bytes (AES-256). El KDF queda **fuera** del
 /// motor (D7): el llamador entrega los 32 B ya derivados desde su keystore. Se
@@ -41,16 +41,40 @@ impl std::fmt::Debug for Key {
 
 /// Transforma páginas en el borde del disco. En caché y en el motor las
 /// páginas viven siempre en claro.
+///
+/// Las primitivas son `seal_bytes`/`open_bytes`, que operan sobre un body en
+/// claro de **longitud arbitraria** y producen/consumen el payload almacenado
+/// `nonce ‖ tag ‖ ciphertext` (M10: páginas de tamaño variable). El sellado va
+/// sobre los bytes **finales**, así que cualquier corrupción —incluida la del
+/// `stored_len` del marco— se detecta antes de descomprimir. `seal`/`open` son
+/// envoltorios para las páginas estructurales de slot fijo (header, meta slots).
 pub trait CryptoProvider: Send + Sync {
-    /// Sella la página antes de escribirla: rellena nonce y tag y, si cifra,
-    /// transforma el body in place. `nonce_counter` es único por escritura
-    /// sellada bajo una misma clave (D6); los proveedores sin cifrado lo ignoran.
-    fn seal(&self, page: &mut PageBuf, page_id: PageId, nonce_counter: u64);
-
-    /// Verifica integridad (y descifra) in place tras leer del disco.
-    /// El tag liga el contenido a su `page_id`: una página recolocada es
+    /// Sella `body` (claro) en el payload almacenado `nonce(12) ‖ tag(16) ‖
+    /// ciphertext(body.len())`. `nonce_counter` es único por escritura sellada
+    /// bajo una misma clave (D6); los proveedores sin cifrado lo ignoran. El tag
+    /// liga el contenido a su `page_id` (AAD): una página recolocada es
     /// corrupción, no datos válidos en el sitio equivocado.
-    fn open(&self, page: &mut PageBuf, page_id: PageId) -> Result<()>;
+    fn seal_bytes(&self, body: &[u8], page_id: PageId, nonce_counter: u64) -> Vec<u8>;
+
+    /// Inverso de `seal_bytes`: verifica (y descifra) `stored`
+    /// (`nonce ‖ tag ‖ ciphertext`) y devuelve el body en claro. `Corrupt` si el
+    /// registro es más corto que la reserva cripto o el tag no valida.
+    fn open_bytes(&self, stored: &[u8], page_id: PageId) -> Result<Vec<u8>>;
+
+    /// Sella una página estructural de slot fijo in place (header, meta).
+    fn seal(&self, page: &mut PageBuf, page_id: PageId, nonce_counter: u64) {
+        let stored = self.seal_bytes(page.body(), page_id, nonce_counter);
+        debug_assert_eq!(stored.len(), PAGE_SIZE, "página sellada de tamaño fijo");
+        page.as_bytes_mut().copy_from_slice(&stored);
+    }
+
+    /// Verifica (y descifra) una página estructural de slot fijo in place.
+    fn open(&self, page: &mut PageBuf, page_id: PageId) -> Result<()> {
+        let body = self.open_bytes(page.as_bytes(), page_id)?;
+        debug_assert_eq!(body.len(), BODY_SIZE, "body estructural de tamaño fijo");
+        page.body_mut().copy_from_slice(&body);
+        Ok(())
+    }
 }
 
 /// Modo sin cifrado: integridad por SHA-256 truncado a 16 bytes sobre
@@ -70,27 +94,45 @@ fn plain_tag(page_id: PageId, body: &[u8]) -> [u8; TAG_LEN] {
 }
 
 impl CryptoProvider for PlainProvider {
-    fn seal(&self, page: &mut PageBuf, page_id: PageId, _nonce_counter: u64) {
-        page.nonce_mut().fill(0);
-        let tag = plain_tag(page_id, page.body());
-        page.tag_mut().copy_from_slice(&tag);
+    fn seal_bytes(&self, body: &[u8], page_id: PageId, _nonce_counter: u64) -> Vec<u8> {
+        let mut out = Vec::with_capacity(CRYPTO_RESERVE + body.len());
+        out.extend_from_slice(&[0u8; NONCE_LEN]); // nonce a ceros sin cifrado
+        out.extend_from_slice(&plain_tag(page_id, body));
+        out.extend_from_slice(body); // "ciphertext" = body en claro
+        out
     }
 
-    fn open(&self, page: &mut PageBuf, page_id: PageId) -> Result<()> {
-        if page.nonce().iter().any(|&b| b != 0) {
+    fn open_bytes(&self, stored: &[u8], page_id: PageId) -> Result<Vec<u8>> {
+        let (nonce, tag, body) = split_stored(stored, page_id)?;
+        if nonce.iter().any(|&b| b != 0) {
             return Err(Error::Corrupt {
                 page: page_id.0,
                 reason: "nonce no nulo sin cifrado",
             });
         }
-        if page.tag() != plain_tag(page_id, page.body()) {
+        if tag != plain_tag(page_id, body).as_slice() {
             return Err(Error::Corrupt {
                 page: page_id.0,
                 reason: "tag de integridad inválido",
             });
         }
-        Ok(())
+        Ok(body.to_vec())
     }
+}
+
+/// Parte un payload almacenado en `(nonce, tag, ciphertext)`. `Corrupt` si no
+/// alcanza siquiera la reserva criptográfica (marco truncado o `stored_len`
+/// manipulado a un valor demasiado pequeño).
+fn split_stored(stored: &[u8], page_id: PageId) -> Result<(&[u8], &[u8], &[u8])> {
+    if stored.len() < CRYPTO_RESERVE {
+        return Err(Error::Corrupt {
+            page: page_id.0,
+            reason: "registro más corto que la reserva criptográfica",
+        });
+    }
+    let (nonce, rest) = stored.split_at(NONCE_LEN);
+    let (tag, ct) = rest.split_at(TAG_LEN);
+    Ok((nonce, tag, ct))
 }
 
 /// Cifrado en reposo con AES-256-GCM por página (D6). El nonce de 96 bits es el
@@ -121,36 +163,37 @@ impl Aes256GcmProvider {
 }
 
 impl CryptoProvider for Aes256GcmProvider {
-    fn seal(&self, page: &mut PageBuf, page_id: PageId, nonce_counter: u64) {
+    fn seal_bytes(&self, body: &[u8], page_id: PageId, nonce_counter: u64) -> Vec<u8> {
         let nonce = Self::nonce_bytes(nonce_counter);
         let aad = page_id.0.to_le_bytes();
+        let mut ct = body.to_vec();
         let tag = self
             .cipher
-            .encrypt_in_place_detached(Nonce::from_slice(&nonce), &aad, page.body_mut())
-            .expect("AES-GCM no falla cifrando un body de tamaño fijo");
-        page.nonce_mut().copy_from_slice(&nonce);
-        page.tag_mut().copy_from_slice(&tag);
+            .encrypt_in_place_detached(Nonce::from_slice(&nonce), &aad, &mut ct)
+            .expect("AES-GCM no falla cifrando un body en RAM");
+        let mut out = Vec::with_capacity(CRYPTO_RESERVE + body.len());
+        out.extend_from_slice(&nonce);
+        out.extend_from_slice(&tag);
+        out.extend_from_slice(&ct);
+        out
     }
 
-    fn open(&self, page: &mut PageBuf, page_id: PageId) -> Result<()> {
-        // Copiar nonce y tag antes del préstamo mutable del body.
-        let mut nonce = [0u8; NONCE_LEN];
-        nonce.copy_from_slice(page.nonce());
-        let mut tag = [0u8; TAG_LEN];
-        tag.copy_from_slice(page.tag());
+    fn open_bytes(&self, stored: &[u8], page_id: PageId) -> Result<Vec<u8>> {
+        let (nonce, tag, ct) = split_stored(stored, page_id)?;
         let aad = page_id.0.to_le_bytes();
-
+        let mut body = ct.to_vec();
         self.cipher
             .decrypt_in_place_detached(
-                Nonce::from_slice(&nonce),
+                Nonce::from_slice(nonce),
                 &aad,
-                page.body_mut(),
-                Tag::from_slice(&tag),
+                &mut body,
+                Tag::from_slice(tag),
             )
             .map_err(|_| Error::Corrupt {
                 page: page_id.0,
                 reason: "fallo de autenticación AES-GCM",
-            })
+            })?;
+        Ok(body)
     }
 }
 
@@ -278,5 +321,107 @@ mod tests {
             !a.as_bytes().windows(needle.len()).any(|w| w == needle),
             "el plaintext aflora en la página cifrada"
         );
+    }
+
+    // --- primitivas de longitud variable (M10) ---
+
+    /// Bodies de longitudes representativas: vacío, 1, mediano y el body completo
+    /// de una página de slot fijo.
+    fn bodies() -> Vec<Vec<u8>> {
+        [0usize, 1, 100, BODY_SIZE]
+            .into_iter()
+            .map(|n| (0..n).map(|i| (i * 7 % 256) as u8).collect())
+            .collect()
+    }
+
+    fn providers() -> Vec<(Box<dyn CryptoProvider>, &'static str)> {
+        vec![
+            (Box::new(PlainProvider), "plain"),
+            (Box::new(Aes256GcmProvider::new(&key_of(0x6B))), "aes"),
+        ]
+    }
+
+    #[test]
+    fn bytes_roundtrip_any_length() {
+        for (p, name) in providers() {
+            for body in bodies() {
+                let stored = p.seal_bytes(&body, PageId(9), 4);
+                assert_eq!(
+                    stored.len(),
+                    CRYPTO_RESERVE + body.len(),
+                    "{name}: payload = reserva + body"
+                );
+                let opened = p.open_bytes(&stored, PageId(9)).unwrap();
+                assert_eq!(opened, body, "{name}: round-trip de {} B", body.len());
+            }
+        }
+    }
+
+    #[test]
+    fn bytes_detects_flip_of_any_byte() {
+        for (p, name) in providers() {
+            let body: Vec<u8> = (0..200).map(|i| i as u8).collect();
+            let reference = p.seal_bytes(&body, PageId(11), 7);
+            for i in 0..reference.len() {
+                let mut bad = reference.clone();
+                bad[i] ^= 0x01;
+                assert!(
+                    p.open_bytes(&bad, PageId(11)).is_err(),
+                    "{name}: flip del byte {i} no detectado"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn bytes_detects_relocation() {
+        for (p, name) in providers() {
+            let stored = p.seal_bytes(b"contenido", PageId(5), 1);
+            assert!(
+                matches!(
+                    p.open_bytes(&stored, PageId(6)),
+                    Err(Error::Corrupt { page: 6, .. })
+                ),
+                "{name}: abrir en otra posición debe fallar"
+            );
+        }
+    }
+
+    #[test]
+    fn bytes_rejects_record_shorter_than_reserve() {
+        for (p, name) in providers() {
+            let stored = vec![0u8; CRYPTO_RESERVE - 1];
+            assert!(
+                matches!(
+                    p.open_bytes(&stored, PageId(3)),
+                    Err(Error::Corrupt { page: 3, .. })
+                ),
+                "{name}: un marco truncado debe fallar limpio"
+            );
+        }
+    }
+
+    /// El camino `PageBuf` (slot fijo) es exactamente `seal_bytes` sobre el body:
+    /// prueba que reexpresarlo no cambió un solo byte en disco.
+    #[test]
+    fn pagebuf_path_matches_seal_bytes() {
+        for (p, name) in providers() {
+            let mut page = PageBuf::zeroed();
+            for (i, b) in page.body_mut().iter_mut().enumerate() {
+                *b = (i % 251) as u8;
+            }
+            let expected = p.seal_bytes(page.body(), PageId(13), 2);
+            p.seal(&mut page, PageId(13), 2);
+            assert_eq!(
+                page.as_bytes().as_slice(),
+                expected,
+                "{name}: PageBuf == seal_bytes"
+            );
+
+            p.open(&mut page, PageId(13)).unwrap();
+            for (i, &b) in page.body().iter().enumerate() {
+                assert_eq!(b, (i % 251) as u8, "{name}: body[{i}] tras open");
+            }
+        }
     }
 }

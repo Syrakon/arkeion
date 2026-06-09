@@ -91,3 +91,109 @@ hardware modesto/edge). Cuidados al implementar la compresión:
   presupuesto de ECC, se **corrige**; fuera del presupuesto, falla limpio (nunca
   dato silenciosamente malo) y se puede volver a una versión íntegra.
 - Compresión tras `trait`, opcional, con backend pure-Rust por defecto.
+
+---
+
+# Plan de implementación
+
+## El muro concreto: la identidad de stride fijo
+
+Hoy `offset_físico(page_id) = page_id · 4096` no es un detalle del pager: es una
+identidad **acoplada en cuatro sitios** que hay que romper a la vez.
+
+1. `pager.read_page(id)` / `write_reserved_page(id)` leen/escriben exactamente
+   `PAGE_SIZE` bytes en `id.byte_offset()`.
+2. **Recuperación** (`commit::recover`): salta al head por el meta slot y escanea
+   la cola con **stride fijo** (página a página por offset).
+3. **`verify`**: recomputa `content_hash` sobre el rango **físicamente contiguo**
+   `[commit_page − (pages_written−1), commit_page)` — asume páginas de datos
+   contiguas y en orden de id.
+4. `n_pages = byte_len / PAGE_SIZE` y `head.n_pages = commit_page + 1`.
+
+Tamaño variable rompe (1) y por tanto (2)–(4). La clave que el diseño de arriba no
+aterriza es **cómo camina la recuperación sin stride fijo**.
+
+## Lo que cae solo de los invariantes del motor
+
+Dos garantías que Arkeion **ya** tiene hacen el cambio mucho menor de lo que
+parece:
+
+- **Páginas inmutables + `page_id` append-only** (R2): una entrada del directorio
+  `page_id → (offset, len)` nunca cambia una vez escrita ⇒ el **directorio es
+  append-only**, igual que el resto del archivo.
+- **Las páginas de datos de un commit se escriben en orden de id, contiguas,
+  seguidas de la página de commit** (`publish_commit`). Si se mantiene ese orden
+  físico, el layout sigue siendo *en orden de id* (solo con stride variable):
+  `verify` sigue válido (contiguas físicamente) y la recuperación puede **caminar
+  el log** si cada registro es **auto-delimitado**.
+
+## Layout físico v2
+
+- Páginas estructurales en **slots fijos de 4 KiB** (sin cambios): header (0),
+  meta A (1), meta B (2).
+- Zona append = **log de registros de longitud variable**:
+
+  ```text
+  [u32 LE stored_len][payload sellado: stored_len bytes]
+  payload = nonce(12) ‖ tag(16) ‖ ciphertext(stored_len − 28)
+  ```
+
+  El `ciphertext` cubre el body **en claro recortado** (Slice A: trim de ceros
+  finales; Slice B: comprimido). El logical body sigue siendo `BODY_SIZE`; se
+  rellena con ceros al leer, así que el round-trip y el `content_hash` son
+  idénticos byte-a-byte.
+- **Bump de `FORMAT_VERSION` a 2.** Las DBs v1 (slots fijos) se siguen abriendo por
+  el camino antiguo; las v2 usan el directorio. La cabecera (página 0) lo dice.
+
+### Detección, intacta (principio NO-NEGOCIABLE #1)
+
+El `stored_len` corrupto **ya** lo atrapa el tag: el tag se calcula sobre los
+bytes finales exactos, así que un `len` alterado (mayor o menor) hace leer un
+ciphertext distinto → fallo de autenticación → `Corrupt`, **antes** de
+descomprimir. AAD = `page_id` (como hoy); no hace falta más para la detección. El
+sellado va sobre los bytes **finales** (comprimir → cifrar → sellar): nunca se
+alimenta basura al descompresor.
+
+## Directorio y recuperación (Slice A: barrido al abrir)
+
+`page_id` es **lógico**; el pager mantiene un directorio en memoria
+`Vec<PhysLoc>` indexado por `page_id` (`PhysLoc = { offset: u64, len: u32 }`). En
+v1 se reconstruye al abrir con un **barrido secuencial bufferizado** de la zona
+append: se leen los prefijos de longitud en orden de id, se asignan offsets
+acumulados y, de paso, se localiza el **head** (el último registro de commit
+autoconsistente y bien encadenado). La cola rota = primer registro que no enmarca
+o no abre; el barrido para ahí (truncado lógico, como hoy).
+
+Esto **unifica** `recover` y la construcción del directorio en un solo recorrido y
+conserva las garantías de crash: las páginas de datos preceden a la de commit, así
+que un commit a medio escribir nunca se adopta (el barrido para antes de su página
+de commit), y uno totalmente durable sí (todos sus registros abren).
+
+Coste de apertura: **O(páginas)** (barrido), peor que el O(1)+cola de hoy. Es la
+contrapartida conocida de v1 y se ataca en el **Slice D** con un **directorio
+persistido** (page-table radix o b-tree de `(offset,len)` apuntado por el head):
+O(log n) para resolver y abrir, carga perezosa. No cambia el formato de *datos*,
+solo añade un índice.
+
+## Slicing (cada slice: crate compilando, suite verde, formato versionado)
+
+- **A1 — Sellado de longitud variable en `crypto`.** `seal_bytes`/`open_bytes`
+  (payload `nonce‖tag‖ciphertext` de longitud variable, AAD = `page_id`); reexpresar
+  el `seal`/`open` de `PageBuf` sobre ellos → byte-idéntico. Sin cambio de formato;
+  suite verde. *(Primer incremento, aislado y testeable.)*
+- **A2 — Framing + directorio + pager.** `[u32 len][payload]` en la zona append,
+  directorio en memoria, `read_page`/`write_reserved_page` sobre offsets con trim
+  de ceros. Bump a v2.
+- **A3 — Recuperación por barrido + `verify` sobre offsets.** `recover` como barrido
+  que construye el directorio y halla el prefijo de commits válido; `content_hash`
+  sobre offsets del directorio. Tests de crash/auditoría verdes.
+- **B — Compresor tras `trait`, off por defecto.** `comprimir → cifrar → sellar`,
+  bloque independiente por página, tag de método por página (nunca inflar), backend
+  pure-Rust. El formato ya soporta longitud variable desde A.
+- **C — Presupuesto de estabilidad.** ECC por página + réplicas de lo crítico +
+  scrubbing en `verify` (el NO-NEGOCIABLE; varios sub-slices).
+- **D (si escala mal) — Directorio persistido.** Apertura y resolución O(log n).
+
+`vacuum` no necesita trabajo extra: reescribe replayando por la maquinaria de
+commit (`publish_commit`), así que hereda el framing y el directorio en cuanto A
+está hecho.

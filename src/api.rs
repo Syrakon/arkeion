@@ -597,6 +597,16 @@ impl Connection {
                 .map_or(0, |s| s.version()),
         }
     }
+
+    /// Tablas visibles en esta conexión (introspección de esquema: la usa el CLI
+    /// para `.tables` / `.schema`). Respeta el snapshot histórico si la conexión
+    /// está fijada con [`snapshot`](Connection::snapshot).
+    pub fn tables(&self) -> Result<Vec<crate::catalog::TableDef>> {
+        match &self.pinned {
+            Some(snap) => snap.tables(),
+            None => self.store.snapshot_on(&self.branch)?.tables(),
+        }
+    }
 }
 
 /// Sentencia preparada por [`Connection::prepare`]. Respeta el modo de la

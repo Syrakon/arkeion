@@ -433,6 +433,23 @@ pub fn get_table<S: NodeSource>(src: &S, root: PageId, name: &str) -> Result<Opt
     }
 }
 
+/// Todas las tablas del catálogo, en orden de nombre (escanea `[0x00,0x01,*]`).
+/// Para herramientas que listan el esquema (CLI, introspección).
+pub fn list_tables<S: NodeSource>(src: &S, root: PageId) -> Result<Vec<TableDef>> {
+    let prefix = [KS_CATALOG, CAT_TABLE];
+    let mut out = Vec::new();
+    for item in btree::scan_from(src, root, &prefix)? {
+        let (key, val) = item?;
+        if !key.starts_with(&prefix) {
+            break;
+        }
+        let name = std::str::from_utf8(&key[prefix.len()..])
+            .map_err(|_| Error::CorruptRecord("nombre de tabla no UTF-8"))?;
+        out.push(decode_def(name, &val)?);
+    }
+    Ok(out)
+}
+
 /// Elimina tabla, contador y todas sus filas. `false` si no existía.
 pub fn drop_table<S: NodeStore>(s: &mut S, root: PageId, name: &str) -> Result<(PageId, bool)> {
     let Some(def) = get_table(s, root, name)? else {

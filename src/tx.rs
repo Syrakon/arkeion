@@ -1164,6 +1164,11 @@ impl Snapshot {
         catalog::scan_table(self, self.data_root, table)
     }
 
+    /// Todas las tablas visibles en este snapshot (introspección de esquema).
+    pub fn tables(&self) -> Result<Vec<TableDef>> {
+        catalog::list_tables(self, self.data_root)
+    }
+
     /// rowids cuyas columnas indexadas valen `values` (igualdad, una entrada por
     /// columna del índice), vía el índice.
     pub fn index_lookup(&self, idx: &IndexDef, values: &[Value]) -> Result<Vec<i64>> {

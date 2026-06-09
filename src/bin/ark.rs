@@ -1,0 +1,480 @@
+//! `ark` — shell de línea de comandos para Arkeion, al estilo `sqlite3`.
+//!
+//! Abre un archivo `.arkeion`, ofrece un REPL de SQL y **meta-comandos** (`.`) que
+//! exponen las features propias del motor —historia, time-travel `AS OF`, `verify`
+//! de la cadena de auditoría, ramas/merge, `scrub` y `vacuum`— para ejercitarlo a
+//! mano e ir encontrando rincones que los tests no tocan (dogfooding).
+//!
+//! Sin dependencias nuevas (D8): lee stdin a mano y detecta el terminal con
+//! `std::io::IsTerminal`. En modo no interactivo (pipe) ejecuta el guion y sale.
+//!
+//! ```text
+//! cargo run --bin ark -- mibase.arkeion
+//! cargo run --bin ark -- cifrada.arkeion --key <64-hex>
+//! echo "CREATE TABLE t(id INTEGER PRIMARY KEY); .tables" | cargo run --bin ark -- t.arkeion
+//! ```
+
+use std::io::{self, BufRead, IsTerminal, Write};
+
+use arkeion::catalog::TableDef;
+use arkeion::{AsOf, ChangeKind, Database, Diff, Key, MergePolicy, Options, Retention, Value};
+
+fn main() {
+    let mut args = std::env::args().skip(1);
+    let mut path: Option<String> = None;
+    let mut opts = Options::default();
+    while let Some(a) = args.next() {
+        match a.as_str() {
+            "--compress" => opts = opts.compress(true),
+            "--no-create" => opts = opts.create_if_missing(false),
+            "--ecc" => match args.next().and_then(|s| s.parse::<u8>().ok()) {
+                Some(n) => opts = opts.ecc(n),
+                None => fail("--ecc requiere un número (símbolos de paridad)"),
+            },
+            "--key" => match args.next().as_deref().and_then(parse_key) {
+                Some(k) => opts = opts.key(k),
+                None => fail("--key requiere 64 dígitos hex (clave de 32 bytes)"),
+            },
+            "-h" | "--help" => {
+                usage();
+                return;
+            }
+            other if !other.starts_with('-') && path.is_none() => path = Some(other.into()),
+            other => fail(&format!("argumento desconocido: {other}")),
+        }
+    }
+    let Some(path) = path else {
+        usage();
+        std::process::exit(2);
+    };
+
+    let db = match Database::open(&path, opts) {
+        Ok(db) => db,
+        Err(e) => {
+            eprintln!("no se pudo abrir '{path}': {e}");
+            std::process::exit(1);
+        }
+    };
+    let conn = match db.connect() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("error: {e}");
+            std::process::exit(1);
+        }
+    };
+    repl(&db, conn, &path);
+}
+
+/// Lo que un meta-comando le pide al bucle: seguir, salir, o cambiar de conexión
+/// (rama / snapshot histórico / volver a la cabeza).
+enum Action {
+    Continue,
+    Quit,
+    Swap(Box<arkeion::Connection>),
+}
+
+fn repl(db: &Database, mut conn: arkeion::Connection, path: &str) {
+    let interactive = io::stdin().is_terminal();
+    if interactive {
+        println!(
+            "Arkeion · ark shell — '{path}' (v{}). `.help` para los comandos.",
+            conn.version()
+        );
+    }
+    let stdin = io::stdin();
+    let mut input = stdin.lock();
+    let mut sql = String::new();
+    loop {
+        if interactive {
+            print!("{}", if sql.is_empty() { "ark> " } else { "...> " });
+            io::stdout().flush().ok();
+        }
+        let mut line = String::new();
+        match input.read_line(&mut line) {
+            Ok(0) => break, // EOF / Ctrl-D
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!("error de lectura: {e}");
+                break;
+            }
+        }
+        let line = line.trim_end();
+
+        // Meta-comando solo cuando no estamos a media sentencia SQL. Toleramos un
+        // `;` final por si el dedo lo añade por costumbre (los meta no lo usan).
+        if sql.is_empty() && line.trim_start().starts_with('.') {
+            match meta(db, &conn, line.trim().trim_end_matches(';').trim_end()) {
+                Action::Quit => break,
+                Action::Continue => {}
+                Action::Swap(c) => conn = *c,
+            }
+            continue;
+        }
+        if sql.is_empty() && line.trim().is_empty() {
+            continue;
+        }
+        sql.push_str(line);
+        sql.push('\n');
+        if line.trim_end().ends_with(';') {
+            let stmt = sql.trim().trim_end_matches(';').trim().to_string();
+            sql.clear();
+            if !stmt.is_empty() {
+                run_sql(&conn, &stmt);
+            }
+        }
+    }
+}
+
+/// Ejecuta una sentencia: `SELECT`/`VALUES` por `query` (imprime tabla), el resto
+/// por `execute` (imprime filas afectadas).
+fn run_sql(conn: &arkeion::Connection, sql: &str) {
+    let first = sql
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if first == "select" || first == "values" {
+        let rows = match conn.query(sql, &[]) {
+            Ok(r) => r,
+            Err(e) => return eprintln!("error: {e}"),
+        };
+        let cols: Vec<String> = rows.columns().to_vec();
+        let n = cols.len();
+        let mut data: Vec<Vec<String>> = Vec::new();
+        for r in rows {
+            let row = match r {
+                Ok(row) => row,
+                Err(e) => return eprintln!("error: {e}"),
+            };
+            let mut cells = Vec::with_capacity(n);
+            for i in 0..n {
+                match row.get::<Value>(i) {
+                    Ok(v) => cells.push(show(&v)),
+                    Err(e) => return eprintln!("error: {e}"),
+                }
+            }
+            data.push(cells);
+        }
+        print_table(&cols, &data);
+    } else {
+        match conn.execute(sql, &[]) {
+            Ok(n) => println!("OK · {n} fila{}", plural(n)),
+            Err(e) => eprintln!("error: {e}"),
+        }
+    }
+}
+
+fn meta(db: &Database, conn: &arkeion::Connection, line: &str) -> Action {
+    let mut p = line.split_whitespace();
+    let cmd = p.next().unwrap_or("");
+    match cmd {
+        ".quit" | ".exit" | ".q" => return Action::Quit,
+        ".help" | ".h" => help(),
+        ".tables" => match conn.tables() {
+            Ok(ts) if ts.is_empty() => println!("(sin tablas)"),
+            Ok(ts) => ts.iter().for_each(|t| println!("{}", t.name)),
+            Err(e) => eprintln!("error: {e}"),
+        },
+        ".schema" => {
+            let only = p.next();
+            match conn.tables() {
+                Ok(ts) => ts
+                    .iter()
+                    .filter(|t| only.is_none_or(|n| n == t.name))
+                    .for_each(print_schema),
+                Err(e) => eprintln!("error: {e}"),
+            }
+        }
+        ".version" | ".v" => println!("v{}", conn.version()),
+        ".history" | ".log" => match db.history() {
+            Ok(revs) => revs.iter().for_each(|r| {
+                println!(
+                    "v{:<5} padre v{:<5} ts={}",
+                    r.version,
+                    r.parent,
+                    epoch(r.timestamp)
+                );
+            }),
+            Err(e) => eprintln!("error: {e}"),
+        },
+        ".verify" => match db.verify() {
+            Ok(rep) => println!(
+                "cadena {} · {} commits · head v{} · hash {}…",
+                if rep.chain_ok { "OK ✓" } else { "ROTA ✗" },
+                rep.commits,
+                rep.head,
+                hex8(&rep.chain_hash),
+            ),
+            Err(e) => eprintln!("error: {e}"),
+        },
+        ".scrub" => {
+            let r = db.scrub();
+            println!(
+                "scrub · {} páginas · {} corregidas (bit-rot) · {} rotas",
+                r.pages, r.corrected, r.broken
+            );
+        }
+        ".vacuum" => {
+            let ret = match p.next().and_then(|s| s.parse::<u64>().ok()) {
+                Some(n) => Retention::KeepLast(n),
+                None => Retention::KeepAll,
+            };
+            match db.vacuum(ret) {
+                Ok(rep) => println!(
+                    "vacuum · head v{} · conservadas desde v{} · {} compactadas",
+                    rep.head, rep.kept_from, rep.reclaimed_versions
+                ),
+                Err(e) => eprintln!("error: {e}"),
+            }
+        }
+        ".branches" => match db.branches() {
+            Ok(bs) => bs
+                .iter()
+                .for_each(|b| println!("{:<20} → v{}", b.name, b.head)),
+            Err(e) => eprintln!("error: {e}"),
+        },
+        ".branch" => match p.next() {
+            Some(name) => {
+                let from = p.next().and_then(|s| s.parse::<u64>().ok());
+                let asof = from.map_or(AsOf::Head, AsOf::Version);
+                match db.create_branch(name, asof) {
+                    Ok(()) => println!("rama '{name}' creada"),
+                    Err(e) => eprintln!("error: {e}"),
+                }
+            }
+            None => eprintln!("uso: .branch <nombre> [versión-origen]"),
+        },
+        ".checkout" | ".use" => match p.next() {
+            Some(name) => match db.connect_branch(name) {
+                Ok(c) => {
+                    println!("en rama '{name}' (v{})", c.version());
+                    return Action::Swap(Box::new(c));
+                }
+                Err(e) => eprintln!("error: {e}"),
+            },
+            None => eprintln!("uso: .checkout <rama>"),
+        },
+        ".merge" => match (p.next(), p.next()) {
+            (Some(from), Some(into)) => match db.merge(from, into, MergePolicy::FailOnConflict) {
+                Ok(rep) => println!(
+                    "merge '{from}' → '{into}' · {} cambios aplicados · v{}",
+                    rep.applied, rep.version
+                ),
+                Err(e) => eprintln!("error: {e}"),
+            },
+            _ => eprintln!("uso: .merge <origen> <destino>"),
+        },
+        ".changes" => match p.next().and_then(|s| s.parse::<u64>().ok()) {
+            Some(v) => match db.changes(v) {
+                Ok(d) => print_diff(&d),
+                Err(e) => eprintln!("error: {e}"),
+            },
+            None => eprintln!("uso: .changes <versión>  (qué cambió ESA versión)"),
+        },
+        ".diff" => match (
+            p.next().and_then(|s| s.parse::<u64>().ok()),
+            p.next().and_then(|s| s.parse::<u64>().ok()),
+        ) {
+            (Some(a), Some(b)) => match db.diff_versions(a, b) {
+                Ok(d) => print_diff(&d),
+                Err(e) => eprintln!("error: {e}"),
+            },
+            _ => eprintln!("uso: .diff <v1> <v2>"),
+        },
+        ".asof" => match p.next().and_then(|s| s.parse::<u64>().ok()) {
+            Some(v) => match conn.snapshot(AsOf::Version(v)) {
+                Ok(c) => {
+                    println!("snapshot AS OF v{v} (solo lectura; `.live` para volver)");
+                    return Action::Swap(Box::new(c));
+                }
+                Err(e) => eprintln!("error: {e}"),
+            },
+            None => eprintln!("uso: .asof <versión>"),
+        },
+        ".live" | ".head" => match db.connect() {
+            Ok(c) => {
+                println!("conexión en vivo (head v{})", c.version());
+                return Action::Swap(Box::new(c));
+            }
+            Err(e) => eprintln!("error: {e}"),
+        },
+        other => eprintln!("comando desconocido: {other}  (.help para la lista)"),
+    }
+    Action::Continue
+}
+
+// --- presentación ---
+
+fn show(v: &Value) -> String {
+    match v {
+        Value::Null => "NULL".into(),
+        Value::Integer(n) => n.to_string(),
+        Value::Real(f) => f.to_string(),
+        Value::Bool(b) => b.to_string(),
+        Value::Text(s) => s.clone(),
+        Value::Blob(b) => format!(
+            "x'{}'",
+            b.iter().map(|x| format!("{x:02x}")).collect::<String>()
+        ),
+    }
+}
+
+fn print_table(cols: &[String], rows: &[Vec<String>]) {
+    let mut w: Vec<usize> = cols.iter().map(|c| c.chars().count()).collect();
+    for r in rows {
+        for (i, c) in r.iter().enumerate() {
+            w[i] = w[i].max(c.chars().count());
+        }
+    }
+    let join = |cells: &[String]| -> String {
+        cells
+            .iter()
+            .enumerate()
+            .map(|(i, c)| pad(c, w[i]))
+            .collect::<Vec<_>>()
+            .join("  ")
+    };
+    println!("{}", join(cols));
+    println!(
+        "{}",
+        w.iter()
+            .map(|x| "-".repeat(*x))
+            .collect::<Vec<_>>()
+            .join("  ")
+    );
+    rows.iter().for_each(|r| println!("{}", join(r)));
+    println!("({} fila{})", rows.len(), plural(rows.len()));
+}
+
+fn pad(s: &str, w: usize) -> String {
+    let n = s.chars().count();
+    if n >= w {
+        s.to_string()
+    } else {
+        format!("{s}{}", " ".repeat(w - n))
+    }
+}
+
+fn print_schema(t: &TableDef) {
+    let cols: Vec<String> = t
+        .columns
+        .iter()
+        .map(|c| {
+            let mut s = format!("{} {}", c.name, c.col_type.name());
+            if Some(c) == t.rowid_alias.and_then(|i| t.columns.get(i)) {
+                s.push_str(" PRIMARY KEY");
+            } else if c.not_null {
+                s.push_str(" NOT NULL");
+            }
+            s
+        })
+        .collect();
+    println!("CREATE TABLE {} ({});", t.name, cols.join(", "));
+    for idx in &t.indexes {
+        let names: Vec<&str> = idx
+            .columns
+            .iter()
+            .map(|&i| t.columns[i].name.as_str())
+            .collect();
+        println!(
+            "  CREATE {}INDEX {} ON {} ({});",
+            if idx.unique { "UNIQUE " } else { "" },
+            idx.name,
+            t.name,
+            names.join(", ")
+        );
+    }
+}
+
+fn print_diff(d: &Diff) {
+    if d.is_empty() {
+        return println!("(sin cambios)");
+    }
+    for s in &d.schema {
+        println!("  {} tabla {}", mark(s.kind), s.table);
+    }
+    for r in &d.rows {
+        println!(
+            "  {} fila  tabla#{} rowid {}",
+            mark(r.kind),
+            r.table_id,
+            r.rowid
+        );
+    }
+    println!("— {} de esquema, {} de filas", d.schema.len(), d.rows.len());
+}
+
+fn mark(k: ChangeKind) -> char {
+    match k {
+        ChangeKind::Added => '+',
+        ChangeKind::Removed => '-',
+        ChangeKind::Modified => '~',
+    }
+}
+
+fn plural(n: usize) -> &'static str {
+    if n == 1 { "" } else { "s" }
+}
+
+fn epoch(t: std::time::SystemTime) -> u64 {
+    t.duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+fn hex8(h: &[u8; 32]) -> String {
+    h[..4].iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn parse_key(h: &str) -> Option<Key> {
+    if h.len() != 64 {
+        return None;
+    }
+    let mut bytes = [0u8; 32];
+    for (i, b) in bytes.iter_mut().enumerate() {
+        *b = u8::from_str_radix(h.get(i * 2..i * 2 + 2)?, 16).ok()?;
+    }
+    Some(Key::new(bytes))
+}
+
+fn usage() {
+    eprintln!(
+        "ark — shell de Arkeion\n\
+         \n\
+         uso: ark <archivo.arkeion> [opciones]\n\
+         opciones:\n\
+         \x20 --compress       activa la compresión de página (al crear)\n\
+         \x20 --ecc <n>        Reed-Solomon con n símbolos de paridad (al crear)\n\
+         \x20 --key <64-hex>   cifrado AES-256-GCM con clave de 32 bytes en hex\n\
+         \x20 --no-create      no crear el archivo si no existe\n\
+         \n\
+         dentro: SQL terminado en ';', o meta-comandos (.help)."
+    );
+}
+
+fn help() {
+    println!(
+        "Meta-comandos:\n\
+         \x20 .tables                 lista las tablas\n\
+         \x20 .schema [tabla]         muestra el esquema (CREATE …)\n\
+         \x20 .version                versión (commit) actual\n\
+         \x20 .history                línea temporal de versiones (git log de datos)\n\
+         \x20 .changes <v>            qué cambió la versión v\n\
+         \x20 .diff <v1> <v2>         diferencias entre dos versiones\n\
+         \x20 .asof <v>               vista de solo lectura AS OF la versión v\n\
+         \x20 .live                   vuelve a la cabeza (en vivo)\n\
+         \x20 .branches               lista las ramas\n\
+         \x20 .branch <n> [v]         crea la rama n (desde v o head)\n\
+         \x20 .checkout <rama>        cambia a una rama\n\
+         \x20 .merge <orig> <dest>    fusiona orig en dest\n\
+         \x20 .verify                 verifica la cadena de auditoría\n\
+         \x20 .scrub                  barrido de integridad (corrige bit-rot ECC)\n\
+         \x20 .vacuum [n]             compacta (KeepLast n, o todo)\n\
+         \x20 .help   .quit\n\
+         SQL: cualquier sentencia terminada en ';'."
+    );
+}
+
+fn fail(msg: &str) -> ! {
+    eprintln!("ark: {msg}");
+    std::process::exit(2);
+}

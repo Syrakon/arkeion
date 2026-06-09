@@ -89,6 +89,8 @@ pub mod format;
 #[doc(hidden)]
 pub mod io;
 #[doc(hidden)]
+pub mod keyenc;
+#[doc(hidden)]
 pub mod pager;
 #[doc(hidden)]
 pub mod record;

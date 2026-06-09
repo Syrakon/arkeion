@@ -74,6 +74,47 @@ fn get_u64(page: u64, buf: &[u8], pos: &mut usize) -> Result<u64> {
     ))
 }
 
+// --- array de punteros a celda (v3): búsqueda binaria in-page ---
+//
+// Las celdas se almacenan en orden de clave desde la cabecera (como antes), y un
+// **array de punteros** ordenado por clave crece desde el FINAL del nodo hacia el
+// contenido: `ptr[i]` (el offset de la celda i) ocupa los 2 bytes en
+// `body.len() - 2*(i+1)`. Así `inner_child`/`leaf_seek` hacen búsqueda binaria
+// O(log celdas) en vez de escaneo lineal, y anexar la clave máxima sigue siendo
+// O(1) (celda al final del contenido + puntero en el borde del array, ambos al
+// hueco central). Coste: 2 bytes por celda.
+
+fn cell_ptr(body: &[u8], i: usize) -> usize {
+    let p = body.len() - 2 * (i + 1);
+    u16::from_le_bytes([body[p], body[p + 1]]) as usize
+}
+
+/// Escribe `ptr[i] = off` en el array del final del nodo.
+fn set_cell_ptr(body: &mut [u8], i: usize, off: usize) {
+    let p = body.len() - 2 * (i + 1);
+    body[p..p + 2].copy_from_slice(&(off as u16).to_le_bytes());
+}
+
+/// Clave de una celda interna en `off`: `(clave, pos tras la clave)` (apunta al
+/// `child` u64).
+fn inner_key_at(page: u64, body: &[u8], off: usize) -> Result<(&[u8], usize)> {
+    let mut pos = off;
+    let klen = get_varint(page, body, &mut pos)? as usize;
+    let key = get_slice(page, body, &mut pos, klen)?;
+    Ok((key, pos))
+}
+
+/// Flags + clave de una celda de hoja en `off`: `(flags, clave, pos tras la
+/// clave)` (apunta al payload).
+fn leaf_key_at(page: u64, body: &[u8], off: usize) -> Result<(u8, &[u8], usize)> {
+    let mut pos = off;
+    let flags = *body.get(pos).ok_or(corrupt(page, "celda truncada"))?;
+    pos += 1;
+    let klen = get_varint(page, body, &mut pos)? as usize;
+    let key = get_slice(page, body, &mut pos, klen)?;
+    Ok((flags, key, pos))
+}
+
 // --- tamaños (para decidir splits sin codificar) ---
 
 pub fn leaf_cell_size(c: &LeafCell) -> usize {
@@ -125,35 +166,28 @@ pub fn parse_leaf(page: u64, body: &[u8]) -> Result<Vec<LeafCell>> {
     Ok(cells)
 }
 
-/// `false` si las celdas no caben (el llamador hace split). Si caben, escribe
-/// el nodo completo y rellena el resto con ceros (contenido determinista).
+/// `false` si las celdas (contenido + array de punteros) no caben (el llamador
+/// hace split). Si caben, escribe el nodo completo: cabecera, contenido en orden
+/// de clave, hueco central a ceros y el array de punteros al final (v3). Contenido
+/// determinista (mismo input ⇒ mismos bytes).
 pub fn encode_leaf(cells: &[LeafCell], body: &mut [u8]) -> bool {
-    let mut out = Vec::with_capacity(BODY_SIZE);
-    out.extend_from_slice(&[TYPE_LEAF, 0]);
-    out.extend_from_slice(&(cells.len() as u16).to_le_bytes());
-    for c in cells {
-        match &c.payload {
-            Payload::Inline(v) => {
-                out.push(0);
-                put_varint(&mut out, c.key.len() as u64);
-                out.extend_from_slice(&c.key);
-                put_varint(&mut out, v.len() as u64);
-                out.extend_from_slice(v);
-            }
-            Payload::Overflow { total_len, first } => {
-                out.push(CELL_OVERFLOW_FLAG);
-                put_varint(&mut out, c.key.len() as u64);
-                out.extend_from_slice(&c.key);
-                put_varint(&mut out, *total_len);
-                out.extend_from_slice(&first.0.to_le_bytes());
-            }
-        }
+    let n = cells.len();
+    let content_len: usize = cells.iter().map(leaf_cell_size).sum();
+    let content_end = LEAF_HDR + content_len;
+    if content_end + 2 * n > body.len() {
+        return false; // no caben contenido + punteros ⇒ split
     }
-    if out.len() > body.len() {
-        return false;
+    body[0] = TYPE_LEAF;
+    body[1] = 0;
+    body[2..4].copy_from_slice(&(n as u16).to_le_bytes());
+    let mut off = LEAF_HDR;
+    for (i, c) in cells.iter().enumerate() {
+        set_cell_ptr(body, i, off);
+        off = write_leaf_cell_at(body, off, &c.key, &c.payload);
     }
-    body[..out.len()].copy_from_slice(&out);
-    body[out.len()..].fill(0);
+    debug_assert_eq!(off, content_end);
+    let ptr_start = body.len() - 2 * n;
+    body[content_end..ptr_start].fill(0);
     true
 }
 
@@ -182,20 +216,24 @@ pub fn parse_inner(page: u64, body: &[u8]) -> Result<(Vec<InnerCell>, PageId)> {
 }
 
 pub fn encode_inner(cells: &[InnerCell], rightmost: PageId, body: &mut [u8]) -> bool {
-    let mut out = Vec::with_capacity(BODY_SIZE);
-    out.extend_from_slice(&[TYPE_INNER, 0]);
-    out.extend_from_slice(&(cells.len() as u16).to_le_bytes());
-    out.extend_from_slice(&rightmost.0.to_le_bytes());
-    for c in cells {
-        put_varint(&mut out, c.key.len() as u64);
-        out.extend_from_slice(&c.key);
-        out.extend_from_slice(&c.child.0.to_le_bytes());
-    }
-    if out.len() > body.len() {
+    let n = cells.len();
+    let content_len: usize = cells.iter().map(inner_cell_size).sum();
+    let content_end = INNER_HDR + content_len;
+    if content_end + 2 * n > body.len() {
         return false;
     }
-    body[..out.len()].copy_from_slice(&out);
-    body[out.len()..].fill(0);
+    body[0] = TYPE_INNER;
+    body[1] = 0;
+    body[2..4].copy_from_slice(&(n as u16).to_le_bytes());
+    body[4..12].copy_from_slice(&rightmost.0.to_le_bytes());
+    let mut off = INNER_HDR;
+    for (i, c) in cells.iter().enumerate() {
+        set_cell_ptr(body, i, off);
+        off = write_inner_cell_at(body, off, &c.key, c.child);
+    }
+    debug_assert_eq!(off, content_end);
+    let ptr_start = body.len() - 2 * n;
+    body[content_end..ptr_start].fill(0);
     true
 }
 
@@ -215,21 +253,26 @@ pub fn inner_child(page: u64, body: &[u8], key: &[u8]) -> Result<PageId> {
         return Err(corrupt(page, "se esperaba un nodo interno"));
     }
     let ncells = u16::from_le_bytes([body[2], body[3]]) as usize;
-    let rightmost = PageId(u64::from_le_bytes(
-        body[4..12].try_into().expect("rango fijo de 8 bytes"),
-    ));
-    let mut pos = INNER_HDR;
-    for _ in 0..ncells {
-        let klen = get_varint(page, body, &mut pos)? as usize;
-        let ckey = get_slice(page, body, &mut pos, klen)?;
-        let child = PageId(get_u64(page, body, &mut pos)?);
-        // Primer separador con clave > `key` (cota superior exclusiva): su hijo
-        // cubre `key`. Si ninguno, va al rightmost.
+    let rightmost = inner_rightmost(body);
+    // partition_point por búsqueda binaria: primer separador con clave > `key`
+    // (cota superior exclusiva). Su hijo cubre `key`; si ninguno, va al rightmost.
+    let mut lo = 0;
+    let mut hi = ncells;
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        let (ckey, _) = inner_key_at(page, body, cell_ptr(body, mid))?;
         if ckey > key {
-            return Ok(child);
+            hi = mid;
+        } else {
+            lo = mid + 1;
         }
     }
-    Ok(rightmost)
+    if lo < ncells {
+        let (_, mut pos) = inner_key_at(page, body, cell_ptr(body, lo))?;
+        Ok(PageId(get_u64(page, body, &mut pos)?))
+    } else {
+        Ok(rightmost)
+    }
 }
 
 /// `Some((pos_payload, flags))` con `pos` al inicio del payload de la celda de
@@ -239,16 +282,16 @@ fn leaf_seek(page: u64, body: &[u8], key: &[u8]) -> Result<Option<(usize, u8)>> 
         return Err(corrupt(page, "se esperaba una hoja"));
     }
     let ncells = u16::from_le_bytes([body[2], body[3]]) as usize;
-    let mut pos = LEAF_HDR;
-    for _ in 0..ncells {
-        let flags = *body.get(pos).ok_or(corrupt(page, "celda truncada"))?;
-        pos += 1;
-        let klen = get_varint(page, body, &mut pos)? as usize;
-        let ckey = get_slice(page, body, &mut pos, klen)?;
+    // Búsqueda binaria sobre el array de punteros (claves en orden).
+    let mut lo = 0;
+    let mut hi = ncells;
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        let (flags, ckey, payload_pos) = leaf_key_at(page, body, cell_ptr(body, mid))?;
         match ckey.cmp(key) {
-            std::cmp::Ordering::Equal => return Ok(Some((pos, flags))),
-            std::cmp::Ordering::Greater => return Ok(None), // ordenadas: ya pasamos el punto
-            std::cmp::Ordering::Less => skip_leaf_payload(page, body, &mut pos, flags)?,
+            std::cmp::Ordering::Equal => return Ok(Some((payload_pos, flags))),
+            std::cmp::Ordering::Less => lo = mid + 1,
+            std::cmp::Ordering::Greater => hi = mid,
         }
     }
     Ok(None)
@@ -353,10 +396,12 @@ pub fn leaf_append(
     }
 
     let cell = encode_leaf_cell(key, payload);
-    if end + cell.len() > body.len() {
-        return Ok(None); // no cabe ⇒ camino general (hará split)
+    // La celda nueva y un puntero más deben caber sobre el array del final.
+    if end + cell.len() > body.len() - 2 * (ncells + 1) {
+        return Ok(None); // no caben ⇒ camino general (hará split)
     }
     body[end..end + cell.len()].copy_from_slice(&cell);
+    set_cell_ptr(body, ncells, end); // puntero de la celda nueva (clave máxima)
     body[2..4].copy_from_slice(&((ncells as u16) + 1).to_le_bytes());
     Ok(Some(end + cell.len()))
 }
@@ -369,7 +414,9 @@ pub fn leaf_append(
 pub fn append_inline_at(body: &mut [u8], end: usize, key: &[u8], value: &[u8]) -> Option<usize> {
     let cell_len =
         1 + varint_len(key.len() as u64) + key.len() + varint_len(value.len() as u64) + value.len();
-    if end + cell_len > body.len() {
+    let ncells = u16::from_le_bytes([body[2], body[3]]) as usize;
+    // La celda nueva y un puntero más deben caber sobre el array del final.
+    if end + cell_len > body.len() - 2 * (ncells + 1) {
         return None;
     }
     let mut p = end;
@@ -381,9 +428,49 @@ pub fn append_inline_at(body: &mut [u8], end: usize, key: &[u8], value: &[u8]) -
     p = put_varint_at(body, p, value.len() as u64);
     body[p..p + value.len()].copy_from_slice(value);
     p += value.len();
-    let ncells = u16::from_le_bytes([body[2], body[3]]);
-    body[2..4].copy_from_slice(&(ncells + 1).to_le_bytes());
+    set_cell_ptr(body, ncells, end); // puntero de la celda nueva (clave máxima)
+    body[2..4].copy_from_slice(&((ncells + 1) as u16).to_le_bytes());
     Some(p)
+}
+
+/// Escribe una celda de hoja en `body[off..]` **sin asignar** y devuelve el
+/// offset siguiente. Mismo formato que `encode_leaf_cell`.
+fn write_leaf_cell_at(body: &mut [u8], off: usize, key: &[u8], payload: &Payload) -> usize {
+    let mut p = off;
+    match payload {
+        Payload::Inline(v) => {
+            body[p] = 0;
+            p += 1;
+            p = put_varint_at(body, p, key.len() as u64);
+            body[p..p + key.len()].copy_from_slice(key);
+            p += key.len();
+            p = put_varint_at(body, p, v.len() as u64);
+            body[p..p + v.len()].copy_from_slice(v);
+            p += v.len();
+        }
+        Payload::Overflow { total_len, first } => {
+            body[p] = CELL_OVERFLOW_FLAG;
+            p += 1;
+            p = put_varint_at(body, p, key.len() as u64);
+            body[p..p + key.len()].copy_from_slice(key);
+            p += key.len();
+            p = put_varint_at(body, p, *total_len);
+            body[p..p + 8].copy_from_slice(&first.0.to_le_bytes());
+            p += 8;
+        }
+    }
+    p
+}
+
+/// Escribe una celda interna (`[varint klen][key][child u64]`) en `body[off..]`
+/// sin asignar y devuelve el offset siguiente.
+fn write_inner_cell_at(body: &mut [u8], off: usize, key: &[u8], child: PageId) -> usize {
+    let mut p = off;
+    p = put_varint_at(body, p, key.len() as u64);
+    body[p..p + key.len()].copy_from_slice(key);
+    p += key.len();
+    body[p..p + 8].copy_from_slice(&child.0.to_le_bytes());
+    p + 8
 }
 
 /// Escribe un varint LEB128 en `body[pos..]` y devuelve la posición siguiente

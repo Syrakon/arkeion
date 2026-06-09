@@ -35,10 +35,11 @@ pub const MAGIC_META: &[u8; 8] = b"ARKMETA1";
 /// Magic de las páginas de commit (zona append).
 pub const MAGIC_COMMIT: &[u8; 8] = b"ARKCMT01";
 /// Versión del formato que escribe esta build. v2 (M10): zona append como log de
-/// registros de longitud variable + directorio de páginas. Ruptura limpia
-/// respecto a v1 (slots fijos): pre-1.0 no hay DBs v1 persistidas, así que no se
-/// implementa lectura dual; una migración v1→v2 sería un rewrite estilo `vacuum`.
-pub const FORMAT_VERSION: u32 = 2;
+/// registros de longitud variable + directorio de páginas. v3: nodos b-tree con
+/// **array de punteros a celda** (búsqueda binaria in-page). Ruptura limpia entre
+/// versiones (pre-1.0 no hay DBs persistidas): no se implementa lectura dual; una
+/// migración entre formatos sería un rewrite estilo `vacuum`.
+pub const FORMAT_VERSION: u32 = 3;
 
 /// `FileHeader.flags` bit 0: cifrado en reposo activo.
 pub const FLAG_ENCRYPTED: u32 = 1;

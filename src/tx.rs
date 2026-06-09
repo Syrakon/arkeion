@@ -332,6 +332,7 @@ impl Store {
             rowid_cache: HashMap::new(),
             rec_buf: Vec::new(),
             enc_buf: Vec::new(),
+            values_buf: Vec::new(),
             schema_cache: HashMap::new(),
         })
     }
@@ -1411,11 +1412,17 @@ pub struct WriteTx {
     /// fila validada y su codificación, para no asignar un `Vec` por fila.
     rec_buf: Vec<Value>,
     enc_buf: Vec<u8>,
+    /// Buffer de la fila evaluada por el executor (`INSERT`), prestado vía
+    /// `take_values_buf`/`put_values_buf`: tampoco asigna un `Vec` por fila
+    /// (M10-perf, fase 2).
+    values_buf: Vec<Value>,
     /// Caché del esquema por nombre de tabla dentro de la tx: `get_table` desciende
     /// el catálogo y decodifica el `TableDef` en CADA sentencia (un INSERT por fila
     /// en un lote lo paga N veces). El esquema solo cambia con DDL (insert/update/
     /// delete de filas no lo tocan), así que se cachea y se **vacía al hacer DDL**.
-    schema_cache: HashMap<String, TableDef>,
+    /// `Arc`: entregar el def cacheado es un bump de refcount, no un clone profundo
+    /// de columnas e índices por sentencia (M10-perf, fase 2).
+    schema_cache: HashMap<String, Arc<TableDef>>,
 }
 
 impl Drop for WriteTx {
@@ -1520,17 +1527,29 @@ impl WriteTx {
     /// no vuelve a descender el catálogo ni a decodificar el esquema por fila. La
     /// caché se vacía en cada DDL (insert/update/delete de filas no tocan el
     /// esquema, así que no la invalidan).
-    pub fn table_cached(&mut self, name: &str) -> Result<Option<TableDef>> {
+    pub fn table_cached(&mut self, name: &str) -> Result<Option<Arc<TableDef>>> {
         if let Some(def) = self.schema_cache.get(name) {
             return Ok(Some(def.clone()));
         }
         match catalog::get_table(&self.ts, self.data_root, name)? {
             Some(def) => {
+                let def = Arc::new(def);
                 self.schema_cache.insert(name.to_owned(), def.clone());
                 Ok(Some(def))
             }
             None => Ok(None),
         }
+    }
+
+    /// Presta el buffer de valores del INSERT del executor (devuélvelo con
+    /// [`put_values_buf`](Self::put_values_buf)). Si un error lo pierde por el
+    /// camino, el siguiente `take` simplemente empieza con un `Vec` nuevo.
+    pub(crate) fn take_values_buf(&mut self) -> Vec<Value> {
+        std::mem::take(&mut self.values_buf)
+    }
+
+    pub(crate) fn put_values_buf(&mut self, buf: Vec<Value>) {
+        self.values_buf = buf;
     }
 
     /// Añade una columna a una tabla existente (`ALTER TABLE ADD COLUMN`). No

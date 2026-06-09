@@ -299,10 +299,14 @@ pub fn run_execute(tx: &mut WriteTx, stmt: &Stmt, params: &[Value]) -> Result<us
             let def = tx
                 .table_cached(table)?
                 .ok_or_else(|| sql_err(format!("tabla desconocida: {table}")))?;
+            // Buffer prestado de la tx: ni un `Vec` de valores por fila. Si una
+            // fila falla, el `?` lo pierde — camino frío, el próximo take asigna.
+            let mut values = tx.take_values_buf();
             for row in rows {
-                let values = insert_values(&def, columns.as_deref(), row, params)?;
+                insert_values_into(&def, columns.as_deref(), row, params, &mut values)?;
                 tx.insert_row(&def, &values)?;
             }
+            tx.put_values_buf(values);
             Ok(rows.len())
         }
         Stmt::AlterTableAddColumn { table, column } => {
@@ -443,7 +447,7 @@ fn run_update(
     let def = tx
         .table_cached(table)?
         .ok_or_else(|| sql_err(format!("tabla desconocida: {table}")))?;
-    let schema = QuerySchema::single(table, def.clone());
+    let schema = QuerySchema::single(table, (*def).clone());
 
     // Resolver SET y validar el WHERE antes de tocar filas. Reasignar el
     // alias del rowid sería mover la fila de clave: fuera de v1.
@@ -496,7 +500,7 @@ fn run_delete(
     let def = tx
         .table_cached(table)?
         .ok_or_else(|| sql_err(format!("tabla desconocida: {table}")))?;
-    let schema = QuerySchema::single(table, def.clone());
+    let schema = QuerySchema::single(table, (*def).clone());
     if let Some(cond) = where_clause {
         no_aggregates(cond, "WHERE")?;
         validate_columns(cond, &schema)?;
@@ -545,57 +549,55 @@ fn table_spec(name: &str, columns: &[ColumnAst]) -> Result<TableSpec> {
     })
 }
 
-fn insert_values(
+/// Evalúa la fila de un INSERT en `out` (un `Vec` **reutilizado**: lo limpia
+/// antes y no asigna por fila, M10-perf fase 2).
+fn insert_values_into(
     def: &TableDef,
     columns: Option<&[String]>,
     exprs: &[Expr],
     params: &[Value],
-) -> Result<Vec<Value>> {
-    let values: Vec<Value> = exprs
-        .iter()
-        .map(|e| eval_const(e, params))
-        .collect::<Result<_>>()?;
+    out: &mut Vec<Value>,
+) -> Result<()> {
+    out.clear();
     match columns {
         // Posicional (sin lista de columnas): hay que dar un valor por **cada**
         // columna, ni más ni menos (como SQLite). Aceptar de menos rellenaría
         // columnas con NULL que el usuario no escribió — para nombrar un
         // subconjunto está la forma `INSERT … (col, …) VALUES …`.
         None => {
-            if values.len() != def.columns.len() {
+            for e in exprs {
+                out.push(eval_const(e, params)?);
+            }
+            if out.len() != def.columns.len() {
                 return Err(sql_err(format!(
                     "la tabla tiene {} columnas pero se dieron {} valores",
                     def.columns.len(),
-                    values.len()
+                    out.len()
                 )));
             }
-            Ok(values)
+            Ok(())
         }
         Some(names) => {
-            if names.len() != values.len() {
+            if names.len() != exprs.len() {
                 return Err(sql_err("número distinto de columnas y de valores"));
             }
             // Las no nombradas toman su DEFAULT (o NULL); el alias del rowid
             // queda NULL ⇒ rowid automático.
-            let mut out: Vec<Value> = def
-                .columns
-                .iter()
-                .enumerate()
-                .map(|(i, c)| {
-                    if def.rowid_alias == Some(i) {
-                        Value::Null
-                    } else {
-                        c.default.clone().unwrap_or(Value::Null)
-                    }
-                })
-                .collect();
-            for (name, value) in names.iter().zip(values) {
+            for (i, c) in def.columns.iter().enumerate() {
+                out.push(if def.rowid_alias == Some(i) {
+                    Value::Null
+                } else {
+                    c.default.clone().unwrap_or(Value::Null)
+                });
+            }
+            for (name, e) in names.iter().zip(exprs) {
                 let i = col_index(def, name)?;
                 if names.iter().filter(|n| *n == name).count() > 1 {
                     return Err(sql_err(format!("columna repetida en INSERT: {name}")));
                 }
-                out[i] = value;
+                out[i] = eval_const(e, params)?;
             }
-            Ok(out)
+            Ok(())
         }
     }
 }

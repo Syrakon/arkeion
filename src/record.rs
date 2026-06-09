@@ -36,6 +36,45 @@ impl Value {
     }
 }
 
+/// Vista **prestada** de un [`Value`] ya resuelto (validación, defaults y
+/// promoción aplicados): escalares por valor, payloads de texto/blob por
+/// referencia. Permite codificar un registro sin materializarlo — ni un clone
+/// de `String`/`Vec<u8>` por fila en el camino caliente (M10-perf, fase 2).
+#[derive(Clone, Copy, Debug)]
+pub enum ValueRef<'a> {
+    Null,
+    Bool(bool),
+    Integer(i64),
+    Real(f64),
+    Text(&'a str),
+    Blob(&'a [u8]),
+}
+
+impl<'a> ValueRef<'a> {
+    pub fn of(v: &'a Value) -> ValueRef<'a> {
+        match v {
+            Value::Null => ValueRef::Null,
+            Value::Bool(b) => ValueRef::Bool(*b),
+            Value::Integer(n) => ValueRef::Integer(*n),
+            Value::Real(f) => ValueRef::Real(*f),
+            Value::Text(s) => ValueRef::Text(s),
+            Value::Blob(b) => ValueRef::Blob(b),
+        }
+    }
+
+    /// Materializa el valor (clona los payloads prestados).
+    pub fn to_value(self) -> Value {
+        match self {
+            ValueRef::Null => Value::Null,
+            ValueRef::Bool(b) => Value::Bool(b),
+            ValueRef::Integer(n) => Value::Integer(n),
+            ValueRef::Real(f) => Value::Real(f),
+            ValueRef::Text(s) => Value::Text(s.to_owned()),
+            ValueRef::Blob(b) => Value::Blob(b.to_vec()),
+        }
+    }
+}
+
 const TAG_NULL: u8 = 0;
 const TAG_FALSE: u8 = 1;
 const TAG_TRUE: u8 = 2;
@@ -61,34 +100,48 @@ pub fn encode_values(values: &[Value]) -> Vec<u8> {
 /// Como [`encode_values`] pero en un buffer **reutilizado** (lo limpia antes):
 /// el camino caliente de `insert_row` evita asignar un `Vec` por fila (M10-perf).
 pub fn encode_values_into(values: &[Value], out: &mut Vec<u8>) {
+    encode_resolved_into(values.len(), |i| Ok(ValueRef::of(&values[i])), out)
+        .expect("el cierre es infalible");
+}
+
+/// Como [`encode_values_into`] pero **sin materializar** el registro: `col(i)`
+/// resuelve la columna `i` y puede fallar (validación inline). Dos pasadas
+/// sobre el resolutor — tags y payloads — porque el formato pone todos los
+/// tags por delante; resolver dos veces es O(1) por columna y evita el `Vec`
+/// intermedio. Si `col` falla, `out` queda a medias (cada uso lo limpia antes).
+pub fn encode_resolved_into<'a, F>(ncols: usize, mut col: F, out: &mut Vec<u8>) -> Result<()>
+where
+    F: FnMut(usize) -> Result<ValueRef<'a>>,
+{
     out.clear();
-    put_varint(out, values.len() as u64);
-    for v in values {
-        out.push(match v {
-            Value::Null => TAG_NULL,
-            Value::Bool(false) => TAG_FALSE,
-            Value::Bool(true) => TAG_TRUE,
-            Value::Integer(_) => TAG_INT,
-            Value::Real(_) => TAG_REAL,
-            Value::Text(_) => TAG_TEXT,
-            Value::Blob(_) => TAG_BLOB,
+    put_varint(out, ncols as u64);
+    for i in 0..ncols {
+        out.push(match col(i)? {
+            ValueRef::Null => TAG_NULL,
+            ValueRef::Bool(false) => TAG_FALSE,
+            ValueRef::Bool(true) => TAG_TRUE,
+            ValueRef::Integer(_) => TAG_INT,
+            ValueRef::Real(_) => TAG_REAL,
+            ValueRef::Text(_) => TAG_TEXT,
+            ValueRef::Blob(_) => TAG_BLOB,
         });
     }
-    for v in values {
-        match v {
-            Value::Null | Value::Bool(_) => {}
-            Value::Integer(n) => put_varint(out, zigzag(*n)),
-            Value::Real(f) => out.extend_from_slice(&f.to_le_bytes()),
-            Value::Text(s) => {
+    for i in 0..ncols {
+        match col(i)? {
+            ValueRef::Null | ValueRef::Bool(_) => {}
+            ValueRef::Integer(n) => put_varint(out, zigzag(n)),
+            ValueRef::Real(f) => out.extend_from_slice(&f.to_le_bytes()),
+            ValueRef::Text(s) => {
                 put_varint(out, s.len() as u64);
                 out.extend_from_slice(s.as_bytes());
             }
-            Value::Blob(b) => {
+            ValueRef::Blob(b) => {
                 put_varint(out, b.len() as u64);
                 out.extend_from_slice(b);
             }
         }
     }
+    Ok(())
 }
 
 pub fn decode_values(buf: &[u8]) -> Result<Vec<Value>> {

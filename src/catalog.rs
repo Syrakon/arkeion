@@ -17,7 +17,7 @@ use crate::btree::{self, Cursor, NodeSource, NodeStore};
 use crate::error::{Error, Result};
 use crate::format::{PageId, put_varint, take_varint};
 use crate::keyenc;
-use crate::record::{self, Value};
+use crate::record::{self, Value, ValueRef};
 
 pub const MAX_COLUMNS: usize = 255;
 pub const MAX_NAME_LEN: usize = 128;
@@ -755,59 +755,61 @@ pub fn index_scan_range<S: NodeSource>(
 
 // --- filas ---
 
+/// Resuelve la columna `i` de una fila entrante: alias del rowid → NULL (se
+/// reconstruye al leer), valor ausente → DEFAULT (o NULL), promoción
+/// INTEGER → REAL y validación de tipo/NOT NULL. **Única fuente** de las
+/// reglas de validación: la usan el camino caliente sin clones de
+/// [`put_row_buffered`] y [`validate_record_into`]. Solo aplica a valores de
+/// un INSERT/UPDATE — en un registro **almacenado** las columnas ausentes
+/// significan NULL/DEFAULT según `finish_row`, no según estas reglas.
+fn resolve_col<'a>(table: &'a TableDef, values: &'a [Value], i: usize) -> Result<ValueRef<'a>> {
+    if table.rowid_alias == Some(i) {
+        return Ok(ValueRef::Null); // reconstruido del rowid al leer
+    }
+    let col = &table.columns[i];
+    let v = match values.get(i) {
+        Some(v) => v,
+        None => col.default.as_ref().unwrap_or(&Value::Null),
+    };
+    match (col.col_type, v) {
+        (_, Value::Null) => {
+            if col.not_null {
+                return Err(Error::Constraint("NULL en columna NOT NULL"));
+            }
+            Ok(ValueRef::Null)
+        }
+        (ColType::Integer, Value::Integer(n)) => Ok(ValueRef::Integer(*n)),
+        // Promoción sin pérdida: INTEGER → REAL (docs/04).
+        (ColType::Real, Value::Integer(n)) => Ok(ValueRef::Real(*n as f64)),
+        (ColType::Real, Value::Real(f)) => Ok(ValueRef::Real(*f)),
+        (ColType::Text, Value::Text(s)) => Ok(ValueRef::Text(s.as_str())),
+        (ColType::Blob, Value::Blob(b)) => Ok(ValueRef::Blob(b.as_slice())),
+        (ColType::Boolean, Value::Bool(b)) => Ok(ValueRef::Bool(*b)),
+        _ => Err(Error::Constraint(
+            "tipo de valor incompatible con la columna",
+        )),
+    }
+}
+
 /// Valida tipos y restricciones, aplica defaults y devuelve el registro listo
 /// para almacenar (el alias del rowid se guarda como NULL: se reconstruye).
-fn validated_record(table: &TableDef, values: &[Value], rowid: i64) -> Result<Vec<Value>> {
+fn validated_record(table: &TableDef, values: &[Value]) -> Result<Vec<Value>> {
     let mut record = Vec::with_capacity(table.columns.len());
-    validate_record_into(table, values, rowid, &mut record)?;
+    validate_record_into(table, values, &mut record)?;
     Ok(record)
 }
 
 /// Como [`validated_record`] pero en un `Vec` **reutilizado** (lo limpia antes):
-/// el camino caliente de `insert_row` evita asignar el vector por fila (M10-perf).
-fn validate_record_into(
-    table: &TableDef,
-    values: &[Value],
-    rowid: i64,
-    record: &mut Vec<Value>,
-) -> Result<()> {
+/// materializa vía [`resolve_col`] para los caminos que necesitan el registro
+/// entero en memoria (UPDATE y tablas con índices secundarios).
+fn validate_record_into(table: &TableDef, values: &[Value], record: &mut Vec<Value>) -> Result<()> {
     record.clear();
     if values.len() > table.columns.len() {
         return Err(Error::InvalidInput("más valores que columnas"));
     }
-    for (i, col) in table.columns.iter().enumerate() {
-        if table.rowid_alias == Some(i) {
-            record.push(Value::Null); // reconstruido del rowid al leer
-            continue;
-        }
-        let value = match values.get(i) {
-            Some(v) => v.clone(),
-            None => col.default.clone().unwrap_or(Value::Null),
-        };
-        let value = match (col.col_type, value) {
-            (_, Value::Null) => {
-                if col.not_null {
-                    return Err(Error::Constraint("NULL en columna NOT NULL"));
-                }
-                Value::Null
-            }
-            (ColType::Integer, v @ Value::Integer(_)) => v,
-            // Promoción sin pérdida: INTEGER → REAL (docs/04).
-            (ColType::Real, Value::Integer(n)) => Value::Real(n as f64),
-            (ColType::Real, v @ Value::Real(_)) => v,
-            (ColType::Text, v @ Value::Text(_)) => v,
-            (ColType::Blob, v @ Value::Blob(_)) => v,
-            (ColType::Boolean, v @ Value::Bool(_)) => v,
-            (expected, got) => {
-                let _ = (expected, got);
-                return Err(Error::Constraint(
-                    "tipo de valor incompatible con la columna",
-                ));
-            }
-        };
-        record.push(value);
+    for i in 0..table.columns.len() {
+        record.push(resolve_col(table, values, i)?.to_value());
     }
-    let _ = rowid;
     Ok(())
 }
 
@@ -852,7 +854,16 @@ pub(crate) fn resolve_rowid<S: NodeSource>(
                 .ok_or(Error::Constraint("rowids agotados"))?,
         )),
         Some(n) => {
-            if btree::contains(src, root, &row_key(table_id, n))? {
+            // Invariante del contador: todo rowid existente es < `next` (cada
+            // insert lo deja por encima y el merge lo reconcilia por máximo;
+            // el camino automático ya confía en él: asigna `next` sin
+            // dup-check). n >= next ⇒ la fila no puede existir, así que el
+            // descenso de dup-check sobra — un INSERT con PK explícita
+            // creciente queda O(1) como el automático. Salvedad: si `next`
+            // saturó en i64::MAX, ese rowid sí puede existir (saturating_add
+            // de abajo) y hay que mirar.
+            if (n < next || next == i64::MAX) && btree::contains(src, root, &row_key(table_id, n))?
+            {
                 return Err(Error::Constraint("rowid duplicado"));
             }
             Ok((n, if n >= next { n.saturating_add(1) } else { next }))
@@ -880,7 +891,7 @@ pub(crate) fn put_row<S: NodeStore>(
     rowid: i64,
     values: &[Value],
 ) -> Result<PageId> {
-    let record = validated_record(table, values, rowid)?;
+    let record = validated_record(table, values)?;
     let mut root = btree::insert(
         s,
         root,
@@ -905,13 +916,26 @@ pub(crate) fn put_row_buffered<S: NodeStore>(
     rec_buf: &mut Vec<Value>,
     enc_buf: &mut Vec<u8>,
 ) -> Result<PageId> {
-    validate_record_into(table, values, rowid, rec_buf)?;
-    record::encode_values_into(rec_buf, enc_buf);
-    let mut root = btree::insert(s, root, &row_key(table.table_id, rowid), enc_buf)?;
-    if !table.indexes.is_empty() {
-        root = insert_index_entries(s, root, table, rowid, rec_buf.as_slice())?;
+    if table.indexes.is_empty() {
+        // Sin índices (el caso del bulk-load típico): valida y codifica en una
+        // pasada sobre los valores prestados, sin clonar texto/blob por fila
+        // ni materializar el registro (M10-perf, fase 2).
+        if values.len() > table.columns.len() {
+            return Err(Error::InvalidInput("más valores que columnas"));
+        }
+        record::encode_resolved_into(
+            table.columns.len(),
+            |i| resolve_col(table, values, i),
+            enc_buf,
+        )?;
+        return btree::insert(s, root, &row_key(table.table_id, rowid), enc_buf);
     }
-    Ok(root)
+    // Con índices: las entradas necesitan el registro materializado (claves de
+    // índice, dup-check UNIQUE); se reutilizan los buffers.
+    validate_record_into(table, values, rec_buf)?;
+    record::encode_values_into(rec_buf, enc_buf);
+    let root = btree::insert(s, root, &row_key(table.table_id, rowid), enc_buf)?;
+    insert_index_entries(s, root, table, rowid, rec_buf.as_slice())
 }
 
 /// Inserta con rowid automático o explícito, contador incluido (camino directo
@@ -943,7 +967,7 @@ pub fn update_row<S: NodeStore>(
     let Some(old_bytes) = btree::get(s, root, &key)? else {
         return Ok((root, false));
     };
-    let record = validated_record(table, values, rowid)?;
+    let record = validated_record(table, values)?;
     let mut root = root;
     // Quita las entradas de índice de la fila vieja antes de sobrescribir.
     if !table.indexes.is_empty() {

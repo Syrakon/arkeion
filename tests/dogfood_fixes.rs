@@ -45,7 +45,40 @@ fn positional_insert_requires_a_value_per_column() {
     // Posicional exacto: ok.
     conn.execute("INSERT INTO p VALUES (1, 2, 3)", &[]).unwrap();
     // Para nombrar un subconjunto está la forma con lista de columnas.
-    conn.execute("INSERT INTO p (a, b) VALUES (4, 5)", &[]).unwrap();
+    conn.execute("INSERT INTO p (a, b) VALUES (4, 5)", &[])
+        .unwrap();
+}
+
+#[test]
+fn as_of_is_scoped_to_the_branch_ancestry() {
+    let (_d, db) = db();
+    let conn = db.connect().unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)", &[])
+        .unwrap(); // v1
+    conn.execute("INSERT INTO t (v) VALUES (1)", &[]).unwrap(); // v2
+    conn.execute("INSERT INTO t (v) VALUES (2)", &[]).unwrap(); // v3 (head de main)
+
+    // Rama desde una versión TEMPRANA (v1): su ascendencia es v1→génesis, así que
+    // las versiones de main (v2, v3) NO están en su línea temporal aunque sean
+    // numéricamente menores que su head (el punto de bifurcación).
+    db.create_branch("b", AsOf::Version(1)).unwrap();
+    let bconn = db.connect_branch("b").unwrap();
+    let bhead = bconn.version();
+
+    // AS OF de versiones que viven solo en main no debe resolver desde `b`.
+    assert!(
+        bconn.snapshot(AsOf::Version(2)).is_err(),
+        "v2 (de main) no es de b"
+    );
+    assert!(
+        bconn.snapshot(AsOf::Version(3)).is_err(),
+        "v3 (de main) no es de b"
+    );
+    // La propia ascendencia de `b` sí resuelve.
+    assert!(bconn.snapshot(AsOf::Version(1)).is_ok());
+    assert!(bconn.snapshot(AsOf::Version(bhead)).is_ok());
+    // Y main sigue viajando por su propia historia.
+    assert!(conn.snapshot(AsOf::Version(2)).is_ok());
 }
 
 #[test]
@@ -60,7 +93,9 @@ fn changes_uses_recorded_parent_not_numeric_predecessor() {
     let fconn = db.connect_branch("feat").unwrap();
     fconn.execute("INSERT INTO t (v) VALUES (20)", &[]).unwrap();
 
-    let report = db.merge("feat", "main", MergePolicy::FailOnConflict).unwrap();
+    let report = db
+        .merge("feat", "main", MergePolicy::FailOnConflict)
+        .unwrap();
     // El commit de merge tiene como padre el merge-base, no `version-1`. `changes`
     // debe mostrar el insert aplicado, no «(sin cambios)» que daría `v-1`.
     let d = db.changes(report.version).unwrap();

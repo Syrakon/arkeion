@@ -689,6 +689,52 @@ impl Store {
         snapshot_at(&pager, &head, at)
     }
 
+    /// `snapshot_at` **acotado a la rama** (M8): `AS OF` solo resuelve versiones
+    /// que estén en la **ascendencia** de la rama, no cualquier versión global. Sin
+    /// esto, `AS OF VERSION n` desde una rama podía leer datos de otra línea
+    /// temporal (las versiones son globales monótonas, pero el `AS OF` de una rama
+    /// debe quedarse en su historia). El meta-índice es global (compartido); lo que
+    /// cambia es la versión/`data_root` cabeza y el filtro de ascendencia.
+    pub fn snapshot_at_on(&self, branch: &str, at: AsOf) -> Result<Snapshot> {
+        let (pager, global) = {
+            let st = self.lock();
+            (st.pager.clone(), st.head.clone())
+        };
+        let bh = resolve_branch_head(&pager, &global, branch)?;
+        let meta = global.meta_root;
+        match at {
+            AsOf::Head => Ok(snapshot_of(&pager, bh.version, bh.data_root)),
+            AsOf::Version(v) => {
+                if v == bh.version {
+                    return Ok(snapshot_of(&pager, bh.version, bh.data_root));
+                }
+                // La versión debe existir Y estar en la línea temporal de la rama.
+                if v > bh.version || !is_ancestor(&pager, meta, bh.version, v)? {
+                    return Err(Error::VersionNotFound(AsOf::Version(v)));
+                }
+                if v == 0 {
+                    return Ok(genesis_snapshot(&pager));
+                }
+                let data_root = read_data_root(&pager, meta, v)?;
+                Ok(snapshot_of(&pager, v, data_root))
+            }
+            AsOf::Timestamp(t) => {
+                // Mayor ancestro de la rama con `ts ≤` el dado (recorre la
+                // ascendencia, no todo el índice global).
+                let ms = system_time_to_ms(t);
+                let mut v = bh.version;
+                while v != 0 {
+                    let (data_root, ts, parent) = read_hist(&pager, meta, v)?;
+                    if ts <= ms {
+                        return Ok(snapshot_of(&pager, v, data_root));
+                    }
+                    v = parent;
+                }
+                Ok(genesis_snapshot(&pager))
+            }
+        }
+    }
+
     /// Compacta el archivo según `retention`, manteniendo la clave de cifrado
     /// actual (M9): reescribe a un temporal y publica con rename atómico.
     pub fn vacuum(&self, retention: Retention) -> Result<VacuumReport> {
@@ -1032,6 +1078,20 @@ fn read_parent_version(pager: &Arc<Pager>, meta_root: PageId, version: u64) -> R
         return Ok(0);
     }
     Ok(read_hist(pager, meta_root, version)?.2)
+}
+
+/// `true` si `target` está en la ascendencia de `from` (caminando los padres
+/// registrados): es el mismo commit o un antepasado por la línea de datos. Génesis
+/// (0) es ancestro de todo. Acota `AS OF` a la historia de una rama.
+fn is_ancestor(pager: &Arc<Pager>, meta_root: PageId, from: u64, target: u64) -> Result<bool> {
+    let mut v = from;
+    while v != 0 {
+        if v == target {
+            return Ok(true);
+        }
+        v = read_parent_version(pager, meta_root, v)?;
+    }
+    Ok(target == 0)
 }
 
 /// Ancestro común (merge base) de dos versiones, caminando `parent_version`

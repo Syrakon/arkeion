@@ -506,9 +506,11 @@ impl Connection {
             }
             exec::run_select(snap, select, params)?
         } else if let Some(clause) = &select.as_of {
-            // AS OF lee la historia confirmada; ignora una tx abierta (no se
-            // escribe en el pasado: para eso están las ramas, M8).
-            let snap = self.store.snapshot_at(clause_to_asof(clause))?;
+            // AS OF lee la historia confirmada **de esta rama** (acotado a su
+            // ascendencia); ignora una tx abierta (no se escribe en el pasado).
+            let snap = self
+                .store
+                .snapshot_at_on(&self.branch, clause_to_asof(clause))?;
             exec::run_select(&snap, select, params)?
         } else {
             match self.open_tx.borrow().as_ref() {
@@ -576,8 +578,9 @@ impl Connection {
     /// assert!(antes.execute("INSERT INTO t (n) VALUES (3)", &[]).is_err());
     /// ```
     pub fn snapshot(&self, at: AsOf) -> Result<Connection> {
-        // Resuelve ya: una versión inexistente falla aquí, no al consultar.
-        let snap = self.store.snapshot_at(at)?;
+        // Resuelve ya (acotado a la rama): una versión inexistente o de otra rama
+        // falla aquí, no al consultar.
+        let snap = self.store.snapshot_at_on(&self.branch, at)?;
         Ok(Connection {
             store: self.store.clone(),
             branch: self.branch.clone(),

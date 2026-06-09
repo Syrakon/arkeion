@@ -80,6 +80,8 @@ pub mod compress;
 #[doc(hidden)]
 pub mod crypto;
 #[doc(hidden)]
+pub mod ecc;
+#[doc(hidden)]
 pub mod exec;
 #[doc(hidden)]
 pub mod format;

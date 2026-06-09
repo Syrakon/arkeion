@@ -381,6 +381,40 @@ fn multi_column_unique() {
 }
 
 #[test]
+fn same_tx_create_index_then_insert_maintains_index() {
+    // Regresión de la caché de esquema por-tx: un INSERT tras un CREATE INDEX en
+    // la MISMA transacción debe ver el índice nuevo (mantenerlo), no un TableDef
+    // cacheado de antes del índice.
+    let (_d, db) = db();
+    let conn = db.connect().unwrap();
+    conn.execute(
+        "CREATE TABLE u (id INTEGER PRIMARY KEY, email TEXT NOT NULL)",
+        &[],
+    )
+    .unwrap();
+    conn.execute("INSERT INTO u (email) VALUES ('a@x')", &[])
+        .unwrap();
+
+    let tx = conn.begin().unwrap();
+    tx.execute("CREATE INDEX ix ON u (email)", &[]).unwrap();
+    tx.execute("INSERT INTO u (email) VALUES ('b@x')", &[])
+        .unwrap(); // tras el índice, en la misma tx
+    tx.commit().unwrap();
+
+    // La fila preexistente entró por backfill; la nueva, por mantenimiento.
+    assert_eq!(ids(&conn, "SELECT id FROM u WHERE email = 'a@x'"), [1]);
+    assert_eq!(ids(&conn, "SELECT id FROM u WHERE email = 'b@x'"), [2]);
+    // Y un DROP INDEX + INSERT en la misma tx tampoco deja entradas fantasma.
+    let tx = conn.begin().unwrap();
+    tx.execute("DROP INDEX ix", &[]).unwrap();
+    tx.execute("INSERT INTO u (email) VALUES ('c@x')", &[])
+        .unwrap();
+    tx.commit().unwrap();
+    conn.execute("CREATE INDEX ix2 ON u (email)", &[]).unwrap(); // re-backfill de las 3
+    assert_eq!(ids(&conn, "SELECT id FROM u WHERE email = 'c@x'"), [3]);
+}
+
+#[test]
 fn errors_and_flags() {
     let (_d, db) = db();
     let conn = db.connect().unwrap();

@@ -304,6 +304,7 @@ impl Store {
             rowid_cache: HashMap::new(),
             rec_buf: Vec::new(),
             enc_buf: Vec::new(),
+            schema_cache: HashMap::new(),
         })
     }
 
@@ -1306,6 +1307,11 @@ pub struct WriteTx {
     /// fila validada y su codificación, para no asignar un `Vec` por fila.
     rec_buf: Vec<Value>,
     enc_buf: Vec<u8>,
+    /// Caché del esquema por nombre de tabla dentro de la tx: `get_table` desciende
+    /// el catálogo y decodifica el `TableDef` en CADA sentencia (un INSERT por fila
+    /// en un lote lo paga N veces). El esquema solo cambia con DDL (insert/update/
+    /// delete de filas no lo tocan), así que se cachea y se **vacía al hacer DDL**.
+    schema_cache: HashMap<String, TableDef>,
 }
 
 impl Drop for WriteTx {
@@ -1340,6 +1346,7 @@ impl WriteTx {
     // — capa relacional (M2): la tx ve su propio DDL y sus propias filas —
 
     pub fn create_table(&mut self, spec: &TableSpec) -> Result<TableDef> {
+        self.schema_cache.clear();
         let (root, def) = catalog::create_table(&mut self.ts, self.data_root, spec)?;
         self.data_root = root;
         Ok(def)
@@ -1353,6 +1360,7 @@ impl WriteTx {
         columns: &[usize],
         unique: bool,
     ) -> Result<()> {
+        self.schema_cache.clear();
         self.data_root =
             catalog::create_index(&mut self.ts, self.data_root, table, name, columns, unique)?;
         Ok(())
@@ -1360,6 +1368,7 @@ impl WriteTx {
 
     /// Borra un índice por su nombre global. `false` si no existía.
     pub fn drop_index(&mut self, name: &str) -> Result<bool> {
+        self.schema_cache.clear();
         let (root, dropped) = catalog::drop_index(&mut self.ts, self.data_root, name)?;
         self.data_root = root;
         Ok(dropped)
@@ -1387,6 +1396,7 @@ impl WriteTx {
     }
 
     pub fn drop_table(&mut self, name: &str) -> Result<bool> {
+        self.schema_cache.clear();
         // Si la tabla tenía un contador en vuelo, descártalo: el commit no debe
         // recrearlo tras borrarla.
         if let Some(def) = catalog::get_table(&self.ts, self.data_root, name)? {
@@ -1401,9 +1411,28 @@ impl WriteTx {
         catalog::get_table(&self.ts, self.data_root, name)
     }
 
+    /// Como [`table`](Self::table) pero **cacheando** el `TableDef` por la duración
+    /// de la tx: el camino de escritura caliente (un INSERT por fila en un lote)
+    /// no vuelve a descender el catálogo ni a decodificar el esquema por fila. La
+    /// caché se vacía en cada DDL (insert/update/delete de filas no tocan el
+    /// esquema, así que no la invalidan).
+    pub fn table_cached(&mut self, name: &str) -> Result<Option<TableDef>> {
+        if let Some(def) = self.schema_cache.get(name) {
+            return Ok(Some(def.clone()));
+        }
+        match catalog::get_table(&self.ts, self.data_root, name)? {
+            Some(def) => {
+                self.schema_cache.insert(name.to_owned(), def.clone());
+                Ok(Some(def))
+            }
+            None => Ok(None),
+        }
+    }
+
     /// Añade una columna a una tabla existente (`ALTER TABLE ADD COLUMN`). No
     /// reescribe las filas existentes.
     pub fn add_column(&mut self, table: &str, col: catalog::ColumnDef) -> Result<()> {
+        self.schema_cache.clear();
         let (root, _) = catalog::add_column(&mut self.ts, self.data_root, table, col)?;
         self.data_root = root;
         Ok(())

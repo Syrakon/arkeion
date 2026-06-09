@@ -289,8 +289,10 @@ pub fn run_execute(tx: &mut WriteTx, stmt: &Stmt, params: &[Value]) -> Result<us
             columns,
             rows,
         } => {
+            // `table_cached`: un INSERT-por-fila en un lote no re-desciende el
+            // catálogo por cada sentencia (el esquema no cambia entre filas).
             let def = tx
-                .table(table)?
+                .table_cached(table)?
                 .ok_or_else(|| sql_err(format!("tabla desconocida: {table}")))?;
             for row in rows {
                 let values = insert_values(&def, columns.as_deref(), row, params)?;
@@ -434,7 +436,7 @@ fn run_update(
     params: &[Value],
 ) -> Result<usize> {
     let def = tx
-        .table(table)?
+        .table_cached(table)?
         .ok_or_else(|| sql_err(format!("tabla desconocida: {table}")))?;
     let schema = QuerySchema::single(table, def.clone());
 
@@ -487,7 +489,7 @@ fn run_delete(
     params: &[Value],
 ) -> Result<usize> {
     let def = tx
-        .table(table)?
+        .table_cached(table)?
         .ok_or_else(|| sql_err(format!("tabla desconocida: {table}")))?;
     let schema = QuerySchema::single(table, def.clone());
     if let Some(cond) = where_clause {

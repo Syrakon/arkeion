@@ -331,6 +331,41 @@ pub fn leaf_for_each_prefix(
     Ok(true) // toda la cola de la hoja casó: puede seguir en la hermana
 }
 
+/// Número de celdas de una hoja (los 2 bytes de la cabecera).
+pub fn leaf_ncells(body: &[u8]) -> usize {
+    u16::from_le_bytes([body[2], body[3]]) as usize
+}
+
+/// Índice de la primera celda con clave `>= key` (lower_bound, búsqueda binaria).
+/// Lo usa el cursor de scan para arrancar en la posición de `scan_from`.
+pub fn leaf_lower_bound(page: u64, body: &[u8], key: &[u8]) -> Result<usize> {
+    let ncells = leaf_ncells(body);
+    let mut lo = 0;
+    let mut hi = ncells;
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        let (_flags, ckey, _) = leaf_key_at(page, body, cell_ptr(body, mid))?;
+        if ckey < key {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    Ok(lo)
+}
+
+/// Clave (propia) + payload de la celda `i` de una hoja, leídos **in-page** por el
+/// array de punteros. El payload `Inline` trae su valor (una copia); `Overflow`,
+/// la referencia a resolver. Para el cursor de scan en streaming: una celda a la
+/// vez, sin materializar toda la hoja en un `Vec<LeafCell>`.
+pub fn leaf_cell_at(page: u64, body: &[u8], i: usize) -> Result<(Vec<u8>, Payload)> {
+    let off = cell_ptr(body, i);
+    let (flags, key, payload_pos) = leaf_key_at(page, body, off)?;
+    let mut pos = payload_pos;
+    let payload = read_leaf_payload(page, body, &mut pos, flags)?;
+    Ok((key.to_vec(), payload))
+}
+
 /// `Some((pos_payload, flags))` con `pos` al inicio del payload de la celda de
 /// `key`, o `None` si no está. Escanea sin asignar.
 fn leaf_seek(page: u64, body: &[u8], key: &[u8]) -> Result<Option<(usize, u8)>> {

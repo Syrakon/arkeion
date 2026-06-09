@@ -10,7 +10,6 @@
 
 pub mod node;
 
-use std::collections::VecDeque;
 use std::sync::Arc;
 
 use crate::error::{Error, Result};
@@ -144,6 +143,16 @@ pub fn contains<S: NodeSource>(src: &S, root: PageId, key: &[u8]) -> Result<bool
                 });
             }
         }
+    }
+}
+
+/// Como [`read_value`] pero **consume** el payload: un `Inline` se mueve sin
+/// re-clonar (el camino caliente del scan en streaming ya tiene el valor leído
+/// de la página una vez; clonarlo otra vez sería el doble-copia que evitamos).
+fn read_value_owned<S: NodeSource>(src: &S, payload: Payload) -> Result<Vec<u8>> {
+    match payload {
+        Payload::Inline(v) => Ok(v),
+        overflow => read_value(src, &overflow),
     }
 }
 
@@ -550,18 +559,46 @@ fn write_chain<S: NodeStore>(s: &mut S, data: &[u8]) -> Result<PageId> {
 // --- cursor de rango ---
 
 /// Iterador ascendente por clave. Resuelve overflow al producir cada par.
+/// La hoja actual del cursor, sostenida **sin materializar** sus celdas: el `Arc`
+/// de la página (pager: sin copia) o una copia de sus bytes (fuentes que prestan,
+/// como `MemStore` de tests). Las celdas se leen in-page de una en una al avanzar,
+/// evitando el `Vec<LeafCell>` con dos asignaciones por celda del enfoque viejo.
+enum HeldLeaf {
+    Shared(Arc<PageBuf>),
+    Owned(Box<[u8]>),
+}
+
+impl HeldLeaf {
+    fn bytes(&self) -> &[u8] {
+        match self {
+            HeldLeaf::Shared(p) => p.body(),
+            HeldLeaf::Owned(b) => b,
+        }
+    }
+}
+
+/// Estado de la hoja en curso del cursor de scan en streaming.
+struct LeafScan {
+    page: u64,
+    held: HeldLeaf,
+    /// Próxima celda a emitir (en orden de clave, vía el array de punteros).
+    next: usize,
+    ncells: usize,
+}
+
 pub struct Cursor<'s, S: NodeSource> {
     src: &'s S,
     /// Nodos internos pendientes: (id, índice del próximo hijo a visitar).
     stack: Vec<(PageId, usize)>,
-    leaf: VecDeque<LeafCell>,
+    /// Hoja en curso (en streaming), o `None` si ninguna/agotada.
+    leaf: Option<LeafScan>,
 }
 
 pub fn scan<S: NodeSource>(src: &S, root: PageId) -> Result<Cursor<'_, S>> {
     let mut c = Cursor {
         src,
         stack: Vec::new(),
-        leaf: VecDeque::new(),
+        leaf: None,
     };
     if root != NO_ROOT {
         c.descend(root, None)?;
@@ -578,7 +615,7 @@ pub fn scan_from<'s, S: NodeSource>(
     let mut c = Cursor {
         src,
         stack: Vec::new(),
-        leaf: VecDeque::new(),
+        leaf: None,
     };
     if root != NO_ROOT {
         c.descend(root, Some(start))?;
@@ -607,14 +644,24 @@ impl<S: NodeSource> Cursor<'_, S> {
                     id = child;
                 }
                 node::TYPE_LEAF => {
-                    let cells = node::parse_leaf(id.0, body.bytes())?;
-                    drop(body);
-                    self.leaf = cells.into();
-                    if let Some(k) = start {
-                        while self.leaf.front().is_some_and(|c| c.key.as_slice() < k) {
-                            self.leaf.pop_front();
-                        }
-                    }
+                    let ncells = node::leaf_ncells(body.bytes());
+                    // Posición de arranque: lower_bound de `start` (scan_from) o 0.
+                    let next = match start {
+                        None => 0,
+                        Some(k) => node::leaf_lower_bound(id.0, body.bytes(), k)?,
+                    };
+                    // Sostiene la hoja sin copiar (Arc del pager) o copiándola una
+                    // vez (fuentes que prestan); las celdas se leen al avanzar.
+                    let held = match body {
+                        Body::Shared(p) => HeldLeaf::Shared(p),
+                        Body::Local(b) => HeldLeaf::Owned(b.into()),
+                    };
+                    self.leaf = Some(LeafScan {
+                        page: id.0,
+                        held,
+                        next,
+                        ncells,
+                    });
                     return Ok(());
                 }
                 _ => {
@@ -629,10 +676,18 @@ impl<S: NodeSource> Cursor<'_, S> {
 
     fn advance(&mut self) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
         loop {
-            if let Some(cell) = self.leaf.pop_front() {
-                let value = read_value(self.src, &cell.payload)?;
-                return Ok(Some((cell.key, value)));
+            // Emite la próxima celda de la hoja en curso, leída in-page (una copia
+            // de clave + una de valor, sin materializar el resto de la hoja).
+            if let Some(ls) = self.leaf.as_mut()
+                && ls.next < ls.ncells
+            {
+                let i = ls.next;
+                ls.next += 1;
+                let (key, payload) = node::leaf_cell_at(ls.page, ls.held.bytes(), i)?;
+                let value = read_value_owned(self.src, payload)?;
+                return Ok(Some((key, value)));
             }
+            self.leaf = None; // ninguna hoja o agotada: avanza por la pila
             let Some((id, idx)) = self.stack.last().copied() else {
                 return Ok(None);
             };

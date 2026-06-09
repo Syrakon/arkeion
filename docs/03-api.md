@@ -94,6 +94,12 @@ impl Connection {
     pub fn query(&self, sql: &str, params: &[Value]) -> Result<Rows>;
     pub fn prepare(&self, sql: &str) -> Result<Statement>;                 // parsea una vez
 
+    /// Carga masiva: todas las filas en UNA transacción (1 fsync), sin executor
+    /// SQL por fila; las entradas de índice se insertan en bloque (UNIQUE
+    /// verificado). Solo en autocommit: o el lote entero o nada.
+    pub fn bulk_insert<I, R>(&self, table: &str, rows: I) -> Result<usize>
+    where I: IntoIterator<Item = R>, R: AsRef<[Value]>;
+
     pub fn begin(&self) -> Result<Transaction<'_>>;     // adquiere el escritor único
 
     pub fn snapshot(&self, at: AsOf) -> Result<Connection>;  // conexión SOLO LECTURA fijada
@@ -110,6 +116,12 @@ impl Transaction<'_> {
 ```
 
 `execute`/`query` fuera de transacción = autocommit (una transacción por sentencia).
+
+Un SELECT simple (proyección de columnas o `*`, sin WHERE/JOIN/agregados/ORDER
+BY) se sirve en **streaming**: `Rows` posee su snapshot y decodifica cada fila
+al iterar — solo las columnas proyectadas, sin materializar el resultado. El
+resto de consultas va por el executor clásico; el resultado es indistinguible
+salvo en coste.
 
 ## Filas y parámetros
 

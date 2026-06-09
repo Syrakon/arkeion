@@ -95,14 +95,13 @@ pub fn decode_values(buf: &[u8]) -> Result<Vec<Value>> {
     let bad = |reason: &'static str| Error::CorruptRecord(reason);
     let mut pos = 0usize;
     let ncols = take_varint(buf, &mut pos).ok_or(bad("cabecera de registro truncada"))? as usize;
-    let tags = buf
-        .get(pos..pos + ncols)
-        .ok_or(bad("tags truncados"))?
-        .to_vec();
+    // Los tags se prestan de `buf` (lectura inmutable); el resto del registro se
+    // lee por `pos`, también inmutable, así que no hace falta copiarlos a un Vec.
+    let tags = buf.get(pos..pos + ncols).ok_or(bad("tags truncados"))?;
     pos += ncols;
 
     let mut values = Vec::with_capacity(ncols);
-    for tag in tags {
+    for &tag in tags {
         values.push(match tag {
             TAG_NULL => Value::Null,
             TAG_FALSE => Value::Bool(false),

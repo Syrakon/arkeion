@@ -21,9 +21,10 @@
 //!   se mide con `synchronous=FULL` + journal de rollback por defecto (**2**
 //!   fsync/commit). `ARKEION_BENCH_SQLITE_WAL=1` ⇒ WAL (1 sync) — más rápido para
 //!   SQLite, cambia mucho los ratios.
-//! - **Sensible al tamaño**: con `bulk_n` pequeño el conjunto cabe en la caché de
-//!   páginas de arkeion (16 MB) y las lecturas vuelan; al superarla, la ventaja se
-//!   estrecha o se invierte. Barre tamaños: `-- 2000 50000 20`, `-- 2000 1000000 5`.
+//! - **Sensible al tamaño**: las lecturas vuelan mientras el working set quepa en
+//!   la caché de páginas de arkeion (64 MB por defecto); al superarla, cada fallo
+//!   re-verifica el tag de integridad y la ventaja se estrecha. Barre tamaños:
+//!   `-- 2000 50000 20`, `-- 2000 1000000 5`.
 //!
 //! ```text
 //! cargo bench --bench crud --features bench-sqlite                 # vs SQLite
@@ -108,7 +109,9 @@ fn run_arkeion(durable_n: i64, bulk_n: i64, scan_reps: i64) -> Vec<(&'static str
             let db = Database::open(dir.path().join("a.arkeion"), Options::default()).unwrap();
             let conn = db.connect().unwrap();
             conn.execute(CREATE, &[]).unwrap();
-            let ins = conn.prepare("INSERT INTO t (id, n) VALUES (?1, ?2)").unwrap();
+            let ins = conn
+                .prepare("INSERT INTO t (id, n) VALUES (?1, ?2)")
+                .unwrap();
             let t = Instant::now();
             for i in 1..=durable_n {
                 ins.execute(&params![i, i * 2]).unwrap();
@@ -125,7 +128,9 @@ fn run_arkeion(durable_n: i64, bulk_n: i64, scan_reps: i64) -> Vec<(&'static str
             let db = Database::open(dir.path().join("b.arkeion"), Options::default()).unwrap();
             let conn = db.connect().unwrap();
             conn.execute(CREATE, &[]).unwrap();
-            let ins = conn.prepare("INSERT INTO t (id, n) VALUES (?1, ?2)").unwrap();
+            let ins = conn
+                .prepare("INSERT INTO t (id, n) VALUES (?1, ?2)")
+                .unwrap();
             let t = Instant::now();
             conn.execute("BEGIN", &[]).unwrap();
             for i in 1..=bulk_n {
@@ -142,7 +147,9 @@ fn run_arkeion(durable_n: i64, bulk_n: i64, scan_reps: i64) -> Vec<(&'static str
     let conn = db.connect().unwrap();
     conn.execute(CREATE, &[]).unwrap();
     {
-        let ins = conn.prepare("INSERT INTO t (id, n) VALUES (?1, ?2)").unwrap();
+        let ins = conn
+            .prepare("INSERT INTO t (id, n) VALUES (?1, ?2)")
+            .unwrap();
         conn.execute("BEGIN", &[]).unwrap();
         for i in 1..=bulk_n {
             ins.execute(&params![i, i * 2]).unwrap();
@@ -178,7 +185,9 @@ fn run_arkeion(durable_n: i64, bulk_n: i64, scan_reps: i64) -> Vec<(&'static str
             let conn = db.connect().unwrap();
             conn.execute(CREATE, &[]).unwrap();
             {
-                let ins = conn.prepare("INSERT INTO t (id, n) VALUES (?1, ?2)").unwrap();
+                let ins = conn
+                    .prepare("INSERT INTO t (id, n) VALUES (?1, ?2)")
+                    .unwrap();
                 conn.execute("BEGIN", &[]).unwrap();
                 for i in 1..=durable_n {
                     ins.execute(&params![i, i * 2]).unwrap();
@@ -218,7 +227,9 @@ fn run_arkeion(durable_n: i64, bulk_n: i64, scan_reps: i64) -> Vec<(&'static str
             let conn = db.connect().unwrap();
             conn.execute(CREATE, &[]).unwrap();
             {
-                let ins = conn.prepare("INSERT INTO t (id, n) VALUES (?1, ?2)").unwrap();
+                let ins = conn
+                    .prepare("INSERT INTO t (id, n) VALUES (?1, ?2)")
+                    .unwrap();
                 conn.execute("BEGIN", &[]).unwrap();
                 for i in 1..=durable_n {
                     ins.execute(&params![i, i * 2]).unwrap();
@@ -240,10 +251,15 @@ fn run_arkeion(durable_n: i64, bulk_n: i64, scan_reps: i64) -> Vec<(&'static str
     let idb = Database::open(idir.path().join("i.arkeion"), Options::default()).unwrap();
     let iconn = idb.connect().unwrap();
     iconn
-        .execute("CREATE TABLE it (id INTEGER PRIMARY KEY, k INTEGER NOT NULL)", &[])
+        .execute(
+            "CREATE TABLE it (id INTEGER PRIMARY KEY, k INTEGER NOT NULL)",
+            &[],
+        )
         .unwrap();
     {
-        let ins = iconn.prepare("INSERT INTO it (id, k) VALUES (?1, ?2)").unwrap();
+        let ins = iconn
+            .prepare("INSERT INTO it (id, k) VALUES (?1, ?2)")
+            .unwrap();
         iconn.execute("BEGIN", &[]).unwrap();
         for i in 1..=bulk_n {
             ins.execute(&params![i, i * 2]).unwrap();
@@ -307,7 +323,9 @@ fn run_sqlite(durable_n: i64, bulk_n: i64, scan_reps: i64) -> Vec<(&'static str,
         median_of(DURABLE_REPS, || {
             let dir = bench_dir();
             let conn = open(dir.path().join("a.sqlite"));
-            let mut ins = conn.prepare("INSERT INTO t (id, n) VALUES (?1, ?2)").unwrap();
+            let mut ins = conn
+                .prepare("INSERT INTO t (id, n) VALUES (?1, ?2)")
+                .unwrap();
             let t = Instant::now();
             for i in 1..=durable_n {
                 ins.execute(rusqlite::params![i, i * 2]).unwrap();
@@ -419,7 +437,9 @@ fn run_sqlite(durable_n: i64, bulk_n: i64, scan_reps: i64) -> Vec<(&'static str,
     {
         let tx = iconn.unchecked_transaction().unwrap();
         {
-            let mut ins = tx.prepare("INSERT INTO it (id, k) VALUES (?1, ?2)").unwrap();
+            let mut ins = tx
+                .prepare("INSERT INTO it (id, k) VALUES (?1, ?2)")
+                .unwrap();
             for i in 1..=bulk_n {
                 ins.execute(rusqlite::params![i, i * 2]).unwrap();
             }
@@ -499,8 +519,11 @@ fn run_sqlite_audited(durable_n: i64, bulk_n: i64) -> (f64, f64) {
             let n = i * 2;
             prev = chain(&prev, i, n);
             let tx = conn.transaction().unwrap();
-            tx.execute("INSERT INTO t (id, n) VALUES (?1, ?2)", rusqlite::params![i, n])
-                .unwrap();
+            tx.execute(
+                "INSERT INTO t (id, n) VALUES (?1, ?2)",
+                rusqlite::params![i, n],
+            )
+            .unwrap();
             tx.execute(
                 "INSERT INTO t_log (rid, n, hash) VALUES (?1, ?2, ?3)",
                 rusqlite::params![i, n, &prev[..]],

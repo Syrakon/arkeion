@@ -28,9 +28,12 @@ use crate::io::{DbFile, sync_parent_dir};
 const METHOD_RAW: u8 = 0;
 const METHOD_LZ: u8 = 1;
 
-/// Tope de la caché de páginas (M9): ~16 MiB de bodies. Las páginas son
-/// inmutables, así que evictar nunca pierde datos: se releen del disco.
-const CACHE_CAP: usize = 4096;
+/// Tope **por defecto** de la caché de páginas: 16384 bodies ≈ **64 MiB**. Las
+/// páginas son inmutables, así que evictar nunca pierde datos (se releen del
+/// disco) — solo cuesta re-verificar su tag de integridad. Por eso el tope
+/// importa: un working set que cabe en caché evita esa re-verificación por fallo
+/// (el «acantilado» a datasets grandes). Configurable vía [`crate::Options`].
+const CACHE_CAP: usize = 16384;
 
 /// Construye el proveedor cripto para una clave opcional (D8): AES-256-GCM con
 /// clave, integridad SHA-256 sin ella.
@@ -57,49 +60,82 @@ pub struct Pager {
     state: Mutex<AppendState>,
 }
 
-/// Caché de páginas con tope y eviction LRU aproximada (M9). Cada entrada lleva
-/// el «tick» del último acceso; al superar el tope se evicta en lote (hasta 3/4
-/// del tope) descartando las más antiguas. O(n log n) por lote, amortizado a
-/// O(log n) por inserción (los lotes distan cap/4 inserciones).
+/// Caché de páginas con tope y eviction **CLOCK** (second-chance). El `get` pone
+/// el bit de referencia en O(1) (la ruta caliente: un `get` cacheado no debe
+/// pagar más que un lookup de hash); al estar llena, una manecilla recorre el
+/// anillo limpiando bits y desaloja la primera entrada con el bit a 0 — O(1)
+/// amortizado, sin ordenar ni asignar por desalojo (a diferencia de un LRU
+/// estricto, que haría el `get` O(log n)). Aproxima LRU lo bastante bien para una
+/// caché de páginas inmutables.
+struct Slot {
+    id: PageId,
+    page: Arc<PageBuf>,
+    referenced: bool,
+}
+
 struct PageCache {
-    map: HashMap<PageId, (Arc<PageBuf>, u64)>,
-    tick: u64,
+    slots: Vec<Slot>,
+    index: HashMap<PageId, usize>,
+    hand: usize,
     cap: usize,
 }
 
 impl PageCache {
     fn new(cap: usize) -> PageCache {
+        let cap = cap.max(1);
         PageCache {
-            map: HashMap::new(),
-            tick: 0,
+            slots: Vec::new(),
+            index: HashMap::with_capacity(cap.min(4096)),
+            hand: 0,
             cap,
         }
     }
 
     fn get(&mut self, id: PageId) -> Option<Arc<PageBuf>> {
-        self.tick += 1;
-        let tick = self.tick;
-        let (page, last) = self.map.get_mut(&id)?;
-        *last = tick;
-        Some(page.clone())
+        let &i = self.index.get(&id)?;
+        self.slots[i].referenced = true; // segunda oportunidad en el próximo barrido
+        Some(self.slots[i].page.clone())
     }
 
     fn insert(&mut self, id: PageId, page: Arc<PageBuf>) {
-        self.tick += 1;
-        self.map.insert(id, (page, self.tick));
-        if self.map.len() > self.cap {
-            self.evict_batch();
+        if let Some(&i) = self.index.get(&id) {
+            self.slots[i].page = page; // re-inserción de una página ya cacheada
+            self.slots[i].referenced = true;
+            return;
+        }
+        if self.slots.len() < self.cap {
+            let i = self.slots.len();
+            self.slots.push(Slot {
+                id,
+                page,
+                referenced: false,
+            });
+            self.index.insert(id, i);
+            return;
+        }
+        // Llena: avanza la manecilla dando una segunda oportunidad (bit a 1 →
+        // bórralo y sigue); desaloja la primera con el bit a 0 y reusa su hueco.
+        loop {
+            let i = self.hand;
+            self.hand = (self.hand + 1) % self.cap;
+            if self.slots[i].referenced {
+                self.slots[i].referenced = false;
+            } else {
+                self.index.remove(&self.slots[i].id);
+                self.index.insert(id, i);
+                self.slots[i] = Slot {
+                    id,
+                    page,
+                    referenced: false,
+                };
+                return;
+            }
         }
     }
 
-    /// Descarta las entradas más antiguas hasta dejar la caché a 3/4 del tope.
-    fn evict_batch(&mut self) {
-        let target = self.cap * 3 / 4;
-        let drop_n = self.map.len() - target;
-        let mut ticks: Vec<u64> = self.map.values().map(|(_, t)| *t).collect();
-        ticks.select_nth_unstable(drop_n - 1);
-        let threshold = ticks[drop_n - 1];
-        self.map.retain(|_, (_, t)| *t > threshold);
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.slots.len()
     }
 }
 
@@ -795,7 +831,7 @@ impl Pager {
 
     #[cfg(test)]
     fn cache_len(&self) -> usize {
-        self.cache.lock().expect("caché envenenada").map.len()
+        self.cache.lock().expect("caché envenenada").len()
     }
 }
 
@@ -1022,7 +1058,7 @@ mod tests {
         for i in 0..1000u64 {
             c.insert(PageId(i), Arc::new(PageBuf::zeroed()));
         }
-        assert!(c.map.len() <= 100, "len {} > tope 100", c.map.len());
+        assert!(c.len() <= 100, "len {} > tope 100", c.len());
         // Las recién insertadas siguen; las primeras se evictaron.
         assert!(c.get(PageId(999)).is_some());
         assert!(c.get(PageId(0)).is_none());

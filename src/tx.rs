@@ -931,16 +931,19 @@ fn build_compacted(
 fn resolve_branch_head(pager: &Arc<Pager>, global: &Head, branch: &str) -> Result<BranchHead> {
     match read_ref(pager, global.meta_root, branch)? {
         Some(version) => {
-            // El `commit_page` solo lo tiene a mano la rama tip (head global);
-            // para las demás es informativo (no lo usa la lógica).
-            let commit_page = if version == global.version {
-                global.commit_page
+            // En la punta global (rama tip; el caso común de cada query sobre
+            // main) el `data_root` y el `commit_page` ya están en el head global:
+            // se evita el 2º paseo de meta (`read_data_root`). Para versiones más
+            // viejas u otras ramas sí hay que leerlo, y el commit_page es
+            // informativo (no lo usa la lógica).
+            let (data_root, commit_page) = if version == global.version {
+                (global.data_root, global.commit_page)
             } else {
-                0
+                (read_data_root(pager, global.meta_root, version)?, 0)
             };
             Ok(BranchHead {
                 version,
-                data_root: read_data_root(pager, global.meta_root, version)?,
+                data_root,
                 commit_page,
             })
         }

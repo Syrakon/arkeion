@@ -749,6 +749,12 @@ pub fn run_select(src: &impl DataSource, stmt: &SelectStmt, params: &[Value]) ->
             }
         }
     }
+    // `SELECT *` (única proyección que copia la fila combinada entera): la salida
+    // ES la entrada, así que se mueve sin re-clonar valor a valor (camino canónico
+    // del full scan).
+    if matches!(projections.as_slice(), [None]) {
+        return Ok(SelectOut { columns, rows });
+    }
     let mut out_rows = Vec::with_capacity(rows.len());
     for row in &rows {
         let mut out = Vec::with_capacity(columns.len());

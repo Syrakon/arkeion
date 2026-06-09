@@ -76,6 +76,8 @@ pub mod catalog;
 #[doc(hidden)]
 pub mod commit;
 #[doc(hidden)]
+pub mod compress;
+#[doc(hidden)]
 pub mod crypto;
 #[doc(hidden)]
 pub mod exec;

@@ -217,6 +217,7 @@ fn validate_columns(e: &Expr, schema: &QuerySchema) -> Result<()> {
         Expr::Aggregate { arg, .. } => arg
             .as_deref()
             .map_or(Ok(()), |e| validate_columns(e, schema)),
+        Expr::Function { args, .. } => args.iter().try_for_each(|a| validate_columns(a, schema)),
     }
 }
 
@@ -1081,6 +1082,7 @@ fn col_outside_agg(e: &Expr) -> Option<&str> {
         Expr::Like { expr, pattern, .. } => {
             col_outside_agg(expr).or_else(|| col_outside_agg(pattern))
         }
+        Expr::Function { args, .. } => args.iter().find_map(col_outside_agg),
     }
 }
 
@@ -1109,6 +1111,9 @@ fn collect_columns(e: &Expr, skip_agg: bool, out: &mut Vec<ColRef>) {
             if !skip_agg && let Some(a) = arg {
                 collect_columns(a, skip_agg, out);
             }
+        }
+        Expr::Function { args, .. } => {
+            args.iter().for_each(|a| collect_columns(a, skip_agg, out));
         }
     }
 }
@@ -1291,6 +1296,13 @@ fn fold_aggregates(
             expr: Box::new(fold_aggregates(expr, schema, rows, params)?),
             pattern: Box::new(fold_aggregates(pattern, schema, rows, params)?),
             negated: *negated,
+        },
+        Expr::Function { name, args } => Expr::Function {
+            name: name.clone(),
+            args: args
+                .iter()
+                .map(|a| fold_aggregates(a, schema, rows, params))
+                .collect::<Result<_>>()?,
         },
     })
 }
@@ -1488,6 +1500,139 @@ fn eval(e: &Expr, row: Option<(&QuerySchema, &[Value])>, params: &[Value]) -> Re
                 }
             }
         }
+        Expr::Function { name, args } => {
+            let vals: Vec<Value> = args
+                .iter()
+                .map(|a| eval(a, row, params))
+                .collect::<Result<_>>()?;
+            call_function(name, &vals)
+        }
+    }
+}
+
+/// Funciones escalares built-in (insensibles a mayúsculas). NULL se propaga
+/// (salvo `coalesce`/`ifnull`); el tipo equivocado es un error, no una coerción
+/// silenciosa (filosofía human-first del motor).
+fn call_function(name: &str, args: &[Value]) -> Result<Value> {
+    let lname = name.to_ascii_lowercase();
+    let bad_arity = || sql_err(format!("número de argumentos inválido para {lname}()"));
+    let need_num = |v: &Value| {
+        sql_err(format!(
+            "{lname}() requiere un número, no {}",
+            v.type_name()
+        ))
+    };
+    let need_text = |v: &Value| sql_err(format!("{lname}() requiere TEXT, no {}", v.type_name()));
+    match lname.as_str() {
+        "upper" | "lower" => match args {
+            [Value::Null] => Ok(Value::Null),
+            [Value::Text(s)] => Ok(Value::Text(if lname == "upper" {
+                s.to_uppercase()
+            } else {
+                s.to_lowercase()
+            })),
+            [v] => Err(need_text(v)),
+            _ => Err(bad_arity()),
+        },
+        "length" | "char_length" => match args {
+            [Value::Null] => Ok(Value::Null),
+            [Value::Text(s)] => Ok(Value::Integer(s.chars().count() as i64)),
+            [Value::Blob(b)] => Ok(Value::Integer(b.len() as i64)),
+            [v] => Err(sql_err(format!(
+                "length() requiere TEXT o BLOB, no {}",
+                v.type_name()
+            ))),
+            _ => Err(bad_arity()),
+        },
+        "trim" | "ltrim" | "rtrim" => match args {
+            [Value::Null] => Ok(Value::Null),
+            [Value::Text(s)] => Ok(Value::Text(match lname.as_str() {
+                "ltrim" => s.trim_start().to_string(),
+                "rtrim" => s.trim_end().to_string(),
+                _ => s.trim().to_string(),
+            })),
+            [v] => Err(need_text(v)),
+            _ => Err(bad_arity()),
+        },
+        "abs" => match args {
+            [Value::Null] => Ok(Value::Null),
+            [Value::Integer(n)] => n
+                .checked_abs()
+                .map(Value::Integer)
+                .ok_or_else(|| sql_err("desbordamiento de entero en abs()")),
+            [Value::Real(f)] => Ok(Value::Real(f.abs())),
+            [v] => Err(need_num(v)),
+            _ => Err(bad_arity()),
+        },
+        "round" => {
+            let (x, digits) = match args {
+                [x] => (x, 0i64),
+                [x, Value::Integer(d)] => (x, *d),
+                [_, v] => {
+                    return Err(sql_err(format!(
+                        "round(): el 2º argumento debe ser un entero, no {}",
+                        v.type_name()
+                    )));
+                }
+                _ => return Err(bad_arity()),
+            };
+            match x {
+                Value::Null => Ok(Value::Null),
+                Value::Integer(n) => Ok(Value::Real(*n as f64)),
+                Value::Real(f) => {
+                    let p = 10f64.powi(digits.clamp(0, 15) as i32);
+                    Ok(Value::Real((f * p).round() / p))
+                }
+                v => Err(need_num(v)),
+            }
+        }
+        "coalesce" => {
+            if args.is_empty() {
+                return Err(bad_arity());
+            }
+            Ok(args
+                .iter()
+                .find(|v| !matches!(v, Value::Null))
+                .cloned()
+                .unwrap_or(Value::Null))
+        }
+        "ifnull" => match args {
+            [a, b] => Ok(if matches!(a, Value::Null) {
+                b.clone()
+            } else {
+                a.clone()
+            }),
+            _ => Err(bad_arity()),
+        },
+        "typeof" => match args {
+            [v] => Ok(Value::Text(v.type_name().to_string())),
+            _ => Err(bad_arity()),
+        },
+        "substr" | "substring" => {
+            let (s, start, len) = match args {
+                [Value::Null, ..] => return Ok(Value::Null),
+                [Value::Text(s), Value::Integer(start)] => (s, *start, None),
+                [Value::Text(s), Value::Integer(start), Value::Integer(len)] => {
+                    (s, *start, Some(*len))
+                }
+                _ => return Err(sql_err("substr(texto, inicio [, largo]) con enteros")),
+            };
+            let chars: Vec<char> = s.chars().collect();
+            let n = chars.len() as i64;
+            // 1-based como SQLite; `inicio` negativo cuenta desde el final.
+            let begin = if start < 0 {
+                (n + start).max(0)
+            } else {
+                (start - 1).max(0)
+            };
+            let end = match len {
+                Some(l) => (begin + l.max(0)).min(n),
+                None => n,
+            };
+            let (b, e) = (begin.min(n) as usize, end.max(begin).min(n) as usize);
+            Ok(Value::Text(chars[b..e].iter().collect()))
+        }
+        _ => Err(sql_err(format!("función desconocida: {name}()"))),
     }
 }
 

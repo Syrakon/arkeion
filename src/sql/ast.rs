@@ -174,6 +174,13 @@ pub enum Expr {
         func: AggFunc,
         arg: Option<Box<Expr>>,
     },
+    /// Llamada a una función **escalar** built-in: `nombre(arg, …)` (no agregado).
+    /// El nombre se resuelve en exec (insensible a mayúsculas); aridad y tipos se
+    /// validan ahí. P. ej. `UPPER(s)`, `COALESCE(a, b)`, `ROUND(x, 2)`.
+    Function {
+        name: String,
+        args: Vec<Expr>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -210,6 +217,7 @@ impl Expr {
             Expr::Binary(a, _, b) => a.is_const() && b.is_const(),
             Expr::IsNull { expr, .. } => expr.is_const(),
             Expr::Like { expr, pattern, .. } => expr.is_const() && pattern.is_const(),
+            Expr::Function { args, .. } => args.iter().all(Expr::is_const),
         }
     }
 
@@ -222,6 +230,7 @@ impl Expr {
             Expr::IsNull { expr, .. } => expr.contains_param(),
             Expr::Like { expr, pattern, .. } => expr.contains_param() || pattern.contains_param(),
             Expr::Aggregate { arg, .. } => arg.as_ref().is_some_and(|e| e.contains_param()),
+            Expr::Function { args, .. } => args.iter().any(Expr::contains_param),
         }
     }
 
@@ -233,6 +242,7 @@ impl Expr {
             Expr::Binary(a, _, b) => a.has_aggregate() || b.has_aggregate(),
             Expr::IsNull { expr, .. } => expr.has_aggregate(),
             Expr::Like { expr, pattern, .. } => expr.has_aggregate() || pattern.has_aggregate(),
+            Expr::Function { args, .. } => args.iter().any(Expr::has_aggregate),
         }
     }
 }

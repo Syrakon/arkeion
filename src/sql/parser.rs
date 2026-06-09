@@ -708,26 +708,41 @@ impl Parser {
                         name: col,
                     });
                 }
-                // agregado(expr | *)
+                // `nombre(...)`: agregado o función escalar.
                 if self.eat(&Tok::LParen) {
-                    let func = match name.to_ascii_uppercase().as_str() {
-                        "COUNT" => AggFunc::Count,
-                        "SUM" => AggFunc::Sum,
-                        "AVG" => AggFunc::Avg,
-                        "MIN" => AggFunc::Min,
-                        "MAX" => AggFunc::Max,
-                        _ => return Err(err_at(pos, format!("función desconocida: {name}"))),
+                    let agg = match name.to_ascii_uppercase().as_str() {
+                        "COUNT" => Some(AggFunc::Count),
+                        "SUM" => Some(AggFunc::Sum),
+                        "AVG" => Some(AggFunc::Avg),
+                        "MIN" => Some(AggFunc::Min),
+                        "MAX" => Some(AggFunc::Max),
+                        _ => None,
                     };
-                    let arg = if self.eat(&Tok::Star) {
-                        if func != AggFunc::Count {
-                            return Err(err_at(pos, "solo COUNT admite '*'"));
+                    if let Some(func) = agg {
+                        let arg = if self.eat(&Tok::Star) {
+                            if func != AggFunc::Count {
+                                return Err(err_at(pos, "solo COUNT admite '*'"));
+                            }
+                            None
+                        } else {
+                            Some(Box::new(self.expr()?))
+                        };
+                        self.expect(&Tok::RParen, "')'")?;
+                        return Ok(Expr::Aggregate { func, arg });
+                    }
+                    // Función escalar built-in: `nombre(arg, …)` (el nombre se
+                    // resuelve en exec; `*` no se admite como argumento).
+                    let mut args = Vec::new();
+                    if !matches!(self.peek(), Some(Tok::RParen)) {
+                        loop {
+                            args.push(self.expr()?);
+                            if !self.eat(&Tok::Comma) {
+                                break;
+                            }
                         }
-                        None
-                    } else {
-                        Some(Box::new(self.expr()?))
-                    };
+                    }
                     self.expect(&Tok::RParen, "')'")?;
-                    return Ok(Expr::Aggregate { func, arg });
+                    return Ok(Expr::Function { name, args });
                 }
                 Ok(Expr::Column { table: None, name })
             }
@@ -923,7 +938,11 @@ mod tests {
                 ..
             }
         ));
-        assert!(parse("SELECT NOPE(1) FROM t").is_err());
+        // Una función no-agregado parsea como Function (su validez la decide exec).
+        assert!(matches!(
+            parse("SELECT NOPE(1) FROM t"),
+            Ok(Stmt::Select(_))
+        ));
         assert!(parse("SELECT SUM(*) FROM t").is_err());
     }
 

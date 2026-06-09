@@ -9,7 +9,7 @@
 //! barrido byte-a-byte completo (la conjunción literal del criterio) está en
 //! `fuzz_every_historical_byte`, marcado `#[ignore]` por coste (~25 s).
 
-use arkeion::format::{FIRST_DATA_PAGE, PAGE_SIZE};
+use arkeion::format::{CRYPTO_RESERVE, FIRST_DATA_PAGE, LEN_PREFIX_LEN};
 use arkeion::{Database, Error, Options, params};
 
 fn build(path: &std::path::Path, inserts: i64) {
@@ -26,12 +26,34 @@ fn build(path: &std::path::Path, inserts: i64) {
     }
 }
 
-/// Rango de páginas históricas: de la primera de datos a justo antes de la de
-/// commit del head (la última), que no es histórica. Las páginas 0..3 (cabecera
-/// y meta slots) no forman parte de la cadena.
-fn historical_pages(file_len: usize) -> std::ops::Range<usize> {
-    let last = file_len / PAGE_SIZE - 1;
-    FIRST_DATA_PAGE.0 as usize..last
+/// Spans `(offset payload, len)` de los registros de la zona append, barriendo el
+/// log público v2 `[u32 len][payload]` en orden de id (igual que el pager).
+fn record_spans(bytes: &[u8]) -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
+    let mut off = FIRST_DATA_PAGE.byte_offset() as usize;
+    while off + LEN_PREFIX_LEN <= bytes.len() {
+        let len = u32::from_le_bytes(bytes[off..off + LEN_PREFIX_LEN].try_into().unwrap()) as usize;
+        let payload = off + LEN_PREFIX_LEN;
+        if len < CRYPTO_RESERVE || payload + len > bytes.len() {
+            break;
+        }
+        spans.push((payload, len));
+        off = payload + len;
+    }
+    spans
+}
+
+/// Registros históricos: todos menos el último (la página de commit del head, que
+/// no es histórica). Incluye las páginas de datos del head, que `verify` revalida
+/// vía `content_hash`. Manipular la página de commit del head no daría
+/// `ChainBroken` sino una recuperación a una versión previa —eso lo cubren las
+/// anclas de auditoría—, por eso se excluye. Cabecera y meta slots (páginas 0..3)
+/// no forman parte de la cadena. Solo se manipula el **payload** sellado: tocar el
+/// prefijo de longitud es un daño de framing (lo ve el re-open/ancla, no `verify`).
+fn historical_records(bytes: &[u8]) -> Vec<(usize, usize)> {
+    let mut spans = record_spans(bytes);
+    spans.pop(); // descarta la página de commit del head
+    spans
 }
 
 #[test]
@@ -57,12 +79,12 @@ fn tampering_a_historical_page_breaks_the_chain() {
     build(&path, 3);
 
     let original = std::fs::read(&path).unwrap();
-    let pages = historical_pages(original.len());
-    assert!(pages.len() >= 2, "deberían existir páginas históricas");
+    let records = historical_records(&original);
+    assert!(records.len() >= 2, "deberían existir registros históricos");
 
-    // Un byte de body en cada página histórica ⇒ ChainBroken.
-    for page in pages {
-        let off = page * PAGE_SIZE + 100;
+    // Un byte del payload de cada registro histórico ⇒ ChainBroken.
+    for (payload, len) in records {
+        let off = payload + len / 2;
         let mut bytes = original.clone();
         bytes[off] ^= 0x01;
         std::fs::write(&path, &bytes).unwrap();
@@ -70,7 +92,7 @@ fn tampering_a_historical_page_breaks_the_chain() {
         let result = Database::open(&path, Options::default()).and_then(|db| db.verify());
         assert!(
             matches!(result, Err(Error::ChainBroken { .. })),
-            "página {page}: {result:?}"
+            "registro en {payload}: {result:?}"
         );
     }
 
@@ -96,20 +118,16 @@ fn fuzz_every_historical_byte() {
     build(&path, 1); // mínimo con una página de commit histórica
 
     let original = std::fs::read(&path).unwrap();
-    let pages = historical_pages(original.len());
-    let (start, end) = (pages.start * PAGE_SIZE, pages.end * PAGE_SIZE);
-
-    for off in start..end {
-        let mut bytes = original.clone();
-        bytes[off] ^= 0x01;
-        std::fs::write(&path, &bytes).unwrap();
-        let detected = Database::open(&path, Options::default())
-            .and_then(|db| db.verify())
-            .is_err();
-        assert!(
-            detected,
-            "byte {off} (página {}) no detectado",
-            off / PAGE_SIZE
-        );
+    // Cada byte del payload sellado de cada registro histórico.
+    for (payload, len) in historical_records(&original) {
+        for off in payload..payload + len {
+            let mut bytes = original.clone();
+            bytes[off] ^= 0x01;
+            std::fs::write(&path, &bytes).unwrap();
+            let detected = Database::open(&path, Options::default())
+                .and_then(|db| db.verify())
+                .is_err();
+            assert!(detected, "byte {off} no detectado");
+        }
     }
 }

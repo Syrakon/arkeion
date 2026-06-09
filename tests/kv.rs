@@ -4,7 +4,9 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use arkeion::commit::CommitHeader;
-use arkeion::format::{CRYPTO_RESERVE, MetaSlot, PAGE_SIZE};
+use arkeion::format::{
+    BODY_SIZE, CRYPTO_RESERVE, FIRST_DATA_PAGE, LEN_PREFIX_LEN, MetaSlot, PAGE_SIZE,
+};
 use arkeion::tx::Store;
 
 fn db(dir: &tempfile::TempDir) -> PathBuf {
@@ -270,18 +272,31 @@ fn crash_truncation_never_loses_a_commit_nor_resurrects_one() {
     let dir = tempfile::tempdir().unwrap();
     let path = db(&dir);
     let (bytes, states, commit_ends) = build_committed_db(&path);
-    let total_pages = bytes.len() / PAGE_SIZE;
-    assert_eq!(bytes.len() % PAGE_SIZE, 0);
     assert_eq!(commit_ends.len(), 4);
 
+    // v2: la zona append es un log de registros de longitud variable, así que el
+    // archivo ya no es múltiplo de PAGE_SIZE. El comportamiento solo cambia en las
+    // **fronteras de commit** (donde sube la versión recuperada); cortar en
+    // cualquier punto interior recupera el último commit cuyo registro de commit
+    // cabe entero. Probamos el entorno de cada frontera y un barrido interior.
+    let file_len = bytes.len() as u64;
+    let start = FIRST_DATA_PAGE.byte_offset();
     let mut cuts: Vec<u64> = Vec::new();
-    for p in 3..=total_pages as u64 {
-        let base = p * PAGE_SIZE as u64;
-        cuts.push(base);
-        if p < total_pages as u64 {
-            cuts.extend([base + 1, base + 2048, base + PAGE_SIZE as u64 - 1]);
+    for &(_, end) in &commit_ends {
+        for d in [-2i64, -1, 0, 1, 2] {
+            let c = end as i64 + d;
+            if (start as i64..=file_len as i64).contains(&c) {
+                cuts.push(c as u64);
+            }
         }
     }
+    let mut c = start;
+    while c <= file_len {
+        cuts.push(c);
+        c += 251; // primo: ofrece offsets variados dentro de los registros
+    }
+    cuts.sort_unstable();
+    cuts.dedup();
 
     let work = dir.path().join("cut.arkeion");
     for &cut in &cuts {
@@ -351,14 +366,39 @@ fn hash_chain_is_linked_and_externally_readable() {
     let path = db(&dir);
     let (bytes, _, commit_ends) = build_committed_db(&path);
 
-    let body_of = |page: u64| -> &[u8] {
+    // Reconstruye el directorio de páginas barriendo el log de la zona append
+    // (formato público v2): cada registro es `[u32 len][payload sellado]`, en
+    // orden de id desde FIRST_DATA_PAGE. dir[i] localiza la página id 3 + i.
+    let mut dir_offsets: Vec<(usize, usize)> = Vec::new(); // (offset payload, len)
+    let mut off = FIRST_DATA_PAGE.byte_offset() as usize;
+    while off + LEN_PREFIX_LEN <= bytes.len() {
+        let len = u32::from_le_bytes(bytes[off..off + LEN_PREFIX_LEN].try_into().unwrap()) as usize;
+        let payload = off + LEN_PREFIX_LEN;
+        if len < CRYPTO_RESERVE || payload + len > bytes.len() {
+            break;
+        }
+        dir_offsets.push((payload, len));
+        off = payload + len;
+    }
+
+    // Body lógico de una página de datos (sin cifrar): el ciphertext es el
+    // plaintext recortado; se rellena con ceros hasta BODY_SIZE para decodificar.
+    let data_body = |page: u64| -> Vec<u8> {
+        let (payload, len) = dir_offsets[(page - FIRST_DATA_PAGE.0) as usize];
+        let mut body = vec![0u8; BODY_SIZE];
+        let plain = &bytes[payload + CRYPTO_RESERVE..payload + len];
+        body[..plain.len()].copy_from_slice(plain);
+        body
+    };
+    // Los meta slots siguen en slots fijos de PAGE_SIZE (páginas 1 y 2).
+    let meta_body = |page: u64| -> &[u8] {
         let off = page as usize * PAGE_SIZE;
         &bytes[off + CRYPTO_RESERVE..off + PAGE_SIZE]
     };
 
     let meta = [1u64, 2]
         .into_iter()
-        .filter_map(|p| MetaSlot::decode(body_of(p)))
+        .filter_map(|p| MetaSlot::decode(meta_body(p)))
         .max_by_key(|m| m.version)
         .expect("algún meta slot válido");
     assert_eq!(meta.version, 4);
@@ -367,7 +407,7 @@ fn hash_chain_is_linked_and_externally_readable() {
     let mut expected_version = 4u64;
     let mut child_prev_chain: Option<[u8; 32]> = None;
     while page != 0 {
-        let h = CommitHeader::decode(body_of(page)).expect("página de commit válida");
+        let h = CommitHeader::decode(&data_body(page)).expect("página de commit válida");
         assert_eq!(h.version, expected_version);
         assert_eq!(h.branch, "main");
         assert_eq!(

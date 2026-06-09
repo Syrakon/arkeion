@@ -11,11 +11,12 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
+use crate::commit::Head;
 use crate::crypto::{Aes256GcmProvider, CryptoProvider, Key, PlainProvider};
 use crate::error::{Error, Result};
 use crate::format::{
-    FIRST_DATA_PAGE, FLAG_ENCRYPTED, FileHeader, HEADER_PAGE, MAGIC_HEADER, META_PAGE_A,
-    META_PAGE_B, MetaSlot, PAGE_SIZE, PageBuf, PageId,
+    CRYPTO_RESERVE, FIRST_DATA_PAGE, FLAG_ENCRYPTED, FileHeader, HEADER_PAGE, LEN_PREFIX_LEN,
+    MAGIC_HEADER, META_PAGE_A, META_PAGE_B, MetaSlot, PageBuf, PageId,
 };
 use crate::io::{DbFile, sync_parent_dir};
 
@@ -90,12 +91,55 @@ impl PageCache {
     }
 }
 
+/// Localización física de una página lógica en la zona append (v2, M10): dónde
+/// empieza su payload sellado y cuánto mide. El directorio del pager traduce
+/// `page_id → PhysLoc`; las páginas son inmutables, así que una entrada nunca
+/// cambia una vez escrita (el directorio es append-only como el resto).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PhysLoc {
+    /// Offset del payload sellado, tras el prefijo de longitud del registro.
+    offset: u64,
+    /// Longitud del payload sellado (`nonce ‖ tag ‖ ciphertext`).
+    len: u32,
+}
+
 #[derive(Debug)]
 struct AppendState {
     next_page: u64,
     /// Contador de nonces GCM (D6). `PlainProvider` lo ignora; su valor real
     /// se persiste y recupera vía páginas de commit (M1/M7).
     nonce_counter: u64,
+    /// Offset físico donde se añade el próximo registro (fin de la zona append).
+    write_offset: u64,
+    /// Directorio de páginas (v2, M10): `dir[i]` localiza la página lógica
+    /// `FIRST_DATA_PAGE + i`. Se reconstruye al abrir barriendo los prefijos de
+    /// longitud de la zona append.
+    dir: Vec<PhysLoc>,
+}
+
+impl AppendState {
+    /// Localización de una página de datos, o `None` si su id no está en el
+    /// directorio (estructural, fuera de rango o aún sin publicar).
+    fn loc(&self, id: PageId) -> Option<PhysLoc> {
+        let idx = id.0.checked_sub(FIRST_DATA_PAGE.0)?;
+        self.dir.get(idx as usize).copied()
+    }
+}
+
+/// Enmarca un payload sellado: `[u32 LE len][payload]` (v2, M10).
+fn frame(stored: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(LEN_PREFIX_LEN + stored.len());
+    out.extend_from_slice(&(stored.len() as u32).to_le_bytes());
+    out.extend_from_slice(stored);
+    out
+}
+
+/// Body sin su cola de ceros: la compresión gratuita de v2. El body lógico sigue
+/// siendo `BODY_SIZE`; al leer se rellena con ceros, así que el round-trip y el
+/// `content_hash` son idénticos. Un body todo ceros se recorta a vacío.
+fn trim_trailing_zeros(body: &[u8]) -> &[u8] {
+    let end = body.iter().rposition(|&b| b != 0).map_or(0, |p| p + 1);
+    &body[..end]
 }
 
 impl Pager {
@@ -146,6 +190,8 @@ impl Pager {
             state: Mutex::new(AppendState {
                 next_page: FIRST_DATA_PAGE.0,
                 nonce_counter: 0,
+                write_offset: FIRST_DATA_PAGE.byte_offset(),
+                dir: Vec::new(),
             }),
         };
 
@@ -220,14 +266,19 @@ impl Pager {
             plain: PlainProvider,
             crypto,
             cache: Mutex::new(PageCache::new(CACHE_CAP)),
-            // floor: una página final a medio escribir queda fuera y será
-            // sobrescrita por el siguiente append (truncado lógico).
             state: Mutex::new(AppendState {
-                next_page: (len / PAGE_SIZE as u64).max(FIRST_DATA_PAGE.0),
+                next_page: FIRST_DATA_PAGE.0,
                 nonce_counter: 0,
+                write_offset: FIRST_DATA_PAGE.byte_offset(),
+                dir: Vec::new(),
             }),
         };
         pager.read_meta()?;
+        // Reconstruye el directorio de páginas (v2, M10) barriendo los prefijos
+        // de longitud de la zona append; fija `next_page` y `write_offset` al
+        // extremo físico (incluida la cola rota, que recover/`truncate_to_head`
+        // descartan después).
+        pager.sweep_append_region(len)?;
 
         // Validación de clave (M7): la primera página de datos debe descifrar.
         // Una clave errónea aflora aquí como `WrongKey`, no como una base vacía
@@ -240,20 +291,66 @@ impl Pager {
         Ok(pager)
     }
 
-    /// Añade una página a la zona append. `build` rellena el body en claro;
-    /// el sellado ocurre al salir hacia el disco. No hace fsync: el llamador
-    /// agrupa appends y llama a `sync` (protocolo de commit, M1).
+    /// Barrido de la zona append (v2, M10): camina los registros
+    /// `[u32 len][payload]` en orden de id desde `FIRST_DATA_PAGE`, anotando cada
+    /// localización en el directorio. Para en el primer registro incompleto o con
+    /// `len` imposible (la cola rota): truncado lógico. No descifra —los prefijos
+    /// son texto plano—; la validación de cada página es perezosa (`read_page`) y
+    /// la de la cadena la hace `recover`. Coste O(páginas); el directorio
+    /// persistido (Slice D) lo bajará a O(log n).
+    fn sweep_append_region(&self, file_len: u64) -> Result<()> {
+        let mut state = self.state.lock().expect("estado del pager envenenado");
+        let mut offset = FIRST_DATA_PAGE.byte_offset();
+        loop {
+            if offset + LEN_PREFIX_LEN as u64 > file_len {
+                break;
+            }
+            let mut prefix = [0u8; LEN_PREFIX_LEN];
+            if self.file.read_exact_at(&mut prefix, offset).is_err() {
+                break;
+            }
+            let stored_len = u32::from_le_bytes(prefix);
+            let payload = offset + LEN_PREFIX_LEN as u64;
+            // Un payload menor que la reserva cripto, o que no cabe en el archivo,
+            // marca el inicio de la cola rota: para aquí.
+            if (stored_len as usize) < CRYPTO_RESERVE || payload + stored_len as u64 > file_len {
+                break;
+            }
+            state.dir.push(PhysLoc {
+                offset: payload,
+                len: stored_len,
+            });
+            offset = payload + stored_len as u64;
+        }
+        state.next_page = FIRST_DATA_PAGE.0 + state.dir.len() as u64;
+        state.write_offset = offset;
+        Ok(())
+    }
+
+    /// Añade una página a la zona append como un registro enmarcado de longitud
+    /// variable (v2, M10). `build` rellena el body en claro; al salir hacia el
+    /// disco se recorta la cola de ceros, se sella y se enmarca. No hace fsync:
+    /// el llamador agrupa appends y llama a `sync` (protocolo de commit, M1).
     pub fn append_page(&self, build: impl FnOnce(&mut [u8])) -> Result<PageId> {
         let mut page = PageBuf::zeroed();
         build(page.body_mut());
+        let cached = Arc::new(page.clone());
 
         let mut state = self.state.lock().expect("estado del pager envenenado");
         let id = PageId(state.next_page);
-        let cached = Arc::new(page.clone());
-        self.crypto.seal(&mut page, id, state.nonce_counter);
-        self.file.write_all_at(page.as_bytes(), id.byte_offset())?;
+        let offset = state.write_offset;
+        let stored =
+            self.crypto
+                .seal_bytes(trim_trailing_zeros(page.body()), id, state.nonce_counter);
+        let framed = frame(&stored);
+        self.file.write_all_at(&framed, offset)?;
+        state.dir.push(PhysLoc {
+            offset: offset + LEN_PREFIX_LEN as u64,
+            len: stored.len() as u32,
+        });
         state.next_page += 1;
         state.nonce_counter += 1;
+        state.write_offset = offset + framed.len() as u64;
         drop(state);
 
         self.cache
@@ -263,26 +360,36 @@ impl Pager {
         Ok(id)
     }
 
-    /// Lee una página de la zona append, verificada y cacheada.
+    /// Lee una página de la zona append, verificada y cacheada. Resuelve la
+    /// posición física por el directorio (v2, M10), lee el payload sellado, lo
+    /// abre y reconstruye el body lógico rellenando con ceros la cola recortada.
     pub fn read_page(&self, id: PageId) -> Result<Arc<PageBuf>> {
         debug_assert!(
             id >= FIRST_DATA_PAGE,
             "las páginas estructurales no pasan por read_page"
         );
-        if id.0 >= self.n_pages() {
-            return Err(Error::Corrupt {
+        let loc = {
+            let state = self.state.lock().expect("estado del pager envenenado");
+            if id.0 >= state.next_page {
+                return Err(Error::Corrupt {
+                    page: id.0,
+                    reason: "página fuera de rango",
+                });
+            }
+            state.loc(id).ok_or(Error::Corrupt {
                 page: id.0,
-                reason: "página fuera de rango",
-            });
-        }
+                reason: "página sin entrada en el directorio",
+            })?
+        };
         if let Some(p) = self.cache.lock().expect("caché envenenada").get(id) {
             return Ok(p);
         }
 
+        let mut stored = vec![0u8; loc.len as usize];
+        self.file.read_exact_at(&mut stored, loc.offset)?;
+        let body = self.crypto.open_bytes(&stored, id)?;
         let mut page = PageBuf::zeroed();
-        self.file
-            .read_exact_at(page.as_bytes_mut(), id.byte_offset())?;
-        self.crypto.open(&mut page, id)?;
+        page.body_mut()[..body.len()].copy_from_slice(&body);
         let page = Arc::new(page);
         self.cache
             .lock()
@@ -296,21 +403,83 @@ impl Pager {
         self.file.sync_data().map_err(Error::from)
     }
 
-    /// Escribe una página en una posición de la zona append reservada por el
-    /// escritor único (commit, M1). No toca `next_page`: el cursor lo publica
-    /// el commit con `set_n_pages` tras el fsync de durabilidad.
-    pub fn write_reserved_page(&self, id: PageId, page: &PageBuf) -> Result<()> {
-        debug_assert!(
-            id >= FIRST_DATA_PAGE,
-            "posición reservada fuera de la zona append"
-        );
-        let mut sealed = page.clone();
+    /// Sella, enmarca y escribe `body` (claro) para la página lógica `id` en
+    /// `offset` (v2, M10). Devuelve `(longitud total del registro, PhysLoc)`.
+    /// Avanza el contador de nonce pero **no** toca el directorio ni
+    /// `write_offset`: el commit los instala atómicamente con
+    /// [`install_commit`](Pager::install_commit) tras el fsync de durabilidad.
+    /// Un fallo a mitad de commit deja las escrituras como cola rota (sin estado
+    /// en memoria que revertir): el próximo commit las pisa.
+    pub(crate) fn write_record_at(
+        &self,
+        id: PageId,
+        body: &[u8],
+        offset: u64,
+    ) -> Result<(u64, PhysLoc)> {
+        debug_assert!(id >= FIRST_DATA_PAGE, "registro fuera de la zona append");
+        let counter = {
+            let mut state = self.state.lock().expect("estado del pager envenenado");
+            let c = state.nonce_counter;
+            state.nonce_counter += 1;
+            c
+        };
+        let stored = self
+            .crypto
+            .seal_bytes(trim_trailing_zeros(body), id, counter);
+        let framed = frame(&stored);
+        self.file.write_all_at(&framed, offset)?;
+        let loc = PhysLoc {
+            offset: offset + LEN_PREFIX_LEN as u64,
+            len: stored.len() as u32,
+        };
+        Ok((framed.len() as u64, loc))
+    }
+
+    /// Offset físico donde se añadirá el próximo registro (base de un commit).
+    pub(crate) fn write_offset(&self) -> u64 {
+        self.state
+            .lock()
+            .expect("estado del pager envenenado")
+            .write_offset
+    }
+
+    /// Instala atómicamente el resultado de un commit (escritor único): añade las
+    /// entradas de directorio en orden de id, avanza `write_offset` y publica
+    /// `next_page`. Hasta esta llamada las páginas recién escritas viven solo en
+    /// la caché; una cola rota anterior queda lógicamente truncada al publicar.
+    pub(crate) fn install_commit(
+        &self,
+        entries: &[(PageId, PhysLoc)],
+        write_offset: u64,
+        n_pages: u64,
+    ) {
         let mut state = self.state.lock().expect("estado del pager envenenado");
-        self.crypto.seal(&mut sealed, id, state.nonce_counter);
-        state.nonce_counter += 1;
-        self.file
-            .write_all_at(sealed.as_bytes(), id.byte_offset())?;
-        Ok(())
+        for &(id, loc) in entries {
+            debug_assert_eq!(
+                id.0,
+                FIRST_DATA_PAGE.0 + state.dir.len() as u64,
+                "el directorio es append-only en orden de id"
+            );
+            state.dir.push(loc);
+        }
+        state.write_offset = write_offset;
+        state.next_page = n_pages;
+    }
+
+    /// Recorta el estado físico al head recuperado, descartando la cola rota: el
+    /// directorio se queda con las páginas de `head`, `write_offset` apunta al fin
+    /// del head y `next_page = head.n_pages`. El próximo append sobrescribe la
+    /// cola rota (truncado lógico, M1).
+    pub(crate) fn truncate_to_head(&self, head: &Head) {
+        let mut state = self.state.lock().expect("estado del pager envenenado");
+        let keep = head.n_pages.saturating_sub(FIRST_DATA_PAGE.0) as usize;
+        let write_offset = match keep.checked_sub(1).and_then(|i| state.dir.get(i)) {
+            Some(last) => last.offset + last.len as u64,
+            None => FIRST_DATA_PAGE.byte_offset(),
+        };
+        state.dir.truncate(keep);
+        state.write_offset = write_offset;
+        state.next_page = head.n_pages;
     }
 
     /// Inserta una página (en claro) en la caché. La usa el commit para que
@@ -323,12 +492,10 @@ impl Pager {
             .insert(id, page);
     }
 
-    /// Publica el nuevo final lógico del archivo (solo el escritor único).
-    pub fn set_n_pages(&self, n: u64) {
-        self.state
-            .lock()
-            .expect("estado del pager envenenado")
-            .next_page = n;
+    /// Longitud física del archivo en bytes (EOF físico). Acota la cola rota en
+    /// bytes para el margen de nonce de la recuperación (R7).
+    pub(crate) fn byte_len(&self) -> Result<u64> {
+        self.file.byte_len().map_err(Error::from)
     }
 
     pub fn nonce_counter(&self) -> u64 {
@@ -430,7 +597,7 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use super::*;
-    use crate::format::BODY_SIZE;
+    use crate::format::{BODY_SIZE, PAGE_SIZE};
 
     fn db_path(dir: &tempfile::TempDir) -> PathBuf {
         dir.path().join("t.arkeion")

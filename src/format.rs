@@ -6,6 +6,9 @@
 use crate::error::{Error, Result};
 
 /// Tamaño de página en disco. 4 KiB: página de SO y sector lógico común (D2).
+/// Desde v2 (M10) es el tamaño del **body lógico in-memory** y de los slots
+/// estructurales (header, meta); en disco las páginas de datos son registros de
+/// **longitud variable** (ver el log enmarcado de la zona append más abajo).
 pub const PAGE_SIZE: usize = 4096;
 /// Nonce GCM de 96 bits al inicio de cada página (ceros sin cifrado).
 pub const NONCE_LEN: usize = 12;
@@ -16,14 +19,26 @@ pub const CRYPTO_RESERVE: usize = NONCE_LEN + TAG_LEN;
 /// Bytes útiles del body de una página.
 pub const BODY_SIZE: usize = PAGE_SIZE - CRYPTO_RESERVE;
 
+/// Prefijo de longitud de un registro de la zona append (v2, M10): `u32` LE con
+/// la longitud del payload sellado que sigue. Hace cada registro **auto-
+/// delimitado** para que la recuperación camine el log sin stride fijo.
+pub const LEN_PREFIX_LEN: usize = 4;
+/// Registro más pequeño posible: prefijo + payload de un body vacío
+/// (`nonce ‖ tag` sin ciphertext). Cota inferior segura del tamaño de un
+/// registro, usada para acotar la cola rota en bytes (margen de nonce, R7).
+pub const MIN_RECORD_LEN: u64 = LEN_PREFIX_LEN as u64 + CRYPTO_RESERVE as u64;
+
 /// Magic de la cabecera de archivo (página 0).
 pub const MAGIC_HEADER: &[u8; 8] = b"ARKEION1";
 /// Magic de los meta slots (páginas 1 y 2).
 pub const MAGIC_META: &[u8; 8] = b"ARKMETA1";
 /// Magic de las páginas de commit (zona append).
 pub const MAGIC_COMMIT: &[u8; 8] = b"ARKCMT01";
-/// Versión del formato que escribe esta build.
-pub const FORMAT_VERSION: u32 = 1;
+/// Versión del formato que escribe esta build. v2 (M10): zona append como log de
+/// registros de longitud variable + directorio de páginas. Ruptura limpia
+/// respecto a v1 (slots fijos): pre-1.0 no hay DBs v1 persistidas, así que no se
+/// implementa lectura dual; una migración v1→v2 sería un rewrite estilo `vacuum`.
+pub const FORMAT_VERSION: u32 = 2;
 
 /// `FileHeader.flags` bit 0: cifrado en reposo activo.
 pub const FLAG_ENCRYPTED: u32 = 1;
@@ -45,7 +60,11 @@ pub const FIRST_DATA_PAGE: PageId = PageId(3);
 pub struct PageId(pub u64);
 
 impl PageId {
-    /// Offset en bytes dentro del archivo.
+    /// Offset en bytes de un slot **estructural** de tamaño fijo (header, meta).
+    /// Desde v2 (M10) las páginas de datos (id ≥ [`FIRST_DATA_PAGE`]) ya **no**
+    /// viven en `id · PAGE_SIZE`: su posición la da el directorio de páginas del
+    /// pager. `FIRST_DATA_PAGE.byte_offset()` sigue marcando el **inicio** de la
+    /// zona append (primer registro).
     pub fn byte_offset(self) -> u64 {
         self.0 * PAGE_SIZE as u64
     }

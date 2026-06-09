@@ -22,7 +22,7 @@ use crate::catalog::{self, TableDef, TableScan, TableSpec};
 use crate::commit::{self, COMMIT_FLAG_CHECKPOINT, CommitHeader, Head};
 use crate::crypto::Key;
 use crate::error::{Error, Result};
-use crate::format::{PageBuf, PageId};
+use crate::format::{MIN_RECORD_LEN, PageBuf, PageId};
 use crate::io::sync_parent_dir;
 use crate::pager::{Pager, provider_for};
 use crate::record::Value;
@@ -183,13 +183,18 @@ impl Store {
     pub fn open_keyed(path: &Path, key: Option<&Key>) -> Result<Store> {
         let pager = Pager::open_keyed(path, key)?;
         let head = commit::recover(&pager)?;
-        // Margen de nonce (D6, R7): la cola rota ocupa como mucho
-        // `físicas - n_pages` posiciones, selladas con contadores a partir de
-        // `head.nonce_counter`. Retomar pasado ese margen hace estructuralmente
-        // imposible reutilizar un nonce, incluso tras crashes repetidos.
-        let torn_tail = pager.n_pages().saturating_sub(head.n_pages);
-        pager.set_n_pages(head.n_pages);
-        pager.set_nonce_counter(head.nonce_counter + torn_tail);
+        // Margen de nonce (D6, R7): tras recortar al head, la cola rota es la
+        // región física `[fin del head, EOF)`. Cada escritura sellada que dejó
+        // bytes en disco ocupa al menos `MIN_RECORD_LEN`, así que
+        // `ceil(bytes / MIN_RECORD_LEN)` es una cota superior de los contadores
+        // consumidos por la cola. Retomar el contador pasado ese margen hace
+        // estructuralmente imposible reutilizar un par (clave, nonce), incluso
+        // tras crashes repetidos (una escritura que no dejó bytes no aporta
+        // ciphertext en disco, así que reusar su contador es inocuo).
+        let file_len = pager.byte_len()?;
+        pager.truncate_to_head(&head);
+        let torn_bytes = file_len.saturating_sub(pager.write_offset());
+        pager.set_nonce_counter(head.nonce_counter + torn_bytes.div_ceil(MIN_RECORD_LEN));
         Ok(Store::from_parts(path, pager, head))
     }
 
@@ -1435,14 +1440,21 @@ fn publish_commit(
 ) -> Result<Head> {
     let commit_page = PageId(ts.alloc_next);
 
-    // Páginas sucias en orden de id; content_hash cubre los bodies en claro.
+    // Páginas sucias como registros enmarcados, en orden de id (v2, M10);
+    // content_hash cubre los bodies lógicos en claro (BODY_SIZE, sin recortar).
+    // Las localizaciones se acumulan y se instalan en el directorio tras el
+    // fsync: un fallo a mitad no deja estado en memoria que revertir.
+    let mut cursor = pager.write_offset();
+    let mut entries = Vec::new();
     let mut hasher = Sha256::new();
     let mut pages_written = 0u64;
     for pid in ts.alloc_base..ts.alloc_next {
         let id = PageId(pid);
         let page = ts.dirty.remove(&id).unwrap_or_else(PageBuf::zeroed);
         hasher.update(page.body());
-        pager.write_reserved_page(id, &page)?;
+        let (rec_len, loc) = pager.write_record_at(id, page.body(), cursor)?;
+        cursor += rec_len;
+        entries.push((id, loc));
         pager.cache_insert(id, Arc::new(page));
         pages_written += 1;
     }
@@ -1465,7 +1477,9 @@ fn publish_commit(
     header.chain_hash = header.compute_chain();
     let mut page = PageBuf::zeroed();
     header.encode_into(page.body_mut());
-    pager.write_reserved_page(commit_page, &page)?;
+    let (commit_rec_len, commit_loc) = pager.write_record_at(commit_page, page.body(), cursor)?;
+    cursor += commit_rec_len;
+    entries.push((commit_page, commit_loc));
     pager.cache_insert(commit_page, Arc::new(page));
     // **Único** fsync del commit (M9-perf): páginas de datos y de commit escritas,
     // una sola barrera. Basta para la durabilidad porque la recuperación no
@@ -1486,7 +1500,8 @@ fn publish_commit(
         nonce_counter: header.nonce_counter,
         n_pages: commit_page.0 + 1,
     };
-    pager.set_n_pages(head.n_pages);
+    // Publica el directorio, write_offset y next_page en un solo paso atómico.
+    pager.install_commit(&entries, cursor, head.n_pages);
     pager.write_meta(&commit::meta_for(&head))?;
     Ok(head)
 }
@@ -2476,7 +2491,7 @@ mod tests {
                 .unwrap();
             tx.commit().unwrap();
         }
-        let n_after_2 = store.lock().head.n_pages; // 1ª página del commit 3
+        let start_of_3 = std::fs::metadata(&path).unwrap().len(); // inicio en bytes del commit 3
 
         // Commit 3: el que "se quedó a medias".
         let mut tx = store.begin().unwrap();
@@ -2497,11 +2512,12 @@ mod tests {
         };
         let ps = crate::format::PAGE_SIZE as u64;
         // El slot meta de la versión 3 (impar ⇒ slot B) no llegó: corrómpelo para
-        // que recover use el de la versión 2.
+        // que recover use el de la versión 2. Los slots meta siguen en posición fija.
         flip(crate::format::META_PAGE_B.0 * ps + 64);
-        // Una página de datos del commit 3 quedó sin escribir: ilegible (el tag no
-        // cuadra), como una escritura desgarrada real.
-        flip(n_after_2 * ps + 64);
+        // La primera página de datos del commit 3 quedó sin escribir: ilegible (el
+        // nonce/tag no cuadra), como una escritura desgarrada real. Su registro
+        // empieza en `start_of_3`; corrompemos el primer byte de su payload sellado.
+        flip(start_of_3 + crate::format::LEN_PREFIX_LEN as u64);
         drop(f);
 
         // Recuperación: el escaneo hacia delante se topa con la página ilegible

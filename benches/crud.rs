@@ -1,4 +1,4 @@
-//! Harness de benchmarks CRUD monohilo — arkeion vs SQLite (M9).
+//! Harness de benchmarks CRUD monohilo — arkeion vs SQLite (M9 + índices 2º).
 //!
 //! Criterio honesto del hito: *mismo orden de magnitud que SQLite en CRUD
 //! monohilo*. Mide con `std::time` (sin criterion, en el espíritu D8: lo demás
@@ -126,6 +126,36 @@ fn run_arkeion(durable_n: i64, bulk_n: i64, scan_reps: i64) -> Vec<(&'static str
     }
     out.push(("delete por PK (durable)", ops(durable_n, t.elapsed())));
 
+    // 7) SELECT por columna con índice secundario (point lookup vía el índice,
+    // no por PK). Tabla propia para no contaminar las medidas anteriores.
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("i.arkeion"), Options::default()).unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute(
+            "CREATE TABLE it (id INTEGER PRIMARY KEY, k INTEGER NOT NULL)",
+            &[],
+        )
+        .unwrap();
+        let ins = conn.prepare("INSERT INTO it (id, k) VALUES (?1, ?2)").unwrap();
+        conn.execute("BEGIN", &[]).unwrap();
+        for i in 1..=bulk_n {
+            ins.execute(&params![i, i * 2]).unwrap(); // k único
+        }
+        conn.execute("COMMIT", &[]).unwrap();
+        conn.execute("CREATE INDEX ix_k ON it (k)", &[]).unwrap();
+        let sel = conn.prepare("SELECT id FROM it WHERE k = ?1").unwrap();
+        let t = Instant::now();
+        let mut checksum = 0i64;
+        for j in 0..bulk_n {
+            let k = scattered(j, bulk_n) * 2; // un valor de k existente
+            let row = sel.query(&params![k]).unwrap().next().unwrap().unwrap();
+            checksum ^= row.get::<i64>("id").unwrap();
+        }
+        std::hint::black_box(checksum);
+        out.push(("select por índice 2º", ops(bulk_n, t.elapsed())));
+    }
+
     out
 }
 
@@ -226,6 +256,37 @@ fn run_sqlite(durable_n: i64, bulk_n: i64, scan_reps: i64) -> Vec<(&'static str,
         del.execute(rusqlite::params![i]).unwrap();
     }
     out.push(("delete por PK (durable)", ops(durable_n, t.elapsed())));
+    drop(del);
+
+    // 7) SELECT por columna con índice secundario.
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = Connection::open(dir.path().join("i.sqlite")).unwrap();
+        conn.pragma_update(None, "synchronous", "FULL").unwrap();
+        conn.execute_batch("CREATE TABLE it (id INTEGER PRIMARY KEY, k INTEGER NOT NULL)")
+            .unwrap();
+        {
+            let tx = conn.unchecked_transaction().unwrap();
+            {
+                let mut ins = tx.prepare("INSERT INTO it (id, k) VALUES (?1, ?2)").unwrap();
+                for i in 1..=bulk_n {
+                    ins.execute(rusqlite::params![i, i * 2]).unwrap();
+                }
+            }
+            tx.commit().unwrap();
+        }
+        conn.execute_batch("CREATE INDEX ix_k ON it (k)").unwrap();
+        let mut sel = conn.prepare("SELECT id FROM it WHERE k = ?1").unwrap();
+        let t = Instant::now();
+        let mut checksum = 0i64;
+        for j in 0..bulk_n {
+            let k = scattered(j, bulk_n) * 2;
+            let id: i64 = sel.query_row(rusqlite::params![k], |r| r.get(0)).unwrap();
+            checksum ^= id;
+        }
+        std::hint::black_box(checksum);
+        out.push(("select por índice 2º", ops(bulk_n, t.elapsed())));
+    }
 
     out
 }
@@ -328,7 +389,7 @@ fn main() {
     let scan_reps = nums.get(2).copied().unwrap_or(20);
 
     let with_sqlite = cfg!(feature = "bench-sqlite");
-    println!("Arkeion — benchmark CRUD monohilo (M9)");
+    println!("Arkeion — benchmark CRUD monohilo (+ índice secundario)");
     println!(
         "  durable_n={durable_n}  bulk_n={bulk_n}  scan_reps={scan_reps}  tmp={}",
         std::env::temp_dir().display()

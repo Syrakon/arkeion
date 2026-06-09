@@ -29,8 +29,11 @@ pub enum AsOf { Head, Version(u64), Timestamp(std::time::SystemTime) }
 pub struct Options {
     pub create_if_missing: bool,        // true por defecto (zero-config)
     pub key: Option<Key>,               // Some(_) ⇒ AES-256-GCM en reposo
-    pub cache_pages: usize,             // tope de caché (def. 8192 págs = 32 MiB)
+    pub compress: bool,                 // compresión de página al crear (M10, off por defecto)
+    pub ecc_nsym: u8,                   // paridad Reed-Solomon por bloque al crear (M10, 0 = off)
+    pub cache_bytes: usize,             // tope de caché de páginas (def. 64 MiB ≈ PRAGMA cache_size)
 }
+// builders: .create_if_missing(b) .key(k) .compress(b) .ecc(n) .cache_bytes(n)
 
 pub struct Key([u8; 32]);               // clave cruda; Drop ⇒ zeroize. KDF: responsabilidad
                                         // del llamador en v1 (D7)

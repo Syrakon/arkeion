@@ -25,7 +25,7 @@ use crate::crypto::Key;
 use crate::error::{Error, Result};
 use crate::format::{MIN_RECORD_LEN, PageBuf, PageId};
 use crate::io::sync_parent_dir;
-use crate::pager::{Pager, ScrubReport, provider_for};
+use crate::pager::{CACHE_CAP, Pager, ScrubReport, provider_for};
 use crate::record::Value;
 
 /// Rama única de M1; el branching llega en M8.
@@ -161,6 +161,10 @@ pub struct Store {
     /// Ruta del archivo: la necesita `vacuum` para el archivo temporal y el
     /// rename atómico (M9).
     path: PathBuf,
+    /// Tope de la caché de páginas (nº de páginas) con el que se abrió, derivado
+    /// de [`Options::cache_bytes`](crate::Options::cache_bytes). Se conserva para
+    /// que `vacuum` reabra el archivo compactado con la misma configuración.
+    cache_pages: usize,
 }
 
 impl Store {
@@ -183,6 +187,18 @@ impl Store {
         compress: bool,
         ecc_nsym: u8,
     ) -> Result<Store> {
+        Self::create_with_cache(path, key, compress, ecc_nsym, CACHE_CAP)
+    }
+
+    /// Como [`create_with`](Store::create_with) pero con un tope de caché explícito
+    /// (`cache_pages`), propagado desde [`Options::cache_bytes`](crate::Options::cache_bytes).
+    pub fn create_with_cache(
+        path: &Path,
+        key: Option<&Key>,
+        compress: bool,
+        ecc_nsym: u8,
+        cache_pages: usize,
+    ) -> Result<Store> {
         let compressor = compress.then(|| Arc::new(Lz) as Arc<dyn Compressor>);
         let pager = Pager::create_with_crypto(
             path,
@@ -190,9 +206,10 @@ impl Store {
             provider_for(key),
             compressor,
             ecc_nsym,
+            cache_pages,
         )?;
         let head = commit::genesis_head(&pager.header().file_id);
-        Ok(Store::from_parts(path, pager, head))
+        Ok(Store::from_parts(path, pager, head, cache_pages))
     }
 
     pub fn open(path: &Path) -> Result<Store> {
@@ -202,7 +219,17 @@ impl Store {
     /// Abre el almacén; con `key`, descifra la zona append (M7). `KeyRequired`
     /// si el archivo está cifrado y falta clave; `WrongKey` si no encaja.
     pub fn open_keyed(path: &Path, key: Option<&Key>) -> Result<Store> {
-        let pager = Pager::open_keyed(path, key)?;
+        Self::open_keyed_with_cache(path, key, CACHE_CAP)
+    }
+
+    /// Como [`open_keyed`](Store::open_keyed) pero con un tope de caché explícito
+    /// (`cache_pages`), propagado desde [`Options::cache_bytes`](crate::Options::cache_bytes).
+    pub fn open_keyed_with_cache(
+        path: &Path,
+        key: Option<&Key>,
+        cache_pages: usize,
+    ) -> Result<Store> {
+        let pager = Pager::open_keyed_with(path, key, cache_pages)?;
         let head = commit::recover(&pager)?;
         // Margen de nonce (D6, R7): tras recortar al head, la cola rota es la
         // región física `[fin del head, EOF)`. Cada escritura sellada que dejó
@@ -216,10 +243,10 @@ impl Store {
         pager.truncate_to_head(&head);
         let torn_bytes = file_len.saturating_sub(pager.write_offset());
         pager.set_nonce_counter(head.nonce_counter + torn_bytes.div_ceil(MIN_RECORD_LEN));
-        Ok(Store::from_parts(path, pager, head))
+        Ok(Store::from_parts(path, pager, head, cache_pages))
     }
 
-    fn from_parts(path: &Path, pager: Pager, head: Head) -> Store {
+    fn from_parts(path: &Path, pager: Pager, head: Head, cache_pages: usize) -> Store {
         Store {
             state: Arc::new(Mutex::new(DbState {
                 pager: Arc::new(pager),
@@ -227,6 +254,7 @@ impl Store {
             })),
             writer: Arc::new(AtomicBool::new(false)),
             path: path.to_owned(),
+            cache_pages,
         }
     }
 
@@ -797,6 +825,7 @@ impl Store {
                 old_pager.crypto(),
                 old_pager.compressor(),
                 ecc_nsym,
+                self.cache_pages,
             )?,
             Rekey::To(key) => Pager::create_with_crypto(
                 &temp,
@@ -804,6 +833,7 @@ impl Store {
                 provider_for(key),
                 old_pager.compressor(),
                 ecc_nsym,
+                self.cache_pages,
             )?,
         };
         let new_pager = Arc::new(new_pager);

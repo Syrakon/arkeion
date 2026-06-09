@@ -29,6 +29,16 @@ fn main() {
         match a.as_str() {
             "--compress" => opts = opts.compress(true),
             "--no-create" => opts = opts.create_if_missing(false),
+            "--cache-mb" => {
+                match args
+                    .next()
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .and_then(|mb| mb.checked_mul(1024 * 1024))
+                {
+                    Some(bytes) => opts = opts.cache_bytes(bytes),
+                    None => fail("--cache-mb requiere un número de MiB en rango"),
+                }
+            }
             "--ecc" => match args.next().and_then(|s| s.parse::<u8>().ok()) {
                 Some(n) => opts = opts.ecc(n),
                 None => fail("--ecc requiere un número (símbolos de paridad)"),
@@ -535,6 +545,7 @@ fn usage() {
          \x20 --compress       activa la compresión de página (al crear)\n\
          \x20 --ecc <n>        Reed-Solomon con n símbolos de paridad (al crear)\n\
          \x20 --key <64-hex>   cifrado AES-256-GCM con clave de 32 bytes en hex\n\
+         \x20 --cache-mb <n>   tamaño de la caché de páginas en MiB (def. 64)\n\
          \x20 --no-create      no crear el archivo si no existe\n\
          \n\
          dentro: SQL terminado en ';', o meta-comandos (.help)."

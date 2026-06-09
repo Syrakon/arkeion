@@ -32,8 +32,9 @@ const METHOD_LZ: u8 = 1;
 /// páginas son inmutables, así que evictar nunca pierde datos (se releen del
 /// disco) — solo cuesta re-verificar su tag de integridad. Por eso el tope
 /// importa: un working set que cabe en caché evita esa re-verificación por fallo
-/// (el «acantilado» a datasets grandes). Configurable vía [`crate::Options`].
-const CACHE_CAP: usize = 16384;
+/// (el «acantilado» a datasets grandes). Configurable vía
+/// [`Options::cache_bytes`](crate::Options::cache_bytes).
+pub(crate) const CACHE_CAP: usize = 16384;
 
 /// Construye el proveedor cripto para una clave opcional (D8): AES-256-GCM con
 /// clave, integridad SHA-256 sin ella.
@@ -229,7 +230,7 @@ impl Pager {
     /// append se sella con AES-256-GCM; cabecera y meta slots van siempre en
     /// claro (no contienen datos de usuario).
     pub fn create_keyed(path: &Path, key: Option<&Key>) -> Result<Pager> {
-        Self::create_with_crypto(path, key.is_some(), provider_for(key), None, 0)
+        Self::create_with_crypto(path, key.is_some(), provider_for(key), None, 0, CACHE_CAP)
     }
 
     /// Núcleo de la creación, parametrizado por el proveedor cripto y el
@@ -244,6 +245,7 @@ impl Pager {
         crypto: Arc<dyn CryptoProvider>,
         compressor: Option<Arc<dyn Compressor>>,
         ecc_nsym: u8,
+        cache_pages: usize,
     ) -> Result<Pager> {
         let file = DbFile::create_new(path)?;
         if !file.try_lock_exclusive()? {
@@ -273,7 +275,7 @@ impl Pager {
             plain: PlainProvider,
             crypto,
             compressor,
-            cache: Mutex::new(PageCache::new(CACHE_CAP)),
+            cache: Mutex::new(PageCache::new(cache_pages)),
             state: Mutex::new(AppendState {
                 next_page: FIRST_DATA_PAGE.0,
                 nonce_counter: 0,
@@ -317,6 +319,17 @@ impl Pager {
     /// primera página de datos ([`Error::WrongKey`] si la clave no encaja).
     /// Pasar clave para un archivo sin cifrar es un error de uso.
     pub fn open_keyed(path: &Path, key: Option<&Key>) -> Result<Pager> {
+        Self::open_keyed_with(path, key, CACHE_CAP)
+    }
+
+    /// Como [`open_keyed`](Pager::open_keyed) pero con un tope de caché explícito
+    /// (`cache_pages`, en nº de páginas) — lo usa el almacén para propagar
+    /// [`Options::cache_bytes`](crate::Options::cache_bytes).
+    pub(crate) fn open_keyed_with(
+        path: &Path,
+        key: Option<&Key>,
+        cache_pages: usize,
+    ) -> Result<Pager> {
         let file = DbFile::open_rw(path)?;
         if !file.try_lock_exclusive()? {
             return Err(Error::Busy);
@@ -358,7 +371,7 @@ impl Pager {
             plain: PlainProvider,
             crypto,
             compressor,
-            cache: Mutex::new(PageCache::new(CACHE_CAP)),
+            cache: Mutex::new(PageCache::new(cache_pages)),
             state: Mutex::new(AppendState {
                 next_page: FIRST_DATA_PAGE.0,
                 nonce_counter: 0,

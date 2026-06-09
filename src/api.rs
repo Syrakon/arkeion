@@ -17,7 +17,8 @@ use crate::commit::{AuditAnchor, AuditReport};
 use crate::crypto::Key;
 use crate::error::{Error, Result};
 use crate::exec;
-use crate::pager::ScrubReport;
+use crate::format::PAGE_SIZE;
+use crate::pager::{CACHE_CAP, ScrubReport};
 use crate::record::Value;
 use crate::sql::{
     self,
@@ -43,6 +44,13 @@ pub struct Options {
     /// bloque de 255 (par; corrige `ecc_nsym/2` bytes corruptos por bloque). Solo
     /// aplica **al crear**. `0` = sin ECC (por defecto, D8).
     pub ecc_nsym: u8,
+    /// Tamaño de la caché de páginas **en bytes** (aprox.: se redondea hacia abajo
+    /// a páginas de `PAGE_SIZE`, mínimo 1). Como `PRAGMA cache_size` de SQLite, pero
+    /// en bytes. Por defecto **64 MiB**. Súbelo para working sets enormes (evita el
+    /// «acantilado» de re-verificar tags al fallar la caché); bájalo en entornos
+    /// multi-tenant con muchas bases abiertas. Aplica **a cada apertura** (no se
+    /// persiste en el archivo) y se conserva tras un `vacuum`.
+    pub cache_bytes: usize,
 }
 
 impl Default for Options {
@@ -52,6 +60,7 @@ impl Default for Options {
             key: None,
             compress: false,
             ecc_nsym: 0,
+            cache_bytes: CACHE_CAP * PAGE_SIZE,
         }
     }
 }
@@ -109,6 +118,19 @@ impl Options {
         self.ecc_nsym = nsym;
         self
     }
+
+    /// Fija el tamaño de la caché de páginas en bytes (ver [`Options::cache_bytes`]).
+    /// Se redondea a páginas de `PAGE_SIZE` (mínimo 1). 64 MiB por defecto.
+    ///
+    /// ```
+    /// use arkeion::Options;
+    /// // Caché de 8 MiB para una base pequeña en un entorno con muchas abiertas.
+    /// let opts = Options::default().cache_bytes(8 * 1024 * 1024);
+    /// ```
+    pub fn cache_bytes(mut self, bytes: usize) -> Options {
+        self.cache_bytes = bytes;
+        self
+    }
 }
 
 /// Una base de datos Arkeion: un único archivo. Handle clonable y compartible
@@ -122,17 +144,19 @@ impl Database {
     pub fn open(path: impl AsRef<Path>, opts: Options) -> Result<Database> {
         let path = path.as_ref();
         let key = opts.key.as_ref();
+        // Bytes → nº de páginas de caché (mínimo 1; `PageCache` también lo acota).
+        let cache_pages = (opts.cache_bytes / PAGE_SIZE).max(1);
         let store = if opts.create_if_missing {
-            match Store::create_with(path, key, opts.compress, opts.ecc_nsym) {
+            match Store::create_with_cache(path, key, opts.compress, opts.ecc_nsym, cache_pages) {
                 Ok(s) => s,
                 // Ya existe (o carrera con otro creador): abrir.
                 Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                    Store::open_keyed(path, key)?
+                    Store::open_keyed_with_cache(path, key, cache_pages)?
                 }
                 Err(e) => return Err(e),
             }
         } else {
-            Store::open_keyed(path, key)?
+            Store::open_keyed_with_cache(path, key, cache_pages)?
         };
         Ok(Database {
             store: Arc::new(store),

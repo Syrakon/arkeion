@@ -1160,9 +1160,10 @@ impl Snapshot {
         catalog::scan_table(self, self.data_root, table)
     }
 
-    /// rowids cuyas columnas indexadas valen `value` (igualdad), vía el índice.
-    pub fn index_lookup(&self, idx: &IndexDef, value: &Value) -> Result<Vec<i64>> {
-        catalog::index_scan_eq(self, self.data_root, idx, std::slice::from_ref(value))
+    /// rowids cuyas columnas indexadas valen `values` (igualdad, una entrada por
+    /// columna del índice), vía el índice.
+    pub fn index_lookup(&self, idx: &IndexDef, values: &[Value]) -> Result<Vec<i64>> {
+        catalog::index_scan_eq(self, self.data_root, idx, values)
     }
 
     /// rowids de un rango sobre un índice de una columna (`lo`/`hi` inclusivos o
@@ -1366,9 +1367,10 @@ impl WriteTx {
         catalog::index_exists(&self.ts, self.data_root, name)
     }
 
-    /// rowids cuyas columnas indexadas valen `value` (igualdad), vía el índice.
-    pub fn index_lookup(&self, idx: &IndexDef, value: &Value) -> Result<Vec<i64>> {
-        catalog::index_scan_eq(&self.ts, self.data_root, idx, std::slice::from_ref(value))
+    /// rowids cuyas columnas indexadas valen `values` (igualdad, una entrada por
+    /// columna del índice), vía el índice.
+    pub fn index_lookup(&self, idx: &IndexDef, values: &[Value]) -> Result<Vec<i64>> {
+        catalog::index_scan_eq(&self.ts, self.data_root, idx, values)
     }
 
     /// rowids de un rango sobre un índice de una columna, vía el índice ordenado.

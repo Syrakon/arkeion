@@ -310,6 +310,77 @@ fn create_unique_index_rejects_existing_duplicates() {
 }
 
 #[test]
+fn multi_column_index_equality() {
+    let (_d, db) = db();
+    let conn = db.connect().unwrap();
+    conn.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b TEXT)",
+        &[],
+    )
+    .unwrap();
+    for (a, b) in [(1, "x"), (1, "y"), (2, "x"), (1, "x")] {
+        conn.execute("INSERT INTO t (a, b) VALUES (?1, ?2)", &params![a, b])
+            .unwrap();
+    }
+    conn.execute("CREATE INDEX ix_ab ON t (a, b)", &[]).unwrap();
+
+    // Igualdad sobre las dos columnas ⇒ usa el índice compuesto.
+    assert_eq!(
+        ids(&conn, "SELECT id FROM t WHERE a = 1 AND b = 'x'"),
+        [1, 4]
+    );
+    assert_eq!(ids(&conn, "SELECT id FROM t WHERE a = 1 AND b = 'y'"), [2]);
+    assert_eq!(ids(&conn, "SELECT id FROM t WHERE a = 2 AND b = 'x'"), [3]);
+    assert_eq!(
+        ids(&conn, "SELECT id FROM t WHERE a = 1 AND b = 'z'"),
+        Vec::<i64>::new()
+    );
+    // El orden de los conjuntos no importa.
+    assert_eq!(
+        ids(&conn, "SELECT id FROM t WHERE b = 'x' AND a = 1"),
+        [1, 4]
+    );
+
+    // Mantenimiento: mover (1,'y')→(1,'x').
+    conn.execute("UPDATE t SET b = 'x' WHERE id = 2", &[])
+        .unwrap();
+    assert_eq!(
+        ids(&conn, "SELECT id FROM t WHERE a = 1 AND b = 'x'"),
+        [1, 2, 4]
+    );
+    assert_eq!(
+        ids(&conn, "SELECT id FROM t WHERE a = 1 AND b = 'y'"),
+        Vec::<i64>::new()
+    );
+}
+
+#[test]
+fn multi_column_unique() {
+    let (_d, db) = db();
+    let conn = db.connect().unwrap();
+    conn.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER)",
+        &[],
+    )
+    .unwrap();
+    conn.execute("CREATE UNIQUE INDEX ix_ab ON t (a, b)", &[])
+        .unwrap();
+    conn.execute("INSERT INTO t (a, b) VALUES (1, 2)", &[])
+        .unwrap();
+    // (1,3) y (2,2) no chocan con (1,2).
+    conn.execute("INSERT INTO t (a, b) VALUES (1, 3)", &[])
+        .unwrap();
+    conn.execute("INSERT INTO t (a, b) VALUES (2, 2)", &[])
+        .unwrap();
+    // (1,2) repetido ⇒ Constraint.
+    assert!(matches!(
+        conn.execute("INSERT INTO t (a, b) VALUES (1, 2)", &[]),
+        Err(Error::Constraint(_))
+    ));
+    assert_eq!(ids(&conn, "SELECT id FROM t WHERE a = 1 AND b = 2"), [1]);
+}
+
+#[test]
 fn errors_and_flags() {
     let (_d, db) = db();
     let conn = db.connect().unwrap();

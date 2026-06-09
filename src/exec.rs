@@ -27,8 +27,9 @@ pub trait DataSource {
     fn get_row(&self, table: &TableDef, rowid: i64) -> Result<Option<Vec<Value>>>;
     /// Filas completas de la tabla, en orden de rowid.
     fn scan_rows(&self, table: &TableDef) -> Result<Vec<Vec<Value>>>;
-    /// rowids cuyas columnas indexadas valen `value` (igualdad), vía un índice.
-    fn index_lookup(&self, table: &TableDef, idx: &IndexDef, value: &Value) -> Result<Vec<i64>>;
+    /// rowids cuyas columnas indexadas valen `values` (igualdad, un valor por
+    /// columna del índice), vía un índice.
+    fn index_lookup(&self, table: &TableDef, idx: &IndexDef, values: &[Value]) -> Result<Vec<i64>>;
     /// rowids de un rango (`lo`/`hi` opcionales, inclusivos o no), vía un índice.
     fn index_range(
         &self,
@@ -54,8 +55,13 @@ impl DataSource for Snapshot {
             .collect()
     }
 
-    fn index_lookup(&self, _table: &TableDef, idx: &IndexDef, value: &Value) -> Result<Vec<i64>> {
-        Snapshot::index_lookup(self, idx, value)
+    fn index_lookup(
+        &self,
+        _table: &TableDef,
+        idx: &IndexDef,
+        values: &[Value],
+    ) -> Result<Vec<i64>> {
+        Snapshot::index_lookup(self, idx, values)
     }
 
     fn index_range(
@@ -84,8 +90,13 @@ impl DataSource for WriteTx {
             .collect()
     }
 
-    fn index_lookup(&self, _table: &TableDef, idx: &IndexDef, value: &Value) -> Result<Vec<i64>> {
-        WriteTx::index_lookup(self, idx, value)
+    fn index_lookup(
+        &self,
+        _table: &TableDef,
+        idx: &IndexDef,
+        values: &[Value],
+    ) -> Result<Vec<i64>> {
+        WriteTx::index_lookup(self, idx, values)
     }
 
     fn index_range(
@@ -356,15 +367,28 @@ fn candidate_rows(
             .into_iter()
             .collect());
     }
-    // Index scan de igualdad (col indexada = const); NULL/tipo incompatible → scan.
-    if let Some((idx, const_expr)) = index_lookup_plan(schema, where_clause) {
-        let value = eval_const(const_expr, params)?;
-        let col = idx.columns[0];
-        if !matches!(value, Value::Null)
-            && let Some(coerced) = coerce_value(value, def.columns[col].col_type)
-        {
+    // Index scan de igualdad (índice single o multi-columna); NULL/tipo
+    // incompatible en cualquier columna → cae al full scan.
+    if let Some((idx, const_exprs)) = index_eq_plan(schema, where_clause) {
+        let mut values = Vec::with_capacity(const_exprs.len());
+        let mut usable = true;
+        for (&col, ex) in idx.columns.iter().zip(&const_exprs) {
+            let v = eval_const(ex, params)?;
+            if matches!(v, Value::Null) {
+                usable = false;
+                break;
+            }
+            match coerce_value(v, def.columns[col].col_type) {
+                Some(cv) => values.push(cv),
+                None => {
+                    usable = false;
+                    break;
+                }
+            }
+        }
+        if usable {
             let mut out = Vec::new();
-            for rowid in tx.index_lookup(idx, &coerced)? {
+            for rowid in tx.index_lookup(idx, &values)? {
                 if let Some(row) = tx.get_row(def, rowid)? {
                     out.push((rowid, row));
                 }
@@ -585,10 +609,9 @@ pub fn run_select(src: &impl DataSource, stmt: &SelectStmt, params: &[Value]) ->
                 // Tipo no entero: que el filtro general emita su error de tipos.
                 _ => src.scan_rows(&from_def)?,
             }
-        } else if let Some((idx, const_expr)) =
-            index_lookup_plan(&schema, stmt.where_clause.as_ref())
+        } else if let Some((idx, const_exprs)) = index_eq_plan(&schema, stmt.where_clause.as_ref())
         {
-            index_lookup_rows(src, &from_def, idx, const_expr, params)?
+            index_eq_rows(src, &from_def, idx, &const_exprs, params)?
         } else if let Some((idx, op, const_expr)) =
             index_range_plan(&schema, stmt.where_clause.as_ref())
         {
@@ -785,63 +808,102 @@ fn point_lookup_key<'e>(schema: &QuerySchema, where_clause: Option<&'e Expr>) ->
     }
 }
 
-/// `WHERE col = <const>` con `col` cubierta por un índice secundario de una sola
-/// columna (no la PK alias, que va por el point lookup). Devuelve el índice y la
-/// expresión constante.
-fn index_lookup_plan<'a, 'e>(
-    schema: &'a QuerySchema,
-    where_clause: Option<&'e Expr>,
-) -> Option<(&'a IndexDef, &'e Expr)> {
-    let t = &schema.tables[0];
-    let Some(Expr::Binary(left, BinOp::Eq, right)) = where_clause else {
-        return None;
-    };
-    let col_pos = |e: &Expr| -> Option<usize> {
-        match e {
-            Expr::Column { table, name } if table.as_deref().is_none_or(|q| q == t.qualifier) => {
-                t.def.columns.iter().position(|c| &c.name == name)
-            }
-            _ => None,
+/// Recoge las igualdades `col = const` de un `WHERE` que es una conjunción de
+/// ellas (`a = X AND b = Y AND …`), como `(posición de columna, const)`. Solo
+/// recorre `AND` y `=`; cualquier otra cosa (OR, etc.) no aporta igualdades.
+fn collect_equalities<'e>(e: &'e Expr, t: &SchemaTable, out: &mut Vec<(usize, &'e Expr)>) {
+    match e {
+        Expr::Binary(l, BinOp::And, r) => {
+            collect_equalities(l, t, out);
+            collect_equalities(r, t, out);
         }
-    };
-    let (col, const_expr) = match (left.as_ref(), right.as_ref()) {
-        (c, e) if e.is_const() && col_pos(c).is_some() => (col_pos(c).unwrap(), e),
-        (e, c) if e.is_const() && col_pos(c).is_some() => (col_pos(c).unwrap(), e),
-        _ => return None,
-    };
-    if Some(col) == t.def.rowid_alias {
-        return None; // la PK alias va por el point lookup
+        Expr::Binary(l, BinOp::Eq, r) => {
+            let col_pos = |ex: &Expr| -> Option<usize> {
+                match ex {
+                    Expr::Column { table, name }
+                        if table.as_deref().is_none_or(|q| q == t.qualifier) =>
+                    {
+                        t.def.columns.iter().position(|c| &c.name == name)
+                    }
+                    _ => None,
+                }
+            };
+            if let Some(c) = col_pos(l)
+                && r.is_const()
+            {
+                out.push((c, r.as_ref()));
+            } else if let Some(c) = col_pos(r)
+                && l.is_const()
+            {
+                out.push((c, l.as_ref()));
+            }
+        }
+        _ => {}
     }
-    let idx = t
-        .def
-        .indexes
-        .iter()
-        .find(|i| i.columns.as_slice() == [col])?;
-    Some((idx, const_expr))
 }
 
-/// Resuelve un index scan de igualdad a filas: evalúa la constante, la coacciona
-/// al tipo de la columna, consulta el índice y trae cada fila por rowid.
-fn index_lookup_rows(
+/// Mejor índice de igualdad para el `WHERE`: el índice (single o **multi-columna**)
+/// con **todas** sus columnas cubiertas por una igualdad de la conjunción; entre
+/// los candidatos, el de más columnas (más selectivo). Devuelve el índice y las
+/// constantes en el orden de sus columnas. La PK no es índice secundario, así que
+/// `id = const` lo sigue cubriendo el point lookup.
+fn index_eq_plan<'a, 'e>(
+    schema: &'a QuerySchema,
+    where_clause: Option<&'e Expr>,
+) -> Option<(&'a IndexDef, Vec<&'e Expr>)> {
+    let t = &schema.tables[0];
+    let mut eqs = Vec::new();
+    collect_equalities(where_clause?, t, &mut eqs);
+    if eqs.is_empty() {
+        return None;
+    }
+    let mut best: Option<(&IndexDef, Vec<&Expr>)> = None;
+    for idx in &t.def.indexes {
+        let mut exprs = Vec::with_capacity(idx.columns.len());
+        let covered = idx
+            .columns
+            .iter()
+            .all(|&c| match eqs.iter().find(|(col, _)| *col == c) {
+                Some((_, e)) => {
+                    exprs.push(*e);
+                    true
+                }
+                None => false,
+            });
+        if covered
+            && best
+                .as_ref()
+                .is_none_or(|(b, _)| idx.columns.len() > b.columns.len())
+        {
+            best = Some((idx, exprs));
+        }
+    }
+    best
+}
+
+/// Resuelve un index scan de igualdad (1+ columnas) a filas: evalúa y coacciona
+/// cada constante a su columna, consulta el índice y trae cada fila por rowid.
+/// NULL o tipo incompatible en cualquier columna ⇒ full scan (que decida el
+/// filtro WHERE general).
+fn index_eq_rows(
     src: &impl DataSource,
     from_def: &TableDef,
     idx: &IndexDef,
-    const_expr: &Expr,
+    const_exprs: &[&Expr],
     params: &[Value],
 ) -> Result<Vec<Vec<Value>>> {
-    let value = eval_const(const_expr, params)?;
-    let col = idx.columns[0];
-    // NULL no casa nunca en `=` (SQL) y un tipo incompatible tampoco: cae a full
-    // scan para que el filtro WHERE general decida (NULL → 0 filas; mismatch →
-    // error de tipo, como sin índice).
-    let coerced = match value {
-        Value::Null => return src.scan_rows(from_def),
-        v => match coerce_value(v, from_def.columns[col].col_type) {
-            Some(c) => c,
+    let mut values = Vec::with_capacity(const_exprs.len());
+    for (&col, ex) in idx.columns.iter().zip(const_exprs) {
+        let v = eval_const(ex, params)?;
+        if matches!(v, Value::Null) {
+            return src.scan_rows(from_def);
+        }
+        match coerce_value(v, from_def.columns[col].col_type) {
+            Some(cv) => values.push(cv),
             None => return src.scan_rows(from_def),
-        },
-    };
-    let rowids = src.index_lookup(from_def, idx, &coerced)?;
+        }
+    }
+    let rowids = src.index_lookup(from_def, idx, &values)?;
     let mut out = Vec::with_capacity(rowids.len());
     for rowid in rowids {
         if let Some(row) = src.get_row(from_def, rowid)? {

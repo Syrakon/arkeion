@@ -346,10 +346,23 @@ pub fn drop_table<S: NodeStore>(s: &mut S, root: PageId, name: &str) -> Result<(
 /// Valida tipos y restricciones, aplica defaults y devuelve el registro listo
 /// para almacenar (el alias del rowid se guarda como NULL: se reconstruye).
 fn validated_record(table: &TableDef, values: &[Value], rowid: i64) -> Result<Vec<Value>> {
+    let mut record = Vec::with_capacity(table.columns.len());
+    validate_record_into(table, values, rowid, &mut record)?;
+    Ok(record)
+}
+
+/// Como [`validated_record`] pero en un `Vec` **reutilizado** (lo limpia antes):
+/// el camino caliente de `insert_row` evita asignar el vector por fila (M10-perf).
+fn validate_record_into(
+    table: &TableDef,
+    values: &[Value],
+    rowid: i64,
+    record: &mut Vec<Value>,
+) -> Result<()> {
+    record.clear();
     if values.len() > table.columns.len() {
         return Err(Error::InvalidInput("más valores que columnas"));
     }
-    let mut record = Vec::with_capacity(table.columns.len());
     for (i, col) in table.columns.iter().enumerate() {
         if table.rowid_alias == Some(i) {
             record.push(Value::Null); // reconstruido del rowid al leer
@@ -383,7 +396,7 @@ fn validated_record(table: &TableDef, values: &[Value], rowid: i64) -> Result<Ve
         record.push(value);
     }
     let _ = rowid;
-    Ok(record)
+    Ok(())
 }
 
 /// Rowid explícito de `values` (si la columna alias trae un entero), validando
@@ -462,6 +475,23 @@ pub(crate) fn put_row<S: NodeStore>(
         &row_key(table.table_id, rowid),
         &record::encode_values(&record),
     )
+}
+
+/// Como [`put_row`] pero con buffers **reutilizados** para la fila validada y su
+/// codificación: el camino caliente de `insert_row` no asigna un `Vec` por fila
+/// (M10-perf). El cursor de append del b-tree hace el resto (insert O(1)).
+pub(crate) fn put_row_buffered<S: NodeStore>(
+    s: &mut S,
+    root: PageId,
+    table: &TableDef,
+    rowid: i64,
+    values: &[Value],
+    rec_buf: &mut Vec<Value>,
+    enc_buf: &mut Vec<u8>,
+) -> Result<PageId> {
+    validate_record_into(table, values, rowid, rec_buf)?;
+    record::encode_values_into(rec_buf, enc_buf);
+    btree::insert(s, root, &row_key(table.table_id, rowid), enc_buf)
 }
 
 /// Inserta con rowid automático o explícito, contador incluido (camino directo

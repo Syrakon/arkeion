@@ -53,6 +53,34 @@ pub trait NodeStore: NodeSource {
     /// las páginas durables son historia, no se liberan (D1).
     fn free(&mut self, id: PageId);
     fn is_dirty(&self, id: PageId) -> bool;
+
+    /// Cursor de append cacheado (M10-perf): saca el cursor de la hoja rightmost
+    /// para el camino rápido de inserts secuenciales. Por defecto `None` (sin
+    /// caché): el store hace siempre el insert completo, correcto y sin coste.
+    fn take_append_cursor(&mut self) -> Option<AppendCursor> {
+        None
+    }
+    /// Guarda (o limpia) el cursor de append. Por defecto no-op.
+    fn set_append_cursor(&mut self, _cursor: Option<AppendCursor>) {}
+}
+
+/// Cursor de append a la hoja **rightmost** de un árbol (M10-perf). Cachea la
+/// hoja, su offset libre y su última clave para que un insert secuencial
+/// (rowid creciente, imports) anexe en **O(1)** sin re-descender ni re-escanear.
+/// Solo es válido si `key > last_key` (clave nueva = máximo global, va a la
+/// rightmost) y `root` sigue siendo la raíz vigente; cualquier otra cosa cae al
+/// camino completo, que lo reestablece. Anexar a la rightmost no toca separadores
+/// (el hijo rightmost no tiene cota superior), por eso es correcto.
+#[derive(Clone, Debug)]
+pub struct AppendCursor {
+    /// Raíz del árbol para la que el cursor es válido.
+    pub root: PageId,
+    /// Hoja rightmost (sucia) donde se anexa.
+    pub leaf: PageId,
+    /// Offset libre en el body de la hoja (dónde va la próxima celda).
+    pub end: usize,
+    /// Última clave de la hoja (cota para aceptar el append: `key > last_key`).
+    pub last_key: Vec<u8>,
 }
 
 // --- lectura ---
@@ -151,12 +179,44 @@ struct InsertOutcome {
     /// Split: (separador, nodo derecho). El separador es la cota inferior
     /// inclusiva del derecho.
     split: Option<(Vec<u8>, PageId)>,
+    /// Si el insert anexó al final de la hoja rightmost **global** (todo el
+    /// descenso fue al hijo rightmost), la info para (re)establecer el cursor de
+    /// append. `None` en cualquier otro caso (overwrite, insert en medio, etc.).
+    tail: Option<Tail>,
+}
+
+/// Datos para (re)establecer el [`AppendCursor`] desde un insert que anexó.
+struct Tail {
+    leaf: PageId,
+    end: usize,
+    last_key: Vec<u8>,
 }
 
 pub fn insert<S: NodeStore>(s: &mut S, root: PageId, key: &[u8], value: &[u8]) -> Result<PageId> {
     if key.is_empty() || key.len() > node::MAX_KEY_LEN {
         return Err(Error::InvalidInput("clave vacía o de más de 1024 bytes"));
     }
+    // Camino rápido: cursor de append (inserts secuenciales: rowid creciente,
+    // imports). Anexa O(1) a la hoja rightmost sin re-descender, sin parsear y
+    // **sin asignar** (reusa el Vec de `last_key`). Solo para valores inline y
+    // claves estrictamente mayores que la última (nuevo máximo global).
+    // `take` siempre saca el cursor; si el camino rápido no aplica (otra raíz,
+    // clave no-máxima, overflow o sin hueco), el camino completo lo reestablece
+    // desde su `tail`, así que no se pierde.
+    if let Some(mut cur) = s.take_append_cursor()
+        && cur.root == root
+        && key > cur.last_key.as_slice()
+        && s.is_dirty(cur.leaf)
+        && node::inline_cell_size(key, value.len()) <= node::MAX_INLINE_CELL
+        && let Some(new_end) = node::append_inline_at(s.body_mut(cur.leaf), cur.end, key, value)
+    {
+        cur.end = new_end;
+        cur.last_key.clear();
+        cur.last_key.extend_from_slice(key);
+        s.set_append_cursor(Some(cur));
+        return Ok(root);
+    }
+
     let payload = if node::inline_cell_size(key, value.len()) <= node::MAX_INLINE_CELL {
         Payload::Inline(value.to_vec())
     } else {
@@ -174,12 +234,14 @@ pub fn insert<S: NodeStore>(s: &mut S, root: PageId, key: &[u8], value: &[u8]) -
         }];
         let ok = node::encode_leaf(&cells, s.body_mut(id));
         debug_assert!(ok, "una celda siempre cabe en una hoja vacía");
+        // El segundo insert (root ≠ NO_ROOT) ya establece el cursor por su tail.
+        s.set_append_cursor(None);
         return Ok(id);
     }
 
     let out = insert_rec(s, root, key, payload)?;
-    match out.split {
-        None => Ok(out.id),
+    let new_root = match out.split {
+        None => out.id,
         Some((sep, right)) => {
             let new_root = s.alloc()?;
             let cells = [InnerCell {
@@ -188,9 +250,17 @@ pub fn insert<S: NodeStore>(s: &mut S, root: PageId, key: &[u8], value: &[u8]) -
             }];
             let ok = node::encode_inner(&cells, right, s.body_mut(new_root));
             debug_assert!(ok, "una raíz con una celda siempre cabe");
-            Ok(new_root)
+            new_root
         }
-    }
+    };
+    // (Re)establece el cursor: solo si el insert anexó a la hoja rightmost global.
+    s.set_append_cursor(out.tail.map(|t| AppendCursor {
+        root: new_root,
+        leaf: t.leaf,
+        end: t.end,
+        last_key: t.last_key,
+    }));
+    Ok(new_root)
 }
 
 fn insert_rec<S: NodeStore>(
@@ -207,9 +277,17 @@ fn insert_rec<S: NodeStore>(
             // Fast-path: una clave que va al final de la hoja (inserts
             // secuenciales: rowid creciente, imports) se anexa in situ sin
             // parsear ni re-encodar las celdas existentes. Bytes idénticos al
-            // re-encode.
-            if node::leaf_append(id.0, s.body_mut(id), key, &payload)? {
-                return Ok(InsertOutcome { id, split: None });
+            // re-encode. Devuelve el `tail` para (re)establecer el cursor.
+            if let Some(end) = node::leaf_append(id.0, s.body_mut(id), key, &payload)? {
+                return Ok(InsertOutcome {
+                    id,
+                    split: None,
+                    tail: Some(Tail {
+                        leaf: id,
+                        end,
+                        last_key: key.to_vec(),
+                    }),
+                });
             }
 
             // General: parsear (la copia ya sucia), insertar/sobrescribir, encodar.
@@ -234,7 +312,13 @@ fn insert_rec<S: NodeStore>(
                 }
             };
             if node::encode_leaf(&cells, s.body_mut(id)) {
-                return Ok(InsertOutcome { id, split: None });
+                // No es un append a la rightmost (overwrite o insert en medio):
+                // sin tail; el cursor se reestablecerá en el próximo append.
+                return Ok(InsertOutcome {
+                    id,
+                    split: None,
+                    tail: None,
+                });
             }
             // Split de hoja: el separador es la primera clave de la derecha. En un
             // **append al final** (inserts secuenciales: rowid creciente, imports)
@@ -252,23 +336,38 @@ fn insert_rec<S: NodeStore>(
             let ok = node::encode_leaf(&right_cells, s.body_mut(right))
                 && node::encode_leaf(&cells, s.body_mut(id));
             debug_assert!(ok, "cada mitad de un split cabe por construcción");
+            // Split: el cursor se reestablecerá con el próximo append (que irá a
+            // la mitad derecha, la nueva rightmost).
             Ok(InsertOutcome {
                 id,
                 split: Some((sep, right)),
+                tail: None,
             })
         }
         node::TYPE_INNER => {
             // Descenso sin materializar el nodo (camino caliente).
             let child = node::inner_child(id.0, body.bytes(), key)?;
+            // ¿Bajamos al hijo rightmost? Solo entonces la hoja del tail es la
+            // rightmost **global** y el cursor puede apuntarla.
+            let is_rightmost = child == node::inner_rightmost(body.bytes());
             drop(body);
-            let out = insert_rec(s, child, key, payload)?;
+            let InsertOutcome {
+                id: cid,
+                split: csplit,
+                tail: ctail,
+            } = insert_rec(s, child, key, payload)?;
+            let tail = if is_rightmost { ctail } else { None };
 
             // Atajo CoW: si el hijo no cambió de id (ya estaba sucio en esta tx)
             // y no hubo split, este nodo interno —forzosamente ya sucio, pues un
             // padre limpio solo apunta a hijos limpios— sigue siendo válido tal
             // cual. Evita re-parsear y re-encodar todo el camino en cada insert.
-            if out.split.is_none() && out.id == child {
-                return Ok(InsertOutcome { id, split: None });
+            if csplit.is_none() && cid == child {
+                return Ok(InsertOutcome {
+                    id,
+                    split: None,
+                    tail,
+                });
             }
 
             // Algo cambió: ahora sí materializar para mutar y re-encodar.
@@ -277,17 +376,17 @@ fn insert_rec<S: NodeStore>(
             drop(body);
             let idx = cells.partition_point(|c| c.key.as_slice() <= key);
             if idx < cells.len() {
-                cells[idx].child = out.id;
+                cells[idx].child = cid;
             } else {
-                rightmost = out.id;
+                rightmost = cid;
             }
-            if let Some((sep, right)) = out.split {
-                // out.id cubre < sep; right cubre [sep, cota original del slot).
+            if let Some((sep, right)) = csplit {
+                // cid cubre < sep; right cubre [sep, cota original del slot).
                 cells.insert(
                     idx,
                     InnerCell {
                         key: sep,
-                        child: out.id,
+                        child: cid,
                     },
                 );
                 if idx + 1 < cells.len() {
@@ -299,7 +398,11 @@ fn insert_rec<S: NodeStore>(
 
             let id = s.make_dirty(id)?;
             if node::encode_inner(&cells, rightmost, s.body_mut(id)) {
-                return Ok(InsertOutcome { id, split: None });
+                return Ok(InsertOutcome {
+                    id,
+                    split: None,
+                    tail,
+                });
             }
             // Split interno: la clave de cells[sp] SUBE; su hijo pasa a ser el
             // rightmost de la mitad izquierda.
@@ -312,9 +415,13 @@ fn insert_rec<S: NodeStore>(
             let ok = node::encode_inner(&right_cells, rightmost, s.body_mut(right))
                 && node::encode_inner(&cells, left_rightmost, s.body_mut(id));
             debug_assert!(ok, "cada mitad de un split cabe por construcción");
+            // La mitad derecha hereda el rightmost original ⇒ la hoja del `tail`
+            // sigue siendo la rightmost global; el cursor la apuntará tras el
+            // nuevo nodo raíz.
             Ok(InsertOutcome {
                 id,
                 split: Some((sep_up, right)),
+                tail,
             })
         }
         _ => Err(Error::Corrupt {

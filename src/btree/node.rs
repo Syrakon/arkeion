@@ -315,10 +315,17 @@ fn encode_leaf_cell(key: &[u8], payload: &Payload) -> Vec<u8> {
 /// la última celda (append puro) y cabe en el hueco. El resultado es **idéntico
 /// byte a byte** a re-encodar la hoja con la celda añadida (mismas celdas en
 /// orden + mismo relleno a cero, que ya estaba ahí), pero sin parsear ni
-/// reescribir las celdas existentes. `Ok(true)` si anexó; `Ok(false)` si hay que
-/// ir por el camino general (clave no final, o no cabe ⇒ split). Es la
-/// optimización de los inserts secuenciales (imports, rowid creciente).
-pub fn leaf_append(page: u64, body: &mut [u8], key: &[u8], payload: &Payload) -> Result<bool> {
+/// reescribir las celdas existentes. `Ok(Some(fin))` (offset libre tras la celda
+/// nueva) si anexó; `Ok(None)` si hay que ir por el camino general (clave no
+/// final, o no cabe ⇒ split). Es la optimización de los inserts secuenciales
+/// (imports, rowid creciente). Escanea las celdas para hallar el final: el camino
+/// O(1) sin escaneo es [`append_inline_at`] (cursor de append).
+pub fn leaf_append(
+    page: u64,
+    body: &mut [u8],
+    key: &[u8],
+    payload: &Payload,
+) -> Result<Option<usize>> {
     if body[0] != TYPE_LEAF {
         return Err(corrupt(page, "se esperaba una hoja"));
     }
@@ -342,16 +349,64 @@ pub fn leaf_append(page: u64, body: &mut [u8], key: &[u8], payload: &Payload) ->
     if let Some((ks, ke)) = last_key
         && key <= &body[ks..ke]
     {
-        return Ok(false);
+        return Ok(None);
     }
 
     let cell = encode_leaf_cell(key, payload);
     if end + cell.len() > body.len() {
-        return Ok(false); // no cabe ⇒ camino general (hará split)
+        return Ok(None); // no cabe ⇒ camino general (hará split)
     }
     body[end..end + cell.len()].copy_from_slice(&cell);
     body[2..4].copy_from_slice(&((ncells as u16) + 1).to_le_bytes());
-    Ok(true)
+    Ok(Some(end + cell.len()))
+}
+
+/// Anexa una celda **inline** al final de la hoja en `end` (offset libre ya
+/// conocido) sin escanear las celdas existentes: el camino O(1) del **cursor de
+/// append** (M10-perf). El llamador garantiza que `key` va después de la última
+/// celda y que la hoja es la rightmost (el cursor lo asegura). Devuelve el nuevo
+/// offset libre, o `None` si no cabe (⇒ split por el camino general). No asigna.
+pub fn append_inline_at(body: &mut [u8], end: usize, key: &[u8], value: &[u8]) -> Option<usize> {
+    let cell_len =
+        1 + varint_len(key.len() as u64) + key.len() + varint_len(value.len() as u64) + value.len();
+    if end + cell_len > body.len() {
+        return None;
+    }
+    let mut p = end;
+    body[p] = 0; // flag inline
+    p += 1;
+    p = put_varint_at(body, p, key.len() as u64);
+    body[p..p + key.len()].copy_from_slice(key);
+    p += key.len();
+    p = put_varint_at(body, p, value.len() as u64);
+    body[p..p + value.len()].copy_from_slice(value);
+    p += value.len();
+    let ncells = u16::from_le_bytes([body[2], body[3]]);
+    body[2..4].copy_from_slice(&(ncells + 1).to_le_bytes());
+    Some(p)
+}
+
+/// Escribe un varint LEB128 en `body[pos..]` y devuelve la posición siguiente
+/// (versión sobre slice de [`crate::format::put_varint`], sin asignar).
+fn put_varint_at(body: &mut [u8], mut pos: usize, mut v: u64) -> usize {
+    loop {
+        let b = (v & 0x7f) as u8;
+        v >>= 7;
+        if v == 0 {
+            body[pos] = b;
+            return pos + 1;
+        }
+        body[pos] = b | 0x80;
+        pos += 1;
+    }
+}
+
+/// Hijo rightmost de un nodo interno (puntero en `body[4..12]`). El llamador ya
+/// sabe que es un nodo interno (camino caliente del cursor de append).
+pub fn inner_rightmost(body: &[u8]) -> PageId {
+    PageId(u64::from_le_bytes(
+        body[4..12].try_into().expect("rango fijo de 8 bytes"),
+    ))
 }
 
 // --- overflow ---
@@ -509,7 +564,11 @@ mod tests {
 
         // Append (clave > última): byte-idéntico a re-encodar con la celda.
         let mut appended = body.clone();
-        assert!(leaf_append(0, &mut appended, b"z", &Payload::Inline(b"9".to_vec())).unwrap());
+        assert!(
+            leaf_append(0, &mut appended, b"z", &Payload::Inline(b"9".to_vec()))
+                .unwrap()
+                .is_some()
+        );
         let mut expected = base.clone();
         expected.push(cell(b"z", b"9"));
         let mut expected_body = vec![0u8; BODY_SIZE];
@@ -525,7 +584,11 @@ mod tests {
             total_len: 70_000,
             first: PageId(123),
         };
-        assert!(leaf_append(0, &mut over, b"zz", &payload).unwrap());
+        assert!(
+            leaf_append(0, &mut over, b"zz", &payload)
+                .unwrap()
+                .is_some()
+        );
         let mut expected2 = base.clone();
         expected2.push(LeafCell {
             key: b"zz".to_vec(),
@@ -538,13 +601,21 @@ mod tests {
         // No-append: clave en medio, igual a una existente, o menor que la 1ª.
         for k in [&b"b"[..], b"m", b"0"] {
             let mut b2 = body.clone();
-            assert!(!leaf_append(0, &mut b2, k, &Payload::Inline(b"x".to_vec())).unwrap());
+            assert!(
+                leaf_append(0, &mut b2, k, &Payload::Inline(b"x".to_vec()))
+                    .unwrap()
+                    .is_none()
+            );
             assert_eq!(b2, body, "no-append no debe tocar el body");
         }
 
         // Clave final pero que no cabe ⇒ false, body intacto (lo parte el general).
         let mut b3 = body.clone();
-        assert!(!leaf_append(0, &mut b3, b"zzz", &Payload::Inline(vec![7u8; BODY_SIZE])).unwrap());
+        assert!(
+            leaf_append(0, &mut b3, b"zzz", &Payload::Inline(vec![7u8; BODY_SIZE]))
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(b3, body);
     }
 

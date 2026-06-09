@@ -54,7 +54,15 @@ fn unzigzag(u: u64) -> i64 {
 
 pub fn encode_values(values: &[Value]) -> Vec<u8> {
     let mut out = Vec::with_capacity(16 + values.len() * 8);
-    put_varint(&mut out, values.len() as u64);
+    encode_values_into(values, &mut out);
+    out
+}
+
+/// Como [`encode_values`] pero en un buffer **reutilizado** (lo limpia antes):
+/// el camino caliente de `insert_row` evita asignar un `Vec` por fila (M10-perf).
+pub fn encode_values_into(values: &[Value], out: &mut Vec<u8>) {
+    out.clear();
+    put_varint(out, values.len() as u64);
     for v in values {
         out.push(match v {
             Value::Null => TAG_NULL,
@@ -69,19 +77,18 @@ pub fn encode_values(values: &[Value]) -> Vec<u8> {
     for v in values {
         match v {
             Value::Null | Value::Bool(_) => {}
-            Value::Integer(n) => put_varint(&mut out, zigzag(*n)),
+            Value::Integer(n) => put_varint(out, zigzag(*n)),
             Value::Real(f) => out.extend_from_slice(&f.to_le_bytes()),
             Value::Text(s) => {
-                put_varint(&mut out, s.len() as u64);
+                put_varint(out, s.len() as u64);
                 out.extend_from_slice(s.as_bytes());
             }
             Value::Blob(b) => {
-                put_varint(&mut out, b.len() as u64);
+                put_varint(out, b.len() as u64);
                 out.extend_from_slice(b);
             }
         }
     }
-    out
 }
 
 pub fn decode_values(buf: &[u8]) -> Result<Vec<Value>> {

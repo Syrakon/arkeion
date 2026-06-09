@@ -302,6 +302,8 @@ impl Store {
             meta_root: global.meta_root,
             base: global,
             rowid_cache: HashMap::new(),
+            rec_buf: Vec::new(),
+            enc_buf: Vec::new(),
         })
     }
 
@@ -1171,6 +1173,10 @@ pub struct TxStore {
     freed: Vec<PageId>,
     alloc_base: u64,
     alloc_next: u64,
+    /// Cursor de append a la hoja rightmost del árbol de datos (M10-perf): hace
+    /// O(1) los inserts secuenciales. Lo gestiona `btree::insert`; se invalida
+    /// solo (raíz/clave) y se reestablece desde el `tail` del insert completo.
+    append_cursor: Option<btree::AppendCursor>,
 }
 
 impl TxStore {
@@ -1182,6 +1188,7 @@ impl TxStore {
             freed: Vec::new(),
             alloc_base: base,
             alloc_next: base,
+            append_cursor: None,
         }
     }
 }
@@ -1238,6 +1245,14 @@ impl NodeStore for TxStore {
     fn is_dirty(&self, id: PageId) -> bool {
         self.dirty.contains_key(&id)
     }
+
+    fn take_append_cursor(&mut self) -> Option<btree::AppendCursor> {
+        self.append_cursor.take()
+    }
+
+    fn set_append_cursor(&mut self, cursor: Option<btree::AppendCursor>) {
+        self.append_cursor = cursor;
+    }
 }
 
 // --- transacción de escritura ---
@@ -1267,6 +1282,10 @@ pub struct WriteTx {
     /// commit. Evita reescribir la hoja del contador en cada `insert_row`. El
     /// resultado en disco es idéntico (solo persiste el valor final).
     rowid_cache: HashMap<u32, i64>,
+    /// Buffers reutilizados del camino caliente de `insert_row` (M10-perf): la
+    /// fila validada y su codificación, para no asignar un `Vec` por fila.
+    rec_buf: Vec<Value>,
+    enc_buf: Vec<u8>,
 }
 
 impl Drop for WriteTx {
@@ -1342,7 +1361,15 @@ impl WriteTx {
             catalog::resolve_rowid(&self.ts, self.data_root, table.table_id, explicit, next)?;
         // Solo se persiste tras escribir la fila: un insert fallido no deja
         // contador a medias en la caché.
-        self.data_root = catalog::put_row(&mut self.ts, self.data_root, table, rowid, values)?;
+        self.data_root = catalog::put_row_buffered(
+            &mut self.ts,
+            self.data_root,
+            table,
+            rowid,
+            values,
+            &mut self.rec_buf,
+            &mut self.enc_buf,
+        )?;
         self.rowid_cache.insert(table.table_id, new_next);
         Ok(rowid)
     }

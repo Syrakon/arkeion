@@ -18,6 +18,19 @@ pub enum Stmt {
         if_exists: bool,
         name: String,
     },
+    /// `CREATE [UNIQUE] INDEX [IF NOT EXISTS] nombre ON tabla (col, …)`.
+    CreateIndex {
+        if_not_exists: bool,
+        unique: bool,
+        name: String,
+        table: String,
+        columns: Vec<String>,
+    },
+    /// `DROP INDEX [IF EXISTS] nombre` (nombre global, estilo SQLite).
+    DropIndex {
+        if_exists: bool,
+        name: String,
+    },
     Insert {
         table: String,
         columns: Option<Vec<String>>,

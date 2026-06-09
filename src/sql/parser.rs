@@ -124,9 +124,9 @@ impl Parser {
 
     fn statement(&mut self) -> Result<Stmt> {
         match self.peek() {
-            Some(Tok::Kw(Kw::Create)) => self.create_table(),
+            Some(Tok::Kw(Kw::Create)) => self.create(),
             Some(Tok::Kw(Kw::Alter)) => self.alter_table(),
-            Some(Tok::Kw(Kw::Drop)) => self.drop_table(),
+            Some(Tok::Kw(Kw::Drop)) => self.drop(),
             Some(Tok::Kw(Kw::Insert)) => self.insert(),
             Some(Tok::Kw(Kw::Select)) => Ok(Stmt::Select(self.select()?)),
             Some(Tok::Kw(Kw::Update)) => self.update(),
@@ -150,16 +150,49 @@ impl Parser {
         }
     }
 
-    fn create_table(&mut self) -> Result<Stmt> {
+    /// `CREATE` → tabla o índice según lo que siga (`[UNIQUE] INDEX` vs `TABLE`).
+    fn create(&mut self) -> Result<Stmt> {
         self.expect_kw(Kw::Create, "CREATE")?;
-        self.expect_kw(Kw::Table, "TABLE")?;
-        let if_not_exists = if self.eat_kw(Kw::If) {
+        if matches!(self.peek(), Some(Tok::Kw(Kw::Unique | Kw::Index))) {
+            self.create_index()
+        } else {
+            self.create_table()
+        }
+    }
+
+    /// `DROP` → tabla o índice.
+    fn drop(&mut self) -> Result<Stmt> {
+        self.expect_kw(Kw::Drop, "DROP")?;
+        if matches!(self.peek(), Some(Tok::Kw(Kw::Index))) {
+            self.drop_index()
+        } else {
+            self.drop_table()
+        }
+    }
+
+    fn if_not_exists(&mut self) -> Result<bool> {
+        if self.eat_kw(Kw::If) {
             self.expect_kw(Kw::Not, "NOT")?;
             self.expect_kw(Kw::Exists, "EXISTS")?;
-            true
+            Ok(true)
         } else {
-            false
-        };
+            Ok(false)
+        }
+    }
+
+    fn if_exists(&mut self) -> Result<bool> {
+        if self.eat_kw(Kw::If) {
+            self.expect_kw(Kw::Exists, "EXISTS")?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// Tras consumir `CREATE`: `TABLE [IF NOT EXISTS] nombre (col, …)`.
+    fn create_table(&mut self) -> Result<Stmt> {
+        self.expect_kw(Kw::Table, "TABLE")?;
+        let if_not_exists = self.if_not_exists()?;
         let name = self.ident("un nombre de tabla")?;
         self.expect(&Tok::LParen, "'('")?;
         let mut columns = Vec::new();
@@ -175,6 +208,40 @@ impl Parser {
             name,
             columns,
         })
+    }
+
+    /// Tras consumir `CREATE`: `[UNIQUE] INDEX [IF NOT EXISTS] nombre ON tabla (col, …)`.
+    fn create_index(&mut self) -> Result<Stmt> {
+        let unique = self.eat_kw(Kw::Unique);
+        self.expect_kw(Kw::Index, "INDEX")?;
+        let if_not_exists = self.if_not_exists()?;
+        let name = self.ident("un nombre de índice")?;
+        self.expect_kw(Kw::On, "ON")?;
+        let table = self.ident("un nombre de tabla")?;
+        self.expect(&Tok::LParen, "'('")?;
+        let mut columns = Vec::new();
+        loop {
+            columns.push(self.ident("un nombre de columna")?);
+            if !self.eat(&Tok::Comma) {
+                break;
+            }
+        }
+        self.expect(&Tok::RParen, "')'")?;
+        Ok(Stmt::CreateIndex {
+            if_not_exists,
+            unique,
+            name,
+            table,
+            columns,
+        })
+    }
+
+    /// Tras consumir `DROP`: `INDEX [IF EXISTS] nombre`.
+    fn drop_index(&mut self) -> Result<Stmt> {
+        self.expect_kw(Kw::Index, "INDEX")?;
+        let if_exists = self.if_exists()?;
+        let name = self.ident("un nombre de índice")?;
+        Ok(Stmt::DropIndex { if_exists, name })
     }
 
     fn alter_table(&mut self) -> Result<Stmt> {
@@ -224,15 +291,10 @@ impl Parser {
         }
     }
 
+    /// Tras consumir `DROP`: `TABLE [IF EXISTS] nombre`.
     fn drop_table(&mut self) -> Result<Stmt> {
-        self.expect_kw(Kw::Drop, "DROP")?;
         self.expect_kw(Kw::Table, "TABLE")?;
-        let if_exists = if self.eat_kw(Kw::If) {
-            self.expect_kw(Kw::Exists, "EXISTS")?;
-            true
-        } else {
-            false
-        };
+        let if_exists = self.if_exists()?;
         Ok(Stmt::DropTable {
             if_exists,
             name: self.ident("un nombre de tabla")?,

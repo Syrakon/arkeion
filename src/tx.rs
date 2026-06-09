@@ -18,7 +18,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use sha2::{Digest, Sha256};
 
 use crate::btree::{self, Body, Cursor, NodeSource, NodeStore};
-use crate::catalog::{self, TableDef, TableScan, TableSpec};
+use crate::catalog::{self, IndexDef, TableDef, TableScan, TableSpec};
 use crate::commit::{self, COMMIT_FLAG_CHECKPOINT, CommitHeader, Head};
 use crate::compress::{Compressor, Lz};
 use crate::crypto::Key;
@@ -1159,6 +1159,11 @@ impl Snapshot {
     pub fn scan_table(&self, table: &TableDef) -> Result<TableScan<'_, Snapshot>> {
         catalog::scan_table(self, self.data_root, table)
     }
+
+    /// rowids cuyas columnas indexadas valen `value` (igualdad), vía el índice.
+    pub fn index_lookup(&self, idx: &IndexDef, value: &Value) -> Result<Vec<i64>> {
+        catalog::index_scan_eq(self, self.data_root, idx, std::slice::from_ref(value))
+    }
 }
 
 // --- estado de páginas de una transacción ---
@@ -1323,6 +1328,36 @@ impl WriteTx {
         let (root, def) = catalog::create_table(&mut self.ts, self.data_root, spec)?;
         self.data_root = root;
         Ok(def)
+    }
+
+    /// Crea un índice secundario sobre `columns` (posiciones) de `table` (M10.5).
+    pub fn create_index(
+        &mut self,
+        table: &str,
+        name: &str,
+        columns: &[usize],
+        unique: bool,
+    ) -> Result<()> {
+        self.data_root =
+            catalog::create_index(&mut self.ts, self.data_root, table, name, columns, unique)?;
+        Ok(())
+    }
+
+    /// Borra un índice por su nombre global. `false` si no existía.
+    pub fn drop_index(&mut self, name: &str) -> Result<bool> {
+        let (root, dropped) = catalog::drop_index(&mut self.ts, self.data_root, name)?;
+        self.data_root = root;
+        Ok(dropped)
+    }
+
+    /// `true` si existe un índice con ese nombre (para `IF NOT EXISTS`).
+    pub fn index_exists(&self, name: &str) -> Result<bool> {
+        catalog::index_exists(&self.ts, self.data_root, name)
+    }
+
+    /// rowids cuyas columnas indexadas valen `value` (igualdad), vía el índice.
+    pub fn index_lookup(&self, idx: &IndexDef, value: &Value) -> Result<Vec<i64>> {
+        catalog::index_scan_eq(&self.ts, self.data_root, idx, std::slice::from_ref(value))
     }
 
     pub fn drop_table(&mut self, name: &str) -> Result<bool> {

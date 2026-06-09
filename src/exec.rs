@@ -684,7 +684,7 @@ pub fn run_select(src: &impl DataSource, stmt: &SelectStmt, params: &[Value]) ->
     let has_agg = stmt
         .projection
         .iter()
-        .any(|i| matches!(i, SelectItem::Expr(e) if e.has_aggregate()))
+        .any(|i| matches!(i, SelectItem::Expr { expr, .. } if expr.has_aggregate()))
         || stmt.having.as_ref().is_some_and(|h| h.has_aggregate());
     if has_agg {
         let (columns, row) = aggregate_projection(&stmt.projection, &schema, &rows, params)?;
@@ -748,12 +748,12 @@ pub fn run_select(src: &impl DataSource, stmt: &SelectStmt, params: &[Value]) ->
                 );
                 projections.push(None);
             }
-            SelectItem::Expr(e) => {
+            SelectItem::Expr { expr: e, alias } => {
                 validate_columns(e, &schema)?;
-                columns.push(match e {
+                columns.push(alias.clone().unwrap_or_else(|| match e {
                     Expr::Column { name, .. } => name.clone(),
                     _ => format!("col{}", i + 1),
-                });
+                }));
                 projections.push(Some(e));
             }
         }
@@ -1054,7 +1054,7 @@ fn aggregate_projection(
     let mut columns = Vec::with_capacity(projection.len());
     let mut out = Vec::with_capacity(projection.len());
     for (i, item) in projection.iter().enumerate() {
-        let SelectItem::Expr(e) = item else {
+        let SelectItem::Expr { expr: e, alias } = item else {
             return Err(sql_err("'*' no se puede combinar con agregados"));
         };
         if let Some(name) = col_outside_agg(e) {
@@ -1063,7 +1063,7 @@ fn aggregate_projection(
             )));
         }
         validate_columns(e, schema)?;
-        columns.push(format!("col{}", i + 1));
+        columns.push(alias.clone().unwrap_or_else(|| format!("col{}", i + 1)));
         let folded = fold_aggregates(e, schema, rows, params)?;
         out.push(eval_const(&folded, params)?);
     }
@@ -1151,7 +1151,7 @@ fn run_grouped(
     for item in &stmt.projection {
         match item {
             SelectItem::Star => return Err(sql_err("'*' no se puede combinar con GROUP BY")),
-            SelectItem::Expr(e) => check_grouped(e)?,
+            SelectItem::Expr { expr: e, .. } => check_grouped(e)?,
         }
     }
     if let Some(h) = &stmt.having {
@@ -1185,7 +1185,11 @@ fn run_grouped(
         .iter()
         .enumerate()
         .map(|(i, item)| match item {
-            SelectItem::Expr(Expr::Column { name, .. }) => name.clone(),
+            SelectItem::Expr { alias: Some(a), .. } => a.clone(),
+            SelectItem::Expr {
+                expr: Expr::Column { name, .. },
+                ..
+            } => name.clone(),
             _ => format!("col{}", i + 1),
         })
         .collect();
@@ -1203,7 +1207,7 @@ fn run_grouped(
         }
         let mut out = Vec::with_capacity(columns.len());
         for item in &stmt.projection {
-            let SelectItem::Expr(e) = item else {
+            let SelectItem::Expr { expr: e, .. } = item else {
                 unreachable!("'*' ya rechazado")
             };
             let folded = fold_aggregates(e, schema, group, params)?;

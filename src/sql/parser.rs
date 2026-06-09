@@ -541,7 +541,14 @@ impl Parser {
         if self.eat(&Tok::Star) {
             return Ok(SelectItem::Star);
         }
-        Ok(SelectItem::Expr(self.expr()?))
+        let expr = self.expr()?;
+        // Alias de columna: `expr AS nombre` (explícito, sin ambigüedad).
+        let alias = if self.eat_kw(Kw::As) {
+            Some(self.ident("un alias de columna tras AS")?)
+        } else {
+            None
+        };
+        Ok(SelectItem::Expr { expr, alias })
     }
 
     // --- expresiones ---
@@ -813,7 +820,7 @@ mod tests {
         );
         assert!(matches!(
             &s.projection[0],
-            SelectItem::Expr(Expr::Column { table: Some(t), name }) if t == "c" && name == "nombre"
+            SelectItem::Expr { expr: Expr::Column { table: Some(t), name }, .. } if t == "c" && name == "nombre"
         ));
         assert_eq!(s.order_by[0].table.as_deref(), Some("c"));
     }
@@ -898,17 +905,23 @@ mod tests {
         };
         assert!(matches!(
             &s.projection[0],
-            SelectItem::Expr(Expr::Aggregate {
-                func: AggFunc::Count,
-                arg: None
-            })
+            SelectItem::Expr {
+                expr: Expr::Aggregate {
+                    func: AggFunc::Count,
+                    arg: None
+                },
+                ..
+            }
         ));
         assert!(matches!(
             &s.projection[1],
-            SelectItem::Expr(Expr::Aggregate {
-                func: AggFunc::Sum,
-                arg: Some(_)
-            })
+            SelectItem::Expr {
+                expr: Expr::Aggregate {
+                    func: AggFunc::Sum,
+                    arg: Some(_)
+                },
+                ..
+            }
         ));
         assert!(parse("SELECT NOPE(1) FROM t").is_err());
         assert!(parse("SELECT SUM(*) FROM t").is_err());
@@ -930,7 +943,11 @@ mod tests {
         let Stmt::Select(s) = parse("SELECT 1 + 2 * 3 FROM t").unwrap() else {
             panic!()
         };
-        let SelectItem::Expr(Expr::Binary(_, BinOp::Add, right)) = &s.projection[0] else {
+        let SelectItem::Expr {
+            expr: Expr::Binary(_, BinOp::Add, right),
+            ..
+        } = &s.projection[0]
+        else {
             panic!("+ debe ser la raíz")
         };
         assert!(matches!(**right, Expr::Binary(_, BinOp::Mul, _)));

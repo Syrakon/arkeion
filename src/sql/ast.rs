@@ -132,7 +132,12 @@ pub enum AsOfClause {
 #[derive(Clone, Debug, PartialEq)]
 pub enum SelectItem {
     Star,
-    Expr(Expr),
+    /// Una expresión proyectada, con su alias opcional (`expr AS nombre`). El
+    /// alias da nombre a la columna de salida; sin él se deriva del propio `expr`.
+    Expr {
+        expr: Expr,
+        alias: Option<String>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

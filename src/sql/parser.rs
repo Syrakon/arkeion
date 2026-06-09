@@ -3,10 +3,11 @@
 //!
 //! ```text
 //! expr := or          or  := and (OR and)*        and := not (AND not)*
-//! not  := [NOT] cmp   cmp := add ((=|!=|<|<=|>|>=) add | IS [NOT] NULL | [NOT] LIKE add)?
+//! not  := [NOT] cmp
+//! cmp  := add ((=|!=|<|<=|>|>=) add | IS [NOT] NULL | [NOT] LIKE add | [NOT] IN (lista))?
 //! add  := mul ((+|-) mul)*                        mul := unary ((*|/|%) unary)*
 //! unary := [-] primary
-//! primary := literal | columna | tabla.columna | agregado(expr|*) | ?N | ( expr )
+//! primary := literal | columna | tabla.columna | func(args) | agregado(expr|*) | ?N | ( expr )
 //! ```
 
 use crate::catalog::ColType;
@@ -617,6 +618,28 @@ impl Parser {
                 expr: Box::new(left),
                 pattern: Box::new(pattern),
                 negated: false,
+            });
+        }
+        // [NOT] IN (v1, v2, …)
+        let neg_in =
+            self.peek() == Some(&Tok::Kw(Kw::Not)) && self.peek2() == Some(&Tok::Kw(Kw::In));
+        if neg_in || self.peek() == Some(&Tok::Kw(Kw::In)) {
+            self.i += if neg_in { 2 } else { 1 };
+            self.expect(&Tok::LParen, "'(' tras IN")?;
+            let mut list = Vec::new();
+            if self.peek() != Some(&Tok::RParen) {
+                loop {
+                    list.push(self.expr()?);
+                    if !self.eat(&Tok::Comma) {
+                        break;
+                    }
+                }
+            }
+            self.expect(&Tok::RParen, "')'")?;
+            return Ok(Expr::In {
+                expr: Box::new(left),
+                list,
+                negated: neg_in,
             });
         }
         let op = match self.peek() {

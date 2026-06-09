@@ -181,6 +181,13 @@ pub enum Expr {
         name: String,
         args: Vec<Expr>,
     },
+    /// `expr [NOT] IN (v1, v2, …)`: pertenencia a un conjunto de valores. Semántica
+    /// trivalente de SQL (si `expr` es NULL, o no está y la lista trae NULL → NULL).
+    In {
+        expr: Box<Expr>,
+        list: Vec<Expr>,
+        negated: bool,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -218,6 +225,7 @@ impl Expr {
             Expr::IsNull { expr, .. } => expr.is_const(),
             Expr::Like { expr, pattern, .. } => expr.is_const() && pattern.is_const(),
             Expr::Function { args, .. } => args.iter().all(Expr::is_const),
+            Expr::In { expr, list, .. } => expr.is_const() && list.iter().all(Expr::is_const),
         }
     }
 
@@ -231,6 +239,9 @@ impl Expr {
             Expr::Like { expr, pattern, .. } => expr.contains_param() || pattern.contains_param(),
             Expr::Aggregate { arg, .. } => arg.as_ref().is_some_and(|e| e.contains_param()),
             Expr::Function { args, .. } => args.iter().any(Expr::contains_param),
+            Expr::In { expr, list, .. } => {
+                expr.contains_param() || list.iter().any(Expr::contains_param)
+            }
         }
     }
 
@@ -243,6 +254,9 @@ impl Expr {
             Expr::IsNull { expr, .. } => expr.has_aggregate(),
             Expr::Like { expr, pattern, .. } => expr.has_aggregate() || pattern.has_aggregate(),
             Expr::Function { args, .. } => args.iter().any(Expr::has_aggregate),
+            Expr::In { expr, list, .. } => {
+                expr.has_aggregate() || list.iter().any(Expr::has_aggregate)
+            }
         }
     }
 }

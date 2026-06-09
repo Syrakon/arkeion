@@ -218,6 +218,10 @@ fn validate_columns(e: &Expr, schema: &QuerySchema) -> Result<()> {
             .as_deref()
             .map_or(Ok(()), |e| validate_columns(e, schema)),
         Expr::Function { args, .. } => args.iter().try_for_each(|a| validate_columns(a, schema)),
+        Expr::In { expr, list, .. } => {
+            validate_columns(expr, schema)?;
+            list.iter().try_for_each(|e| validate_columns(e, schema))
+        }
     }
 }
 
@@ -1083,6 +1087,9 @@ fn col_outside_agg(e: &Expr) -> Option<&str> {
             col_outside_agg(expr).or_else(|| col_outside_agg(pattern))
         }
         Expr::Function { args, .. } => args.iter().find_map(col_outside_agg),
+        Expr::In { expr, list, .. } => {
+            col_outside_agg(expr).or_else(|| list.iter().find_map(col_outside_agg))
+        }
     }
 }
 
@@ -1114,6 +1121,10 @@ fn collect_columns(e: &Expr, skip_agg: bool, out: &mut Vec<ColRef>) {
         }
         Expr::Function { args, .. } => {
             args.iter().for_each(|a| collect_columns(a, skip_agg, out));
+        }
+        Expr::In { expr, list, .. } => {
+            collect_columns(expr, skip_agg, out);
+            list.iter().for_each(|e| collect_columns(e, skip_agg, out));
         }
     }
 }
@@ -1303,6 +1314,18 @@ fn fold_aggregates(
                 .iter()
                 .map(|a| fold_aggregates(a, schema, rows, params))
                 .collect::<Result<_>>()?,
+        },
+        Expr::In {
+            expr,
+            list,
+            negated,
+        } => Expr::In {
+            expr: Box::new(fold_aggregates(expr, schema, rows, params)?),
+            list: list
+                .iter()
+                .map(|e| fold_aggregates(e, schema, rows, params))
+                .collect::<Result<_>>()?,
+            negated: *negated,
         },
     })
 }
@@ -1506,6 +1529,36 @@ fn eval(e: &Expr, row: Option<(&QuerySchema, &[Value])>, params: &[Value]) -> Re
                 .map(|a| eval(a, row, params))
                 .collect::<Result<_>>()?;
             call_function(name, &vals)
+        }
+        Expr::In {
+            expr,
+            list,
+            negated,
+        } => {
+            let v = eval(expr, row, params)?;
+            if matches!(v, Value::Null) {
+                return Ok(Value::Null); // NULL IN (…) es desconocido
+            }
+            let mut saw_null = false;
+            let mut found = false;
+            for item in list {
+                let iv = eval(item, row, params)?;
+                match cmp_values(&v, &iv)? {
+                    Some(Ordering::Equal) => {
+                        found = true;
+                        break;
+                    }
+                    Some(_) => {}
+                    None => saw_null = true, // un NULL en la lista → desconocido
+                }
+            }
+            // Trivalente: hallado → true; no hallado con NULL → NULL; si no → false.
+            // (`negated` invierte el booleano, no el NULL.)
+            Ok(match (found, saw_null) {
+                (true, _) => Value::Bool(!*negated),
+                (false, true) => Value::Null,
+                (false, false) => Value::Bool(*negated),
+            })
         }
     }
 }

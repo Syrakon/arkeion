@@ -9,6 +9,16 @@ fn db() -> (tempfile::TempDir, Database) {
     (dir, db)
 }
 
+fn ids(conn: &arkeion::Connection, sql: &str) -> Vec<i64> {
+    let mut v: Vec<i64> = conn
+        .query(sql, &[])
+        .unwrap()
+        .map(|r| r.unwrap().get::<i64>(0).unwrap())
+        .collect();
+    v.sort_unstable();
+    v
+}
+
 fn one(conn: &arkeion::Connection, sql: &str) -> Value {
     conn.query(sql, &[])
         .unwrap()
@@ -77,4 +87,31 @@ fn scalar_functions() {
     assert_eq!(one(&conn, "SELECT UPPER(NULL) FROM t"), Value::Null);
     assert!(conn.query("SELECT UPPER(n) FROM t", &[]).is_err());
     assert!(conn.query("SELECT NOPE(1) FROM t", &[]).is_err());
+}
+
+#[test]
+fn in_operator() {
+    let (_d, db) = db();
+    let conn = db.connect().unwrap();
+    conn.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER, s TEXT)",
+        &[],
+    )
+    .unwrap();
+    for (n, s) in [(1, "a"), (2, "b"), (3, "c"), (4, "d")] {
+        conn.execute(&format!("INSERT INTO t (n, s) VALUES ({n}, '{s}')"), &[])
+            .unwrap();
+    }
+    assert_eq!(ids(&conn, "SELECT id FROM t WHERE n IN (1, 3)"), [1, 3]);
+    assert_eq!(ids(&conn, "SELECT id FROM t WHERE n NOT IN (1, 3)"), [2, 4]);
+    assert_eq!(ids(&conn, "SELECT id FROM t WHERE s IN ('b', 'd')"), [2, 4]);
+    assert_eq!(
+        ids(&conn, "SELECT id FROM t WHERE n IN (99)"),
+        Vec::<i64>::new()
+    );
+    // NULL en la lista: no hallado + NULL ⇒ desconocido ⇒ la fila no pasa el WHERE.
+    assert_eq!(
+        ids(&conn, "SELECT id FROM t WHERE n IN (99, NULL)"),
+        Vec::<i64>::new()
+    );
 }

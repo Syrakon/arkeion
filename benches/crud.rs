@@ -137,7 +137,9 @@ fn run_arkeion(durable_n: i64, bulk_n: i64, scan_reps: i64) -> Vec<(&'static str
             &[],
         )
         .unwrap();
-        let ins = conn.prepare("INSERT INTO it (id, k) VALUES (?1, ?2)").unwrap();
+        let ins = conn
+            .prepare("INSERT INTO it (id, k) VALUES (?1, ?2)")
+            .unwrap();
         conn.execute("BEGIN", &[]).unwrap();
         for i in 1..=bulk_n {
             ins.execute(&params![i, i * 2]).unwrap(); // k único
@@ -268,7 +270,9 @@ fn run_sqlite(durable_n: i64, bulk_n: i64, scan_reps: i64) -> Vec<(&'static str,
         {
             let tx = conn.unchecked_transaction().unwrap();
             {
-                let mut ins = tx.prepare("INSERT INTO it (id, k) VALUES (?1, ?2)").unwrap();
+                let mut ins = tx
+                    .prepare("INSERT INTO it (id, k) VALUES (?1, ?2)")
+                    .unwrap();
                 for i in 1..=bulk_n {
                     ins.execute(rusqlite::params![i, i * 2]).unwrap();
                 }

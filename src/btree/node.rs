@@ -249,11 +249,17 @@ pub fn encode_inner(cells: &[InnerCell], rightmost: PageId, body: &mut [u8]) -> 
 /// Hijo a seguir en un nodo interno para `key`. Equivale a
 /// `parse_inner(..).partition_point(c.key <= key) → child|rightmost`.
 pub fn inner_child(page: u64, body: &[u8], key: &[u8]) -> Result<PageId> {
+    Ok(inner_child_indexed(page, body, key)?.0)
+}
+
+/// Como [`inner_child`] pero devuelve también el **índice** del hijo elegido
+/// (`= partition_point`, en `0..=ncells`; `ncells` ⇒ rightmost). El índice sirve
+/// para retomar por el hermano siguiente en un recorrido (`for_each_prefix`).
+pub fn inner_child_indexed(page: u64, body: &[u8], key: &[u8]) -> Result<(PageId, usize)> {
     if body[0] != TYPE_INNER {
         return Err(corrupt(page, "se esperaba un nodo interno"));
     }
     let ncells = u16::from_le_bytes([body[2], body[3]]) as usize;
-    let rightmost = inner_rightmost(body);
     // partition_point por búsqueda binaria: primer separador con clave > `key`
     // (cota superior exclusiva). Su hijo cubre `key`; si ninguno, va al rightmost.
     let mut lo = 0;
@@ -267,12 +273,62 @@ pub fn inner_child(page: u64, body: &[u8], key: &[u8]) -> Result<PageId> {
             lo = mid + 1;
         }
     }
-    if lo < ncells {
-        let (_, mut pos) = inner_key_at(page, body, cell_ptr(body, lo))?;
+    Ok((inner_child_value_at(page, body, lo)?, lo))
+}
+
+/// Número de separadores de un nodo interno.
+pub fn inner_ncells(body: &[u8]) -> usize {
+    u16::from_le_bytes([body[2], body[3]]) as usize
+}
+
+/// Hijo en el índice `idx` (`cells[idx].child`, o rightmost si `idx == ncells`).
+pub fn inner_child_value_at(page: u64, body: &[u8], idx: usize) -> Result<PageId> {
+    let ncells = u16::from_le_bytes([body[2], body[3]]) as usize;
+    if idx < ncells {
+        let (_, mut pos) = inner_key_at(page, body, cell_ptr(body, idx))?;
         Ok(PageId(get_u64(page, body, &mut pos)?))
     } else {
-        Ok(rightmost)
+        Ok(inner_rightmost(body))
     }
+}
+
+/// Llama a `f` con la clave de cada celda de la hoja cuya clave empieza por
+/// `prefix`, en orden y **sin asignar** una celda por entrada (binary search a la
+/// primera, luego recorrido in-page). Devuelve `true` si la última celda de la
+/// hoja casó el prefijo (el bloque puede continuar en la hoja hermana siguiente),
+/// `false` si terminó dentro de esta hoja.
+pub fn leaf_for_each_prefix(
+    page: u64,
+    body: &[u8],
+    prefix: &[u8],
+    f: &mut impl FnMut(&[u8]) -> Result<()>,
+) -> Result<bool> {
+    if body[0] != TYPE_LEAF {
+        return Err(corrupt(page, "se esperaba una hoja"));
+    }
+    let ncells = u16::from_le_bytes([body[2], body[3]]) as usize;
+    // lower_bound: primera celda con clave >= prefix.
+    let mut lo = 0;
+    let mut hi = ncells;
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        let (_flags, ckey, _) = leaf_key_at(page, body, cell_ptr(body, mid))?;
+        if ckey < prefix {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    let mut i = lo;
+    while i < ncells {
+        let (_flags, ckey, _) = leaf_key_at(page, body, cell_ptr(body, i))?;
+        if !ckey.starts_with(prefix) {
+            return Ok(false); // pasamos el bloque del prefijo dentro de esta hoja
+        }
+        f(ckey)?;
+        i += 1;
+    }
+    Ok(true) // toda la cola de la hoja casó: puede seguir en la hermana
 }
 
 /// `Some((pos_payload, flags))` con `pos` al inicio del payload de la celda de

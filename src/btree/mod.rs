@@ -662,6 +662,97 @@ impl<S: NodeSource> Iterator for Cursor<'_, S> {
     }
 }
 
+/// Llama a `f` con la clave de **cada** entrada cuya clave empieza por `prefix`,
+/// en orden. A diferencia de [`scan_from`] + filtro, desciende **in-page**
+/// (binary search, sin parsear nodos a `Vec`) y recorre las celdas que casan sin
+/// materializar una celda por entrada ni copiar su payload. Es el camino caliente
+/// del *lookup* por índice secundario (prefijo `[0x02, index_id, valor]`): muchas
+/// entradas contiguas, casi siempre en una sola hoja. `f` recibe la clave prestada
+/// (válida solo durante la llamada). Cruza a hojas hermanas vía la pila de padres
+/// igual que [`Cursor`], pero sin su coste de materialización.
+pub fn for_each_prefix<S: NodeSource>(
+    src: &S,
+    root: PageId,
+    prefix: &[u8],
+    mut f: impl FnMut(&[u8]) -> Result<()>,
+) -> Result<()> {
+    if root == NO_ROOT {
+        return Ok(());
+    }
+    let bad = |id: PageId| Error::Corrupt {
+        page: id.0,
+        reason: "tipo de nodo inesperado",
+    };
+
+    // Desciende a la primera hoja candidata, apilando (interno, próximo hijo).
+    let mut stack: Vec<(PageId, usize)> = Vec::new();
+    let mut id = root;
+    loop {
+        let body = src.body(id)?;
+        match node::node_type(body.bytes()) {
+            node::TYPE_INNER => {
+                let (child, idx) = node::inner_child_indexed(id.0, body.bytes(), prefix)?;
+                drop(body);
+                stack.push((id, idx + 1));
+                id = child;
+            }
+            node::TYPE_LEAF => {
+                drop(body);
+                break;
+            }
+            _ => return Err(bad(id)),
+        }
+    }
+
+    // Recorre la hoja; mientras el bloque del prefijo llegue al final de la hoja,
+    // sigue por la hoja hermana siguiente (descenso leftmost desde el padre).
+    loop {
+        let body = src.body(id)?;
+        let extends = node::leaf_for_each_prefix(id.0, body.bytes(), prefix, &mut f)?;
+        drop(body);
+        if !extends {
+            return Ok(());
+        }
+        // Busca la hoja hermana siguiente subiendo por la pila.
+        let mut next = None;
+        while let Some(&(iid, idx)) = stack.last() {
+            let body = src.body(iid)?;
+            let nc = node::inner_ncells(body.bytes());
+            if idx <= nc {
+                stack.last_mut().expect("recién consultado").1 = idx + 1;
+                let child = node::inner_child_value_at(iid.0, body.bytes(), idx)?;
+                drop(body);
+                // Desciende al hijo más a la izquierda de ese subárbol.
+                let mut cur = child;
+                loop {
+                    let b = src.body(cur)?;
+                    match node::node_type(b.bytes()) {
+                        node::TYPE_INNER => {
+                            let first = node::inner_child_value_at(cur.0, b.bytes(), 0)?;
+                            drop(b);
+                            stack.push((cur, 1));
+                            cur = first;
+                        }
+                        node::TYPE_LEAF => {
+                            drop(b);
+                            next = Some(cur);
+                            break;
+                        }
+                        _ => return Err(bad(cur)),
+                    }
+                }
+                break;
+            }
+            drop(body);
+            stack.pop();
+        }
+        match next {
+            Some(n) => id = n,
+            None => return Ok(()),
+        }
+    }
+}
+
 // --- diff de dos árboles CoW (M8) ---
 
 /// Cambio en una clave entre dos árboles (`from` → `to`).
@@ -934,6 +1025,53 @@ mod tests {
         assert_eq!(get(&s, root, b"a").unwrap(), None);
         let (_, existed) = delete(&mut s, root, b"a").unwrap();
         assert!(!existed);
+    }
+
+    #[test]
+    fn for_each_prefix_matches_filtered_scan() {
+        let mut s = MemStore::new();
+        let mut root = NO_ROOT;
+        // 10 grupos × 500 claves: cada prefijo de grupo casa 500 entradas que
+        // abarcan varias hojas (fuerza la travesía de hermanos de `for_each_prefix`).
+        for g in 0..10u32 {
+            for i in 0..500u32 {
+                let key = format!("p{g:02}-{i:06}").into_bytes();
+                root = insert(&mut s, root, &key, b"").unwrap();
+            }
+        }
+        let collect = |prefix: &[u8]| -> Vec<Vec<u8>> {
+            let mut out = Vec::new();
+            for_each_prefix(&s, root, prefix, |k| {
+                out.push(k.to_vec());
+                Ok(())
+            })
+            .unwrap();
+            out
+        };
+        // Oráculo: scan completo filtrado por prefijo (mismo resultado, en orden).
+        let truth = |prefix: &[u8]| -> Vec<Vec<u8>> {
+            scan(&s, root)
+                .unwrap()
+                .map(|r| r.unwrap().0)
+                .filter(|k| k.starts_with(prefix))
+                .collect()
+        };
+        for g in 0..10u32 {
+            let prefix = format!("p{g:02}-").into_bytes();
+            assert_eq!(collect(&prefix), truth(&prefix), "grupo {g}");
+            assert_eq!(collect(&prefix).len(), 500);
+        }
+        assert_eq!(collect(b"p99-"), Vec::<Vec<u8>>::new()); // sin coincidencias
+        assert_eq!(collect(b"p").len(), 5000); // casa todo
+        assert_eq!(collect(b""), truth(b"")); // prefijo vacío = todas
+        assert_eq!(collect(b"p05-000042"), vec![b"p05-000042".to_vec()]); // un match
+        let mut empty = Vec::new();
+        for_each_prefix(&s, NO_ROOT, b"x", |k| {
+            empty.push(k.to_vec());
+            Ok(())
+        })
+        .unwrap();
+        assert!(empty.is_empty()); // árbol vacío
     }
 
     #[test]

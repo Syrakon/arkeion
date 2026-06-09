@@ -629,18 +629,14 @@ fn value_held_by_other<S: NodeSource>(
     prefix: &[u8],
     rowid: i64,
 ) -> Result<bool> {
-    for item in btree::scan_from(s, root, prefix)? {
-        let (key, _) = item?;
-        if !key.starts_with(prefix) {
-            break;
+    let mut held = false;
+    btree::for_each_prefix(s, root, prefix, |key| {
+        if rowid_from_index_key(key)? != rowid {
+            held = true;
         }
-        let other = record::rowid_from_be(&key[key.len() - 8..])
-            .ok_or(Error::CorruptRecord("rowid en entrada de índice"))?;
-        if other != rowid {
-            return Ok(true);
-        }
-    }
-    Ok(false)
+        Ok(())
+    })?;
+    Ok(held)
 }
 
 /// Borra las entradas de índice de una fila.
@@ -668,16 +664,21 @@ pub fn index_scan_eq<S: NodeSource>(
 ) -> Result<Vec<i64>> {
     let prefix = index_value_prefix(idx, values);
     let mut rowids = Vec::new();
-    for item in btree::scan_from(src, root, &prefix)? {
-        let (key, _) = item?;
-        if !key.starts_with(&prefix) {
-            break;
-        }
-        let rowid = record::rowid_from_be(&key[key.len() - 8..])
-            .ok_or(Error::CorruptRecord("rowid en entrada de índice"))?;
-        rowids.push(rowid);
-    }
+    // `for_each_prefix` desciende in-page y recorre las entradas que casan el
+    // prefijo sin materializar celdas ni copiar payloads (camino caliente).
+    btree::for_each_prefix(src, root, &prefix, |key| {
+        rowids.push(rowid_from_index_key(key)?);
+        Ok(())
+    })?;
     Ok(rowids)
+}
+
+/// rowid (últimos 8 bytes) de una clave de entrada de índice.
+fn rowid_from_index_key(key: &[u8]) -> Result<i64> {
+    key.len()
+        .checked_sub(8)
+        .and_then(|p| record::rowid_from_be(&key[p..]))
+        .ok_or(Error::CorruptRecord("rowid en entrada de índice"))
 }
 
 /// rowids de un **rango** sobre un índice de una sola columna: `lo`/`hi` son

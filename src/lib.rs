@@ -62,6 +62,7 @@ pub use branch::{ChangeKind, Diff, RowChange, SchemaChange};
 pub use commit::{AuditAnchor, AuditReport};
 pub use crypto::Key;
 pub use error::{Error, Result};
+pub use pager::ScrubReport;
 pub use record::Value;
 pub use tx::{
     AsOf, BranchInfo, MergeConflict, MergePolicy, MergeReport, Retention, Revision, VacuumReport,

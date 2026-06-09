@@ -93,6 +93,55 @@ fn beyond_budget_fails_clean() {
 }
 
 #[test]
+fn scrub_surfaces_degradation_that_verify_hides() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("scrub.arkeion");
+    build(&path, Options::default().ecc(NSYM), 400);
+
+    // DB intacta: scrubbing limpio.
+    {
+        let db = Database::open(&path, Options::default().create_if_missing(false)).unwrap();
+        let r = db.scrub();
+        assert!(r.pages > 0);
+        assert_eq!((r.corrected, r.broken), (0, 0), "DB intacta no degrada");
+    }
+
+    // Corrompe 5 bytes (< 8) en el payload del primer registro: corregible.
+    let mut bytes = std::fs::read(&path).unwrap();
+    let base = first_payload();
+    for i in 0..5 {
+        bytes[base + i * 3] ^= 0x5A;
+    }
+    std::fs::write(&path, &bytes).unwrap();
+
+    let db = Database::open(&path, Options::default().create_if_missing(false)).unwrap();
+    // verify() pasa: el ECC corrige al leer de forma transparente…
+    assert!(db.verify().unwrap().chain_ok);
+    // …pero el scrubbing SÍ delata la página degradada (el valor de C3).
+    let r = db.scrub();
+    assert_eq!(r.corrected, 1, "scrub debe señalar la página corregida");
+    assert_eq!(r.broken, 0);
+}
+
+#[test]
+fn scrub_flags_broken_pages() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("scrub.arkeion");
+    build(&path, Options::default().ecc(NSYM), 400);
+
+    // Corrompe 12 bytes (> 8) en un bloque: irrecuperable.
+    let mut bytes = std::fs::read(&path).unwrap();
+    let base = first_payload();
+    for i in 0..12 {
+        bytes[base + i] ^= 0xA5;
+    }
+    std::fs::write(&path, &bytes).unwrap();
+
+    let db = Database::open(&path, Options::default().create_if_missing(false)).unwrap();
+    assert_eq!(db.scrub().broken, 1, "scrub debe señalar la página rota");
+}
+
+#[test]
 fn ecc_is_more_stable_than_plain() {
     // La MISMA corrupción (6 bytes) rompe una DB sin ECC y la sobrevive una con
     // ECC: demuestra que comprimir/proteger no la hace menos estable.

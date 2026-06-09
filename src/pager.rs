@@ -103,6 +103,34 @@ impl PageCache {
     }
 }
 
+/// Informe de un *scrubbing* (M10 Slice C3): un barrido proactivo de toda la
+/// historia retenida que lee cada página del disco forzando la corrección ECC.
+/// Como el ECC corrige de forma transparente al leer, `verify()` por sí solo no
+/// delata un disco que se degrada; este informe sí. La **reparación** real (un
+/// store append-only no reescribe in situ) es reescribir durablemente con
+/// `vacuum` o volver a una versión íntegra vía historia CoW.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct ScrubReport {
+    /// Páginas de datos escaneadas (toda la historia retenida).
+    pub pages: u64,
+    /// Páginas con bit-rot **corregido** por ECC: el dato está bien pero el disco
+    /// se degrada. Señal de actuar (re-`vacuum` o restaurar) antes de que empeore.
+    pub corrected: u64,
+    /// Páginas **irrecuperables** (corrupción fuera del presupuesto ECC, o sin
+    /// ECC): la versión que las usa está dañada; vuelve a una versión íntegra.
+    pub broken: u64,
+}
+
+/// Estado de una página al hacer scrubbing.
+enum PageHealth {
+    /// Abrió a la primera: sin corrupción detectable.
+    Clean,
+    /// Solo abrió tras corrección ECC: bit-rot presente pero corregido.
+    Corrected,
+    /// No abrió ni con ECC: corrupción irrecuperable.
+    Broken,
+}
+
 /// Localización física de una página lógica en la zona append (v2, M10): dónde
 /// empieza su payload sellado y cuánto mide. El directorio del pager traduce
 /// `page_id → PhysLoc`; las páginas son inmutables, así que una entrada nunca
@@ -476,6 +504,58 @@ impl Pager {
                 self.crypto.open_bytes(&fixed, id)
             }
         }
+    }
+
+    /// Lee la página `id` directamente del disco (sin caché) y clasifica su salud
+    /// ECC, para el scrubbing. No descomprime ni cachea: solo ejerce la capa de
+    /// sellado/ECC sobre los bytes que hay realmente en disco.
+    fn scrub_page(&self, id: PageId) -> PageHealth {
+        let loc = {
+            let state = self.state.lock().expect("estado del pager envenenado");
+            match state.loc(id) {
+                Some(l) if id.0 < state.next_page => l,
+                _ => return PageHealth::Broken,
+            }
+        };
+        let mut payload = vec![0u8; loc.len as usize];
+        if self.file.read_exact_at(&mut payload, loc.offset).is_err() {
+            return PageHealth::Broken;
+        }
+        if self.crypto.open_bytes(&payload, id).is_ok() {
+            return PageHealth::Clean;
+        }
+        let nsym = self.header.ecc_nsym as usize;
+        if nsym == 0 {
+            return PageHealth::Broken;
+        }
+        let plen = ecc::parity_len(payload.len(), nsym);
+        let mut parity = vec![0u8; plen];
+        if self
+            .file
+            .read_exact_at(&mut parity, loc.offset + loc.len as u64)
+            .is_err()
+        {
+            return PageHealth::Broken;
+        }
+        match ecc::correct(&payload, &parity, nsym) {
+            Some(fixed) if self.crypto.open_bytes(&fixed, id).is_ok() => PageHealth::Corrected,
+            _ => PageHealth::Broken,
+        }
+    }
+
+    /// Scrubbing (M10 C3): barre toda la historia retenida desde el disco,
+    /// clasificando cada página (limpia / corregida por ECC / irrecuperable).
+    pub(crate) fn scrub(&self) -> ScrubReport {
+        let mut rep = ScrubReport::default();
+        for pid in FIRST_DATA_PAGE.0..self.n_pages() {
+            rep.pages += 1;
+            match self.scrub_page(PageId(pid)) {
+                PageHealth::Clean => {}
+                PageHealth::Corrected => rep.corrected += 1,
+                PageHealth::Broken => rep.broken += 1,
+            }
+        }
+        rep
     }
 
     /// Bytes a sellar para una página de datos (v2, M10): el body recortado tal

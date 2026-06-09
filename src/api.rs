@@ -17,6 +17,7 @@ use crate::commit::{AuditAnchor, AuditReport};
 use crate::crypto::Key;
 use crate::error::{Error, Result};
 use crate::exec;
+use crate::pager::ScrubReport;
 use crate::record::Value;
 use crate::sql::{
     self,
@@ -243,6 +244,17 @@ impl Database {
     /// ```
     pub fn verify(&self) -> Result<AuditReport> {
         self.store.verify()
+    }
+
+    /// *Scrubbing* (M10): barre toda la historia retenida desde el disco forzando
+    /// la corrección de errores por página y devuelve un [`ScrubReport`] con las
+    /// páginas degradadas. Complementa a [`verify`](Database::verify): el ECC
+    /// corrige al leer de forma transparente, así que `verify` pasa sobre una
+    /// página que el ECC arregló sin delatar el disco que se degrada; el
+    /// scrubbing sí (`corrected > 0` ⇒ conviene re-`vacuum` o restaurar antes de
+    /// que el bit-rot exceda el presupuesto). Pensado para correr periódico.
+    pub fn scrub(&self) -> ScrubReport {
+        self.store.scrub()
     }
 
     /// Auditoría **contra un ancla externa** guardada antes (post-M9): además de

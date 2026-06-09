@@ -25,7 +25,7 @@ use crate::crypto::Key;
 use crate::error::{Error, Result};
 use crate::format::{MIN_RECORD_LEN, PageBuf, PageId};
 use crate::io::sync_parent_dir;
-use crate::pager::{Pager, provider_for};
+use crate::pager::{Pager, ScrubReport, provider_for};
 use crate::record::Value;
 
 /// Rama única de M1; el branching llega en M8.
@@ -652,6 +652,16 @@ impl Store {
             (st.pager.clone(), st.head.clone())
         };
         commit::verify_anchored(&pager, &head, Some(anchor))
+    }
+
+    /// Scrubbing (M10 C3): barre toda la historia retenida desde el disco
+    /// forzando la corrección ECC y reporta las páginas degradadas. Complementa a
+    /// `verify`: como el ECC corrige al leer de forma transparente, `verify` pasa
+    /// sobre una página que el ECC arregló y **no** delata el disco que se
+    /// degrada; el scrubbing sí (`corrected > 0`). Pensado para correr periódico.
+    pub fn scrub(&self) -> ScrubReport {
+        let pager = self.lock().pager.clone();
+        pager.scrub()
     }
 
     /// Snapshot histórico (M5, time-travel). `AsOf::Head` equivale a

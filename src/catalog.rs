@@ -1120,6 +1120,131 @@ fn finish_row(table: &TableDef, rowid: i64, mut values: Vec<Value>) -> Result<Ve
 
 // --- scan de tabla ---
 
+/// Proyección precompilada de un scan en streaming: qué columnas almacenadas
+/// decodificar (ordenadas, únicas) y de dónde sale cada columna de salida.
+/// Se construye una vez por consulta; `ScanState::next_into` la usa por fila.
+pub struct ScanProjection {
+    /// Índices de columna a decodificar del registro, crecientes y sin repetir.
+    stored: Vec<usize>,
+    /// Una entrada por columna de salida, en orden.
+    slots: Vec<Slot>,
+}
+
+enum Slot {
+    /// Alias del rowid: se reconstruye de la clave, no se decodifica.
+    Rowid,
+    /// Columna almacenada: posición en `stored` + índice de columna (para su
+    /// DEFAULT si el registro es más corto) + si es el último slot que la usa
+    /// (mueve el valor en vez de clonarlo).
+    Stored {
+        pos: usize,
+        col: usize,
+        last_use: bool,
+    },
+}
+
+impl ScanProjection {
+    /// `cols`: índice de columna de la tabla por cada columna de salida.
+    pub fn new(table: &TableDef, cols: &[usize]) -> ScanProjection {
+        let mut stored: Vec<usize> = cols
+            .iter()
+            .copied()
+            .filter(|&c| table.rowid_alias != Some(c))
+            .collect();
+        stored.sort_unstable();
+        stored.dedup();
+        let slots = cols
+            .iter()
+            .enumerate()
+            .map(|(slot_i, &c)| {
+                if table.rowid_alias == Some(c) {
+                    Slot::Rowid
+                } else {
+                    Slot::Stored {
+                        pos: stored.binary_search(&c).expect("recién insertada"),
+                        col: c,
+                        last_use: !cols[slot_i + 1..].contains(&c),
+                    }
+                }
+            })
+            .collect();
+        ScanProjection { stored, slots }
+    }
+
+    pub fn ncols(&self) -> usize {
+        self.slots.len()
+    }
+}
+
+/// Scan de tabla **sin préstamo de la fuente** (streaming hacia la API): el
+/// `Rows` posee su `Snapshot` y este estado, y decodifica por fila SOLO las
+/// columnas proyectadas, directo de la página sostenida (cero copias de
+/// clave/valor). Semántica de fila idéntica a `finish_row`: alias del rowid
+/// reconstruido y columnas ausentes con su DEFAULT (o NULL).
+pub struct ScanState {
+    cur: btree::CursorState,
+    prefix: [u8; 5],
+    done: bool,
+}
+
+impl ScanState {
+    pub fn start<S: NodeSource>(src: &S, root: PageId, table: &TableDef) -> Result<ScanState> {
+        let prefix = row_prefix(table.table_id);
+        Ok(ScanState {
+            cur: btree::scan_state(src, root, Some(&prefix))?,
+            prefix,
+            done: false,
+        })
+    }
+
+    /// Proyecta la próxima fila en `out` (limpiado). `Ok(false)` = fin del
+    /// scan. `scratch` es un buffer reutilizado entre filas (del llamador).
+    pub fn next_into<S: NodeSource>(
+        &mut self,
+        src: &S,
+        table: &TableDef,
+        proj: &ScanProjection,
+        out: &mut Vec<Value>,
+        scratch: &mut Vec<Option<Value>>,
+    ) -> Result<bool> {
+        if self.done {
+            return Ok(false);
+        }
+        let prefix = self.prefix;
+        let row = self.cur.advance_view(src, |key, record| {
+            if !key.starts_with(&prefix) {
+                return Ok(None); // primera clave fuera de la tabla: fin
+            }
+            let rowid = record::rowid_from_be(&key[5..])
+                .ok_or(Error::CorruptRecord("clave de fila mal formada"))?;
+            record::decode_cols_sorted(record, &proj.stored, scratch)?;
+            Ok(Some(rowid))
+        })?;
+        let Some(Some(rowid)) = row else {
+            self.done = true; // árbol agotado o fuera de prefijo
+            return Ok(false);
+        };
+        out.clear();
+        for slot in &proj.slots {
+            out.push(match slot {
+                Slot::Rowid => Value::Integer(rowid),
+                Slot::Stored { pos, col, last_use } => {
+                    let v = if *last_use {
+                        scratch[*pos].take()
+                    } else {
+                        scratch[*pos].clone()
+                    };
+                    match v {
+                        Some(v) => v,
+                        None => table.columns[*col].default.clone().unwrap_or(Value::Null),
+                    }
+                }
+            });
+        }
+        Ok(true)
+    }
+}
+
 /// Iterador por rowid ascendente: el orden del scan ES el orden del rowid.
 pub struct TableScan<'s, S: NodeSource> {
     cur: Cursor<'s, S>,

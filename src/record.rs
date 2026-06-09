@@ -155,43 +155,112 @@ pub fn decode_values(buf: &[u8]) -> Result<Vec<Value>> {
 
     let mut values = Vec::with_capacity(ncols);
     for &tag in tags {
-        values.push(match tag {
-            TAG_NULL => Value::Null,
-            TAG_FALSE => Value::Bool(false),
-            TAG_TRUE => Value::Bool(true),
-            TAG_INT => Value::Integer(unzigzag(
-                take_varint(buf, &mut pos).ok_or(bad("entero truncado"))?,
-            )),
-            TAG_REAL => {
-                let bytes = buf.get(pos..pos + 8).ok_or(bad("real truncado"))?;
-                pos += 8;
-                Value::Real(f64::from_le_bytes(
-                    bytes.try_into().expect("rango fijo de 8 bytes"),
-                ))
-            }
-            TAG_TEXT => {
-                let len = take_varint(buf, &mut pos).ok_or(bad("longitud de texto truncada"))?;
-                let bytes = buf
-                    .get(pos..pos + len as usize)
-                    .ok_or(bad("texto truncado"))?;
-                pos += len as usize;
-                Value::Text(String::from_utf8(bytes.to_vec()).map_err(|_| bad("texto no UTF-8"))?)
-            }
-            TAG_BLOB => {
-                let len = take_varint(buf, &mut pos).ok_or(bad("longitud de blob truncada"))?;
-                let bytes = buf
-                    .get(pos..pos + len as usize)
-                    .ok_or(bad("blob truncado"))?;
-                pos += len as usize;
-                Value::Blob(bytes.to_vec())
-            }
-            _ => return Err(bad("tag de valor desconocido")),
-        });
+        values.push(decode_payload(buf, &mut pos, tag)?);
     }
     if pos != buf.len() {
         return Err(bad("bytes sobrantes tras el registro"));
     }
     Ok(values)
+}
+
+/// Decodifica el payload del tag `tag` en `pos` (avanzándolo). Único sitio que
+/// conoce la forma de cada payload junto a [`skip_payload`].
+fn decode_payload(buf: &[u8], pos: &mut usize, tag: u8) -> Result<Value> {
+    let bad = |reason: &'static str| Error::CorruptRecord(reason);
+    Ok(match tag {
+        TAG_NULL => Value::Null,
+        TAG_FALSE => Value::Bool(false),
+        TAG_TRUE => Value::Bool(true),
+        TAG_INT => Value::Integer(unzigzag(
+            take_varint(buf, pos).ok_or(bad("entero truncado"))?,
+        )),
+        TAG_REAL => {
+            let bytes = buf.get(*pos..*pos + 8).ok_or(bad("real truncado"))?;
+            *pos += 8;
+            Value::Real(f64::from_le_bytes(
+                bytes.try_into().expect("rango fijo de 8 bytes"),
+            ))
+        }
+        TAG_TEXT => {
+            let len = take_varint(buf, pos).ok_or(bad("longitud de texto truncada"))?;
+            let bytes = buf
+                .get(*pos..*pos + len as usize)
+                .ok_or(bad("texto truncado"))?;
+            *pos += len as usize;
+            Value::Text(String::from_utf8(bytes.to_vec()).map_err(|_| bad("texto no UTF-8"))?)
+        }
+        TAG_BLOB => {
+            let len = take_varint(buf, pos).ok_or(bad("longitud de blob truncada"))?;
+            let bytes = buf
+                .get(*pos..*pos + len as usize)
+                .ok_or(bad("blob truncado"))?;
+            *pos += len as usize;
+            Value::Blob(bytes.to_vec())
+        }
+        _ => return Err(bad("tag de valor desconocido")),
+    })
+}
+
+/// Salta el payload del tag `tag` sin materializarlo (solo avanza `pos`).
+fn skip_payload(buf: &[u8], pos: &mut usize, tag: u8) -> Result<()> {
+    let bad = |reason: &'static str| Error::CorruptRecord(reason);
+    match tag {
+        TAG_NULL | TAG_FALSE | TAG_TRUE => {}
+        TAG_INT => {
+            take_varint(buf, pos).ok_or(bad("entero truncado"))?;
+        }
+        TAG_REAL => {
+            if buf.len() < *pos + 8 {
+                return Err(bad("real truncado"));
+            }
+            *pos += 8;
+        }
+        TAG_TEXT | TAG_BLOB => {
+            let len = take_varint(buf, pos).ok_or(bad("longitud truncada"))? as usize;
+            if buf.len() < *pos + len {
+                return Err(bad("payload truncado"));
+            }
+            *pos += len;
+        }
+        _ => return Err(bad("tag de valor desconocido")),
+    }
+    Ok(())
+}
+
+/// Decodifica SOLO las columnas `wanted` (índices **estrictamente crecientes**)
+/// de un registro, en una pasada: los payloads no pedidos se saltan sin
+/// materializar y la pasada corta tras la última pedida. Las columnas más allá
+/// del registro (añadidas por `ALTER TABLE` tras escribir la fila) salen como
+/// `None` — el llamador aplica su DEFAULT, como `finish_row`. El camino
+/// caliente del full scan en streaming.
+pub fn decode_cols_sorted(
+    buf: &[u8],
+    wanted: &[usize],
+    out: &mut Vec<Option<Value>>,
+) -> Result<()> {
+    let bad = |reason: &'static str| Error::CorruptRecord(reason);
+    out.clear();
+    let mut pos = 0usize;
+    let ncols = take_varint(buf, &mut pos).ok_or(bad("cabecera de registro truncada"))? as usize;
+    let tags = buf.get(pos..pos + ncols).ok_or(bad("tags truncados"))?;
+    pos += ncols;
+    let mut w = 0;
+    for (i, &tag) in tags.iter().enumerate() {
+        if w == wanted.len() {
+            break; // todo lo pedido ya está: el resto del registro no se toca
+        }
+        if wanted[w] == i {
+            out.push(Some(decode_payload(buf, &mut pos, tag)?));
+            w += 1;
+        } else {
+            skip_payload(buf, &mut pos, tag)?;
+        }
+    }
+    while w < wanted.len() {
+        out.push(None); // columna posterior al registro: DEFAULT del llamador
+        w += 1;
+    }
+    Ok(())
 }
 
 // --- rowid memcomparable ---

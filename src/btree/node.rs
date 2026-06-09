@@ -366,6 +366,33 @@ pub fn leaf_cell_at(page: u64, body: &[u8], i: usize) -> Result<(Vec<u8>, Payloa
     Ok((key.to_vec(), payload))
 }
 
+/// Payload **prestado** del body (cero copias): la vista del scan en streaming
+/// hacia la API, que decodifica las columnas pedidas directo de la página.
+#[derive(Debug)]
+pub enum PayloadView<'a> {
+    Inline(&'a [u8]),
+    Overflow { total_len: u64, first: PageId },
+}
+
+/// Como [`leaf_cell_at`] pero sin copiar nada: clave y valor inline llegan
+/// prestados del body (válidos mientras viva el préstamo de la página).
+pub fn leaf_cell_view(page: u64, body: &[u8], i: usize) -> Result<(&[u8], PayloadView<'_>)> {
+    let off = cell_ptr(body, i);
+    let (flags, key, payload_pos) = leaf_key_at(page, body, off)?;
+    let mut pos = payload_pos;
+    if flags & CELL_OVERFLOW_FLAG != 0 {
+        let total_len = get_varint(page, body, &mut pos)?;
+        let first = PageId(get_u64(page, body, &mut pos)?);
+        Ok((key, PayloadView::Overflow { total_len, first }))
+    } else {
+        let vlen = get_varint(page, body, &mut pos)? as usize;
+        Ok((
+            key,
+            PayloadView::Inline(get_slice(page, body, &mut pos, vlen)?),
+        ))
+    }
+}
+
 /// `Some((pos_payload, flags))` con `pos` al inicio del payload de la celda de
 /// `key`, o `None` si no está. Escanea sin asignar.
 fn leaf_seek(page: u64, body: &[u8], key: &[u8]) -> Result<Option<(usize, u8)>> {

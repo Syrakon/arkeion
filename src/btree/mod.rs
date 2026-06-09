@@ -588,6 +588,14 @@ struct LeafScan {
 
 pub struct Cursor<'s, S: NodeSource> {
     src: &'s S,
+    state: CursorState,
+}
+
+/// Estado del cursor de scan **sin el préstamo de la fuente**: lo posee quien
+/// necesita un scan que viva por sí mismo (el `Rows` en streaming de la API,
+/// que es dueño de su `Snapshot`) y pasa la fuente en cada paso. [`Cursor`] es
+/// el envoltorio prestado clásico sobre este estado.
+pub struct CursorState {
     /// Nodos internos pendientes: (id, índice del próximo hijo a visitar).
     stack: Vec<(PageId, usize)>,
     /// Hoja en curso (en streaming), o `None` si ninguna/agotada.
@@ -595,15 +603,10 @@ pub struct Cursor<'s, S: NodeSource> {
 }
 
 pub fn scan<S: NodeSource>(src: &S, root: PageId) -> Result<Cursor<'_, S>> {
-    let mut c = Cursor {
+    Ok(Cursor {
         src,
-        stack: Vec::new(),
-        leaf: None,
-    };
-    if root != NO_ROOT {
-        c.descend(root, None)?;
-    }
-    Ok(c)
+        state: scan_state(src, root, None)?,
+    })
 }
 
 /// Comienza en la primera clave ≥ `start`.
@@ -612,21 +615,39 @@ pub fn scan_from<'s, S: NodeSource>(
     root: PageId,
     start: &[u8],
 ) -> Result<Cursor<'s, S>> {
-    let mut c = Cursor {
+    Ok(Cursor {
         src,
+        state: scan_state(src, root, Some(start))?,
+    })
+}
+
+/// Estado de scan posicionado en la primera clave ≥ `start` (o la primera del
+/// árbol). El llamador conserva el estado y avanza con [`CursorState::advance`]
+/// o [`CursorState::advance_view`], pasando la fuente en cada paso.
+pub fn scan_state<S: NodeSource>(
+    src: &S,
+    root: PageId,
+    start: Option<&[u8]>,
+) -> Result<CursorState> {
+    let mut state = CursorState {
         stack: Vec::new(),
         leaf: None,
     };
     if root != NO_ROOT {
-        c.descend(root, Some(start))?;
+        state.descend(src, root, start)?;
     }
-    Ok(c)
+    Ok(state)
 }
 
-impl<S: NodeSource> Cursor<'_, S> {
-    fn descend(&mut self, mut id: PageId, start: Option<&[u8]>) -> Result<()> {
+impl CursorState {
+    fn descend<S: NodeSource>(
+        &mut self,
+        src: &S,
+        mut id: PageId,
+        start: Option<&[u8]>,
+    ) -> Result<()> {
         loop {
-            let body = self.src.body(id)?;
+            let body = src.body(id)?;
             match node::node_type(body.bytes()) {
                 node::TYPE_INNER => {
                     let (cells, rightmost) = node::parse_inner(id.0, body.bytes())?;
@@ -674,7 +695,33 @@ impl<S: NodeSource> Cursor<'_, S> {
         }
     }
 
-    fn advance(&mut self) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+    /// Avanza a la siguiente hoja vía la pila de padres. `false` = árbol
+    /// agotado. Puede dejar `leaf` en `None` con pila pendiente (un padre
+    /// agotado): el llamador reintenta en bucle, como hacía `advance`.
+    fn next_leaf<S: NodeSource>(&mut self, src: &S) -> Result<bool> {
+        self.leaf = None;
+        let Some((id, idx)) = self.stack.last().copied() else {
+            return Ok(false);
+        };
+        let body = src.body(id)?;
+        let (cells, rightmost) = node::parse_inner(id.0, body.bytes())?;
+        drop(body);
+        if idx <= cells.len() {
+            self.stack.last_mut().expect("recién consultado").1 += 1;
+            let child = if idx < cells.len() {
+                cells[idx].child
+            } else {
+                rightmost
+            };
+            self.descend(src, child, None)?;
+        } else {
+            self.stack.pop();
+        }
+        Ok(true)
+    }
+
+    /// Próxima celda con clave y valor **propios** (una copia de cada una).
+    pub fn advance<S: NodeSource>(&mut self, src: &S) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
         loop {
             // Emite la próxima celda de la hoja en curso, leída in-page (una copia
             // de clave + una de valor, sin materializar el resto de la hoja).
@@ -684,26 +731,43 @@ impl<S: NodeSource> Cursor<'_, S> {
                 let i = ls.next;
                 ls.next += 1;
                 let (key, payload) = node::leaf_cell_at(ls.page, ls.held.bytes(), i)?;
-                let value = read_value_owned(self.src, payload)?;
+                let value = read_value_owned(src, payload)?;
                 return Ok(Some((key, value)));
             }
-            self.leaf = None; // ninguna hoja o agotada: avanza por la pila
-            let Some((id, idx)) = self.stack.last().copied() else {
+            if !self.next_leaf(src)? {
                 return Ok(None);
-            };
-            let body = self.src.body(id)?;
-            let (cells, rightmost) = node::parse_inner(id.0, body.bytes())?;
-            drop(body);
-            if idx <= cells.len() {
-                self.stack.last_mut().expect("recién consultado").1 += 1;
-                let child = if idx < cells.len() {
-                    cells[idx].child
-                } else {
-                    rightmost
+            }
+        }
+    }
+
+    /// Próxima celda **sin copiar**: `f` recibe clave y valor prestados de la
+    /// página sostenida (válidos solo durante la llamada). Un valor overflow se
+    /// materializa en un buffer temporal (raro en filas: solo celdas grandes).
+    /// El camino caliente del full scan en streaming decodifica las columnas
+    /// proyectadas directo de la página, sin `Vec` de clave/valor por fila.
+    pub fn advance_view<S: NodeSource, T>(
+        &mut self,
+        src: &S,
+        f: impl FnOnce(&[u8], &[u8]) -> Result<T>,
+    ) -> Result<Option<T>> {
+        loop {
+            let ready = self.leaf.as_ref().is_some_and(|ls| ls.next < ls.ncells);
+            if ready {
+                let ls = self.leaf.as_mut().expect("comprobado arriba");
+                let i = ls.next;
+                ls.next += 1;
+                let ls = self.leaf.as_ref().expect("comprobado arriba");
+                let (key, view) = node::leaf_cell_view(ls.page, ls.held.bytes(), i)?;
+                return match view {
+                    node::PayloadView::Inline(value) => f(key, value).map(Some),
+                    node::PayloadView::Overflow { total_len, first } => {
+                        let owned = read_value(src, &Payload::Overflow { total_len, first })?;
+                        f(key, &owned).map(Some)
+                    }
                 };
-                self.descend(child, None)?;
-            } else {
-                self.stack.pop();
+            }
+            if !self.next_leaf(src)? {
+                return Ok(None);
             }
         }
     }
@@ -713,7 +777,7 @@ impl<S: NodeSource> Iterator for Cursor<'_, S> {
     type Item = Result<(Vec<u8>, Vec<u8>)>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.advance().transpose()
+        self.state.advance(self.src).transpose()
     }
 }
 

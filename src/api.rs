@@ -528,6 +528,9 @@ impl Connection {
                     "la conexión ya está fijada a un snapshot: quita el AS OF de la consulta",
                 ));
             }
+            if let Some(plan) = exec::stream_select(snap, select, params)? {
+                return Rows::stream(snap.clone(), plan);
+            }
             exec::run_select(snap, select, params)?
         } else if let Some(clause) = &select.as_of {
             // AS OF lee la historia confirmada **de esta rama** (acotado a su
@@ -535,17 +538,24 @@ impl Connection {
             let snap = self
                 .store
                 .snapshot_at_on(&self.branch, clause_to_asof(clause))?;
+            if let Some(plan) = exec::stream_select(&snap, select, params)? {
+                return Rows::stream(snap, plan);
+            }
             exec::run_select(&snap, select, params)?
         } else {
             match self.open_tx.borrow().as_ref() {
+                // Dentro de BEGIN la fuente es la tx prestada: sin streaming.
                 Some(tx) => exec::run_select(tx, select, params)?,
-                None => exec::run_select(&self.store.snapshot_on(&self.branch)?, select, params)?,
+                None => {
+                    let snap = self.store.snapshot_on(&self.branch)?;
+                    if let Some(plan) = exec::stream_select(&snap, select, params)? {
+                        return Rows::stream(snap, plan);
+                    }
+                    exec::run_select(&snap, select, params)?
+                }
             }
         };
-        Ok(Rows {
-            columns: Arc::from(out.columns),
-            rows: out.rows.into_iter(),
-        })
+        Ok(Rows::buffered(out))
     }
 
     /// Sentencia preparada: se parsea una vez y se ejecuta cuantas veces
@@ -751,10 +761,7 @@ impl Transaction<'_> {
             ));
         }
         let out = exec::run_select(&*self.tx.borrow(), &select, params)?;
-        Ok(Rows {
-            columns: Arc::from(out.columns),
-            rows: out.rows.into_iter(),
-        })
+        Ok(Rows::buffered(out))
     }
 
     /// Publica la transacción. Devuelve la versión nueva (o la actual si la
@@ -774,12 +781,59 @@ impl Transaction<'_> {
 /// Resultado de una consulta. Itera `Result<Row>`.
 pub struct Rows {
     columns: Arc<[String]>,
-    rows: std::vec::IntoIter<Vec<Value>>,
+    inner: RowsInner,
+}
+
+enum RowsInner {
+    /// Resultado materializado por el executor (camino general).
+    Buffered(std::vec::IntoIter<Vec<Value>>),
+    /// Full scan en **streaming** (SELECT simple sin WHERE/joins/orden): las
+    /// filas se decodifican al iterar, directo del snapshot que `Rows` posee
+    /// — sin materializar el resultado entero. Un error de decodificación
+    /// llega como `Some(Err)` en la fila afectada y corta el stream.
+    Stream(Box<StreamRows>),
+}
+
+struct StreamRows {
+    /// Dueño de las páginas: el stream lee de este snapshot inmutable.
+    snap: Snapshot,
+    scan: crate::catalog::ScanState,
+    def: crate::catalog::TableDef,
+    proj: crate::catalog::ScanProjection,
+    /// Buffer reutilizado entre filas para las columnas decodificadas.
+    scratch: Vec<Option<Value>>,
+    /// OFFSET pendiente y LIMIT restante.
+    skip: usize,
+    remaining: usize,
 }
 
 impl Rows {
     pub fn columns(&self) -> &[String] {
         &self.columns
+    }
+
+    fn buffered(out: exec::SelectOut) -> Rows {
+        Rows {
+            columns: Arc::from(out.columns),
+            inner: RowsInner::Buffered(out.rows.into_iter()),
+        }
+    }
+
+    fn stream(snap: Snapshot, plan: exec::StreamSelect) -> Result<Rows> {
+        let scan = snap.table_scan_state(&plan.def)?;
+        let proj = crate::catalog::ScanProjection::new(&plan.def, &plan.cols);
+        Ok(Rows {
+            columns: Arc::from(plan.columns),
+            inner: RowsInner::Stream(Box::new(StreamRows {
+                snap,
+                scan,
+                def: plan.def,
+                proj,
+                scratch: Vec::new(),
+                skip: plan.offset,
+                remaining: plan.limit,
+            })),
+        })
     }
 }
 
@@ -787,11 +841,42 @@ impl Iterator for Rows {
     type Item = Result<Row>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let values = self.rows.next()?;
-        Some(Ok(Row {
-            columns: self.columns.clone(),
-            values,
-        }))
+        match &mut self.inner {
+            RowsInner::Buffered(rows) => {
+                let values = rows.next()?;
+                Some(Ok(Row {
+                    columns: self.columns.clone(),
+                    values,
+                }))
+            }
+            RowsInner::Stream(s) => loop {
+                if s.remaining == 0 {
+                    return None;
+                }
+                let mut values = Vec::with_capacity(s.proj.ncols());
+                match s
+                    .scan
+                    .next_into(&s.snap, &s.def, &s.proj, &mut values, &mut s.scratch)
+                {
+                    Err(e) => {
+                        s.remaining = 0; // corta el stream tras un error
+                        return Some(Err(e));
+                    }
+                    Ok(false) => return None,
+                    Ok(true) => {
+                        if s.skip > 0 {
+                            s.skip -= 1;
+                            continue;
+                        }
+                        s.remaining -= 1;
+                        return Some(Ok(Row {
+                            columns: self.columns.clone(),
+                            values,
+                        }));
+                    }
+                }
+            },
+        }
     }
 }
 

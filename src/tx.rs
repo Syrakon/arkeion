@@ -1264,6 +1264,12 @@ impl Snapshot {
         catalog::scan_table(self, self.data_root, table)
     }
 
+    /// Estado de scan **sin préstamo** de una tabla: el `Rows` en streaming de
+    /// la API lo posee junto a este snapshot y avanza pasándole el snapshot.
+    pub fn table_scan_state(&self, table: &TableDef) -> Result<catalog::ScanState> {
+        catalog::ScanState::start(self, self.data_root, table)
+    }
+
     /// Todas las tablas visibles en este snapshot (introspección de esquema).
     pub fn tables(&self) -> Result<Vec<TableDef>> {
         catalog::list_tables(self, self.data_root)

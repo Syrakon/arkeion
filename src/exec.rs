@@ -858,6 +858,85 @@ fn lookup(src: &impl DataSource, table: &TableRef) -> Result<TableDef> {
         .ok_or_else(|| sql_err(format!("tabla desconocida: {}", table.name)))
 }
 
+/// Plan de **streaming** para un SELECT elegible: full scan + proyección de
+/// columnas simples (o `*`), sin WHERE/JOIN/GROUP BY/HAVING/ORDER BY ni
+/// agregados. La capa API responde sin materializar el resultado — el coste
+/// estructural del full scan. `None` = no elegible; cae al camino normal, que
+/// también es quien produce los errores (columna desconocida, etc.), así que
+/// ambos caminos son indistinguibles salvo en coste.
+pub struct StreamSelect {
+    pub def: TableDef,
+    /// Nombres de columna de salida (alias o nombre tal y como se escribió).
+    pub columns: Vec<String>,
+    /// Índice de columna de la tabla por cada columna de salida.
+    pub cols: Vec<usize>,
+    pub offset: usize,
+    /// `usize::MAX` sin `LIMIT`.
+    pub limit: usize,
+}
+
+pub fn stream_select(
+    src: &impl DataSource,
+    stmt: &SelectStmt,
+    params: &[Value],
+) -> Result<Option<StreamSelect>> {
+    let Some(from_ref) = &stmt.from else {
+        return Ok(None);
+    };
+    if !stmt.joins.is_empty()
+        || stmt.where_clause.is_some()
+        || !stmt.group_by.is_empty()
+        || stmt.having.is_some()
+        || !stmt.order_by.is_empty()
+    {
+        return Ok(None);
+    }
+    let def = lookup(src, from_ref)?;
+    let qualifier = from_ref.qualifier();
+    let mut columns = Vec::new();
+    let mut cols = Vec::new();
+    for item in &stmt.projection {
+        match item {
+            SelectItem::Star => {
+                for (c, col) in def.columns.iter().enumerate() {
+                    columns.push(col.name.clone());
+                    cols.push(c);
+                }
+            }
+            SelectItem::Expr {
+                expr: Expr::Column { table, name },
+                alias,
+            } => {
+                if table.as_deref().is_some_and(|q| q != qualifier) {
+                    return Ok(None); // calificador ajeno: que el camino normal dé su error
+                }
+                let Some(c) = def.columns.iter().position(|col| col.name == *name) else {
+                    return Ok(None); // columna desconocida: ídem
+                };
+                columns.push(alias.clone().unwrap_or_else(|| name.clone()));
+                cols.push(c);
+            }
+            _ => return Ok(None), // expresiones/agregados: camino normal
+        }
+    }
+    // Mismos errores y semántica que `limit_offset` (constantes, no negativos).
+    let offset = match &stmt.offset {
+        Some(e) => usize_const(e, params, "OFFSET")?,
+        None => 0,
+    };
+    let limit = match &stmt.limit {
+        Some(e) => usize_const(e, params, "LIMIT")?,
+        None => usize::MAX,
+    };
+    Ok(Some(StreamSelect {
+        def,
+        columns,
+        cols,
+        offset,
+        limit,
+    }))
+}
+
 fn limit_offset(
     rows: Vec<Vec<Value>>,
     stmt: &SelectStmt,

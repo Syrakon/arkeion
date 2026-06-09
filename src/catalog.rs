@@ -510,11 +510,19 @@ pub fn create_index<S: NodeStore>(
         columns: columns.to_vec(),
         unique,
     };
-    // Backfill: una entrada por cada fila existente.
+    // Backfill: una entrada por cada fila existente. Un índice UNIQUE rechaza la
+    // creación si las filas existentes ya contienen valores duplicados.
     let rows: Vec<(i64, Vec<Value>)> = scan_table(s, root, &def)?.collect::<Result<_>>()?;
     for (rowid, values) in rows {
-        let key = index_entry_key(&idx, &values, rowid);
-        root = btree::insert(s, root, &key, &[])?;
+        if idx.unique && !any_indexed_null(&idx, &values) {
+            let prefix = index_value_prefix_of(&idx, &values);
+            if value_held_by_other(s, root, &prefix, rowid)? {
+                return Err(Error::Constraint(
+                    "CREATE UNIQUE INDEX: ya hay valores duplicados",
+                ));
+            }
+        }
+        root = btree::insert(s, root, &index_entry_key(&idx, &values, rowid), &[])?;
     }
     // Persistir: ref de nombre global + esquema con el índice.
     root = btree::insert(s, root, &index_ref_key(index_name), table_name.as_bytes())?;
@@ -585,9 +593,54 @@ fn insert_index_entries<S: NodeStore>(
 ) -> Result<PageId> {
     let mut root = root;
     for idx in &table.indexes {
+        if idx.unique && !any_indexed_null(idx, record) {
+            // UNIQUE: ese valor no debe existir ya en otra fila (SQL permite
+            // varios NULL, así que solo se comprueba si ninguna columna es NULL).
+            let prefix = index_value_prefix_of(idx, record);
+            if value_held_by_other(s, root, &prefix, rowid)? {
+                return Err(Error::Constraint("violación de restricción UNIQUE"));
+            }
+        }
         root = btree::insert(s, root, &index_entry_key(idx, record, rowid), &[])?;
     }
     Ok(root)
+}
+
+fn any_indexed_null(idx: &IndexDef, record: &[Value]) -> bool {
+    idx.columns
+        .iter()
+        .any(|&c| matches!(record[c], Value::Null))
+}
+
+/// Prefijo de valor de una fila para un índice: la clave de entrada sin el rowid.
+fn index_value_prefix_of(idx: &IndexDef, record: &[Value]) -> Vec<u8> {
+    let mut k = index_id_prefix(idx.index_id).to_vec();
+    for &col in &idx.columns {
+        keyenc::encode_index_value(&record[col], &mut k);
+    }
+    k
+}
+
+/// `true` si alguna entrada con ese prefijo de valor es de un rowid **distinto**
+/// (dup-check de UNIQUE).
+fn value_held_by_other<S: NodeSource>(
+    s: &S,
+    root: PageId,
+    prefix: &[u8],
+    rowid: i64,
+) -> Result<bool> {
+    for item in btree::scan_from(s, root, prefix)? {
+        let (key, _) = item?;
+        if !key.starts_with(prefix) {
+            break;
+        }
+        let other = record::rowid_from_be(&key[key.len() - 8..])
+            .ok_or(Error::CorruptRecord("rowid en entrada de índice"))?;
+        if other != rowid {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Borra las entradas de índice de una fila.
@@ -619,6 +672,61 @@ pub fn index_scan_eq<S: NodeSource>(
         let (key, _) = item?;
         if !key.starts_with(&prefix) {
             break;
+        }
+        let rowid = record::rowid_from_be(&key[key.len() - 8..])
+            .ok_or(Error::CorruptRecord("rowid en entrada de índice"))?;
+        rowids.push(rowid);
+    }
+    Ok(rowids)
+}
+
+/// rowids de un **rango** sobre un índice de una sola columna: `lo`/`hi` son
+/// `(valor, inclusive)` opcionales (`col > V` ⇒ `lo=(V,false), hi=None`; etc.).
+/// Recorre el índice ordenado desde la cota inferior y para al pasar la superior.
+/// Excluye `NULL` (no satisface ningún rango en SQL). El planificador lo usa para
+/// `WHERE col <op> const`; luego `get_row` por cada rowid.
+pub fn index_scan_range<S: NodeSource>(
+    src: &S,
+    root: PageId,
+    idx: &IndexDef,
+    lo: Option<(&Value, bool)>,
+    hi: Option<(&Value, bool)>,
+) -> Result<Vec<i64>> {
+    let enc = |v: &Value| {
+        let mut e = Vec::new();
+        keyenc::encode_index_value(v, &mut e);
+        e
+    };
+    let lo_enc = lo.map(|(v, inc)| (enc(v), inc));
+    let hi_enc = hi.map(|(v, inc)| (enc(v), inc));
+    let id_prefix = index_id_prefix(idx.index_id);
+    let mut start = id_prefix.to_vec();
+    if let Some((e, _)) = &lo_enc {
+        start.extend_from_slice(e);
+    }
+    let mut rowids = Vec::new();
+    for item in btree::scan_from(src, root, &start)? {
+        let (key, _) = item?;
+        if !key.starts_with(&id_prefix) {
+            break; // fuera del índice
+        }
+        let value_enc = &key[id_prefix.len()..key.len() - 8];
+        if value_enc.first() == Some(&0x00) {
+            continue; // NULL: no satisface < / > / etc.
+        }
+        if let Some((e, inc)) = &lo_enc {
+            match value_enc.cmp(e.as_slice()) {
+                std::cmp::Ordering::Less => continue,
+                std::cmp::Ordering::Equal if !inc => continue,
+                _ => {}
+            }
+        }
+        if let Some((e, inc)) = &hi_enc {
+            match value_enc.cmp(e.as_slice()) {
+                std::cmp::Ordering::Greater => break, // ordenado: ya pasamos
+                std::cmp::Ordering::Equal if !*inc => break,
+                _ => {}
+            }
         }
         let rowid = record::rowid_from_be(&key[key.len() - 8..])
             .ok_or(Error::CorruptRecord("rowid en entrada de índice"))?;

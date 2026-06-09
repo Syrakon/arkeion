@@ -1164,6 +1164,17 @@ impl Snapshot {
     pub fn index_lookup(&self, idx: &IndexDef, value: &Value) -> Result<Vec<i64>> {
         catalog::index_scan_eq(self, self.data_root, idx, std::slice::from_ref(value))
     }
+
+    /// rowids de un rango sobre un índice de una columna (`lo`/`hi` inclusivos o
+    /// no), vía el índice ordenado.
+    pub fn index_range(
+        &self,
+        idx: &IndexDef,
+        lo: Option<(&Value, bool)>,
+        hi: Option<(&Value, bool)>,
+    ) -> Result<Vec<i64>> {
+        catalog::index_scan_range(self, self.data_root, idx, lo, hi)
+    }
 }
 
 // --- estado de páginas de una transacción ---
@@ -1358,6 +1369,16 @@ impl WriteTx {
     /// rowids cuyas columnas indexadas valen `value` (igualdad), vía el índice.
     pub fn index_lookup(&self, idx: &IndexDef, value: &Value) -> Result<Vec<i64>> {
         catalog::index_scan_eq(&self.ts, self.data_root, idx, std::slice::from_ref(value))
+    }
+
+    /// rowids de un rango sobre un índice de una columna, vía el índice ordenado.
+    pub fn index_range(
+        &self,
+        idx: &IndexDef,
+        lo: Option<(&Value, bool)>,
+        hi: Option<(&Value, bool)>,
+    ) -> Result<Vec<i64>> {
+        catalog::index_scan_range(&self.ts, self.data_root, idx, lo, hi)
     }
 
     pub fn drop_table(&mut self, name: &str) -> Result<bool> {

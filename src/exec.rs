@@ -29,6 +29,14 @@ pub trait DataSource {
     fn scan_rows(&self, table: &TableDef) -> Result<Vec<Vec<Value>>>;
     /// rowids cuyas columnas indexadas valen `value` (igualdad), vía un índice.
     fn index_lookup(&self, table: &TableDef, idx: &IndexDef, value: &Value) -> Result<Vec<i64>>;
+    /// rowids de un rango (`lo`/`hi` opcionales, inclusivos o no), vía un índice.
+    fn index_range(
+        &self,
+        table: &TableDef,
+        idx: &IndexDef,
+        lo: Option<(&Value, bool)>,
+        hi: Option<(&Value, bool)>,
+    ) -> Result<Vec<i64>>;
 }
 
 impl DataSource for Snapshot {
@@ -49,6 +57,16 @@ impl DataSource for Snapshot {
     fn index_lookup(&self, _table: &TableDef, idx: &IndexDef, value: &Value) -> Result<Vec<i64>> {
         Snapshot::index_lookup(self, idx, value)
     }
+
+    fn index_range(
+        &self,
+        _table: &TableDef,
+        idx: &IndexDef,
+        lo: Option<(&Value, bool)>,
+        hi: Option<(&Value, bool)>,
+    ) -> Result<Vec<i64>> {
+        Snapshot::index_range(self, idx, lo, hi)
+    }
 }
 
 impl DataSource for WriteTx {
@@ -68,6 +86,16 @@ impl DataSource for WriteTx {
 
     fn index_lookup(&self, _table: &TableDef, idx: &IndexDef, value: &Value) -> Result<Vec<i64>> {
         WriteTx::index_lookup(self, idx, value)
+    }
+
+    fn index_range(
+        &self,
+        _table: &TableDef,
+        idx: &IndexDef,
+        lo: Option<(&Value, bool)>,
+        hi: Option<(&Value, bool)>,
+    ) -> Result<Vec<i64>> {
+        WriteTx::index_range(self, idx, lo, hi)
     }
 }
 
@@ -344,6 +372,29 @@ fn candidate_rows(
             return Ok(out);
         }
     }
+    // Index scan de rango (col indexada <op> const).
+    if let Some((idx, op, const_expr)) = index_range_plan(schema, where_clause) {
+        let value = eval_const(const_expr, params)?;
+        let col = idx.columns[0];
+        if !matches!(value, Value::Null)
+            && let Some(v) = coerce_value(value, def.columns[col].col_type)
+        {
+            let (lo, hi) = match op {
+                BinOp::Gt => (Some((&v, false)), None),
+                BinOp::Ge => (Some((&v, true)), None),
+                BinOp::Lt => (None, Some((&v, false))),
+                BinOp::Le => (None, Some((&v, true))),
+                _ => (None, None),
+            };
+            let mut out = Vec::new();
+            for rowid in tx.index_range(idx, lo, hi)? {
+                if let Some(row) = tx.get_row(def, rowid)? {
+                    out.push((rowid, row));
+                }
+            }
+            return Ok(out);
+        }
+    }
     let mut all = Vec::new();
     for item in tx.scan_table(def)? {
         all.push(item?);
@@ -538,6 +589,10 @@ pub fn run_select(src: &impl DataSource, stmt: &SelectStmt, params: &[Value]) ->
             index_lookup_plan(&schema, stmt.where_clause.as_ref())
         {
             index_lookup_rows(src, &from_def, idx, const_expr, params)?
+        } else if let Some((idx, op, const_expr)) =
+            index_range_plan(&schema, stmt.where_clause.as_ref())
+        {
+            index_range_rows(src, &from_def, idx, op, const_expr, params)?
         } else {
             src.scan_rows(&from_def)?
         }
@@ -787,6 +842,96 @@ fn index_lookup_rows(
         },
     };
     let rowids = src.index_lookup(from_def, idx, &coerced)?;
+    let mut out = Vec::with_capacity(rowids.len());
+    for rowid in rowids {
+        if let Some(row) = src.get_row(from_def, rowid)? {
+            out.push(row);
+        }
+    }
+    Ok(out)
+}
+
+/// `WHERE col <op> const` (`op` ∈ `< <= > >=`, en cualquier orden) con `col`
+/// cubierta por un índice de una sola columna (no la PK). Devuelve el índice, el
+/// operador (normalizado a `col <op> const`) y la constante.
+fn index_range_plan<'a, 'e>(
+    schema: &'a QuerySchema,
+    where_clause: Option<&'e Expr>,
+) -> Option<(&'a IndexDef, BinOp, &'e Expr)> {
+    let t = &schema.tables[0];
+    let Some(Expr::Binary(left, op, right)) = where_clause else {
+        return None;
+    };
+    if !matches!(op, BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge) {
+        return None;
+    }
+    let col_pos = |e: &Expr| -> Option<usize> {
+        match e {
+            Expr::Column { table, name } if table.as_deref().is_none_or(|q| q == t.qualifier) => {
+                t.def.columns.iter().position(|c| &c.name == name)
+            }
+            _ => None,
+        }
+    };
+    let (col, const_expr, op) = if let Some(c) = col_pos(left)
+        && right.is_const()
+    {
+        (c, right.as_ref(), *op)
+    } else if let Some(c) = col_pos(right)
+        && left.is_const()
+    {
+        (c, left.as_ref(), flip_op(*op)) // const <op> col  ⇒  col <flip(op)> const
+    } else {
+        return None;
+    };
+    if Some(col) == t.def.rowid_alias {
+        return None; // rango sobre la PK: no hay índice secundario (full scan)
+    }
+    let idx = t
+        .def
+        .indexes
+        .iter()
+        .find(|i| i.columns.as_slice() == [col])?;
+    Some((idx, op, const_expr))
+}
+
+/// Voltea un operador de comparación al pasar el operando de lado.
+fn flip_op(op: BinOp) -> BinOp {
+    match op {
+        BinOp::Lt => BinOp::Gt,
+        BinOp::Le => BinOp::Ge,
+        BinOp::Gt => BinOp::Lt,
+        BinOp::Ge => BinOp::Le,
+        other => other,
+    }
+}
+
+/// Resuelve un index scan de rango a filas: evalúa la constante, la coacciona al
+/// tipo de la columna, consulta el rango del índice y trae cada fila por rowid.
+fn index_range_rows(
+    src: &impl DataSource,
+    from_def: &TableDef,
+    idx: &IndexDef,
+    op: BinOp,
+    const_expr: &Expr,
+    params: &[Value],
+) -> Result<Vec<Vec<Value>>> {
+    let value = eval_const(const_expr, params)?;
+    let col = idx.columns[0];
+    if matches!(value, Value::Null) {
+        return src.scan_rows(from_def); // rango contra NULL → 0 filas (filtro general)
+    }
+    let Some(v) = coerce_value(value, from_def.columns[col].col_type) else {
+        return src.scan_rows(from_def); // tipo incompatible: que decida el filtro
+    };
+    let (lo, hi) = match op {
+        BinOp::Gt => (Some((&v, false)), None),
+        BinOp::Ge => (Some((&v, true)), None),
+        BinOp::Lt => (None, Some((&v, false))),
+        BinOp::Le => (None, Some((&v, true))),
+        _ => return src.scan_rows(from_def),
+    };
+    let rowids = src.index_range(from_def, idx, lo, hi)?;
     let mut out = Vec::with_capacity(rowids.len());
     for rowid in rowids {
         if let Some(row) = src.get_row(from_def, rowid)? {

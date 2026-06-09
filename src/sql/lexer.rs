@@ -295,13 +295,35 @@ pub fn lex(sql: &str) -> Result<Vec<Spanned>> {
                 while i < bytes.len() && bytes[i].is_ascii_digit() {
                     i += 1;
                 }
-                let is_float = bytes.get(i) == Some(&b'.')
-                    && bytes.get(i + 1).is_some_and(|c| c.is_ascii_digit());
-                if is_float {
+                let mut is_float = false;
+                // Parte fraccionaria: un punto seguido de dígitos (`1.5`) o un punto
+                // final (`100.`). No se consume el punto si lo sigue una letra
+                // (no existe `numero.identificador` en este SQL).
+                if bytes.get(i) == Some(&b'.')
+                    && !bytes.get(i + 1).is_some_and(|c| c.is_ascii_alphabetic())
+                {
+                    is_float = true;
                     i += 1;
                     while i < bytes.len() && bytes[i].is_ascii_digit() {
                         i += 1;
                     }
+                }
+                // Exponente científico: `e`/`E`, signo opcional, uno o más dígitos
+                // (`1e308`, `1.5e3`, `1e-308`). Solo se consume si hay dígitos.
+                if matches!(bytes.get(i), Some(b'e' | b'E')) {
+                    let mut j = i + 1;
+                    if matches!(bytes.get(j), Some(b'+' | b'-')) {
+                        j += 1;
+                    }
+                    if bytes.get(j).is_some_and(|c| c.is_ascii_digit()) {
+                        is_float = true;
+                        i = j + 1;
+                        while i < bytes.len() && bytes[i].is_ascii_digit() {
+                            i += 1;
+                        }
+                    }
+                }
+                if is_float {
                     let f: f64 = sql[start..i]
                         .parse()
                         .map_err(|_| err(start, "literal real inválido"))?;

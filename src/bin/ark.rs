@@ -327,7 +327,9 @@ fn show(v: &Value) -> String {
     match v {
         Value::Null => "NULL".into(),
         Value::Integer(n) => n.to_string(),
-        Value::Real(f) => f.to_string(),
+        // Debug de f64: forma más corta que round-trippea, SIEMPRE con `.` o `e`,
+        // así un REAL no se confunde con un INTEGER (5.0 → "5.0", 1e308 → "1e308").
+        Value::Real(f) => format!("{f:?}"),
         Value::Bool(b) => b.to_string(),
         Value::Text(s) => s.clone(),
         Value::Blob(b) => format!(

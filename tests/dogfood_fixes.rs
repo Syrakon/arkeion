@@ -82,6 +82,28 @@ fn as_of_is_scoped_to_the_branch_ancestry() {
 }
 
 #[test]
+fn real_literals_accept_scientific_notation() {
+    let (_d, db) = db();
+    let conn = db.connect().unwrap();
+    conn.execute("CREATE TABLE r (id INTEGER PRIMARY KEY, x REAL)", &[])
+        .unwrap();
+    // Formas que el lexer rechazaba: exponente y punto final.
+    for lit in ["1.5e3", "1e308", "1e-9", "100.", "2.5"] {
+        conn.execute(&format!("INSERT INTO r (x) VALUES ({lit})"), &[])
+            .unwrap();
+    }
+    let v: f64 = conn
+        .query("SELECT x FROM r WHERE id = 1", &[])
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .get(0)
+        .unwrap();
+    assert_eq!(v, 1500.0); // 1.5e3
+}
+
+#[test]
 fn changes_uses_recorded_parent_not_numeric_predecessor() {
     let (_d, db) = db();
     let conn = db.connect().unwrap();

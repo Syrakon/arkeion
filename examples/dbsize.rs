@@ -38,6 +38,33 @@ fn main() {
         mb(&path)
     );
 
+    // Mismo dataset con compresión de página (M10, Slice B): mismo motor, mismas
+    // propiedades (verify/AS OF), backend LZSS pure-Rust off por defecto.
+    {
+        let dirc = tempfile::tempdir().unwrap();
+        let pathc = dirc.path().join("c.arkeion");
+        let dbc = Database::open(&pathc, Options::default().compress(true)).unwrap();
+        let connc = dbc.connect().unwrap();
+        connc
+            .execute(
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b TEXT)",
+                &[],
+            )
+            .unwrap();
+        let insc = connc
+            .prepare("INSERT INTO t (a, b) VALUES (?1, ?2)")
+            .unwrap();
+        connc.execute("BEGIN", &[]).unwrap();
+        for i in 0..n {
+            insc.execute(&params![i, "fila de ejemplo"]).unwrap();
+        }
+        connc.execute("COMMIT", &[]).unwrap();
+        println!(
+            "arkeion  insert comprimido (1 commit) : {:.1} MB",
+            mb(&pathc)
+        );
+    }
+
     // Actualizar TODAS las filas una vez: arkeion conserva la versión vieja (CoW).
     let upd = conn
         .prepare("UPDATE t SET a = a + 1 WHERE id = ?1")

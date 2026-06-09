@@ -42,6 +42,9 @@ pub const FORMAT_VERSION: u32 = 2;
 
 /// `FileHeader.flags` bit 0: cifrado en reposo activo.
 pub const FLAG_ENCRYPTED: u32 = 1;
+/// `FileHeader.flags` bit 1: compresión de página activa (v2, M10). Marca que las
+/// páginas de datos llevan un byte de método (crudo/comprimido) antes del payload.
+pub const FLAG_COMPRESSED: u32 = 2;
 
 /// Página 0: cabecera de archivo (inmutable tras la creación).
 pub const HEADER_PAGE: PageId = PageId(0);

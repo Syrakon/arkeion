@@ -7,18 +7,25 @@
 //! - Las únicas escrituras in-place son los dos meta slots, que solo apuntan
 //!   hacia atrás (la durabilidad la da la página de commit, M1).
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use crate::commit::Head;
+use crate::compress::{Compressor, Lz};
 use crate::crypto::{Aes256GcmProvider, CryptoProvider, Key, PlainProvider};
 use crate::error::{Error, Result};
 use crate::format::{
-    CRYPTO_RESERVE, FIRST_DATA_PAGE, FLAG_ENCRYPTED, FileHeader, HEADER_PAGE, LEN_PREFIX_LEN,
-    MAGIC_HEADER, META_PAGE_A, META_PAGE_B, MetaSlot, PageBuf, PageId,
+    CRYPTO_RESERVE, FIRST_DATA_PAGE, FLAG_COMPRESSED, FLAG_ENCRYPTED, FileHeader, HEADER_PAGE,
+    LEN_PREFIX_LEN, MAGIC_HEADER, META_PAGE_A, META_PAGE_B, MetaSlot, PageBuf, PageId,
 };
 use crate::io::{DbFile, sync_parent_dir};
+
+/// Byte de método de una página de datos cuando la compresión está activa (v2,
+/// M10): crudo o comprimido. Solo presente con `FLAG_COMPRESSED`.
+const METHOD_RAW: u8 = 0;
+const METHOD_LZ: u8 = 1;
 
 /// Tope de la caché de páginas (M9): ~16 MiB de bodies. Las páginas son
 /// inmutables, así que evictar nunca pierde datos: se releen del disco.
@@ -40,6 +47,10 @@ pub struct Pager {
     plain: PlainProvider,
     /// Zona append: `PlainProvider` sin cifrado, `Aes256GcmProvider` con clave (M7).
     crypto: Arc<dyn CryptoProvider>,
+    /// Compresor de página (v2, M10): `None` = off (formato sin byte de método),
+    /// `Some` = on (cada página de datos lleva un byte de método). Se decide al
+    /// crear (bit `FLAG_COMPRESSED`) y se lee del header al abrir.
+    compressor: Option<Arc<dyn Compressor>>,
     /// Caché acotada de páginas inmutables (M9): LRU aproximada con tope.
     cache: Mutex<PageCache>,
     state: Mutex<AppendState>,
@@ -153,18 +164,20 @@ impl Pager {
     /// append se sella con AES-256-GCM; cabecera y meta slots van siempre en
     /// claro (no contienen datos de usuario).
     pub fn create_keyed(path: &Path, key: Option<&Key>) -> Result<Pager> {
-        Self::create_with_crypto(path, key.is_some(), provider_for(key))
+        Self::create_with_crypto(path, key.is_some(), provider_for(key), None)
     }
 
-    /// Núcleo de la creación, parametrizado por el proveedor cripto ya
-    /// construido (M9). Lo usa `vacuum` para crear el archivo temporal con el
-    /// **mismo** proveedor (misma clave) sin volver a manejar la `Key` cruda, o
-    /// con uno nuevo (rotación de clave). Genera una identidad de archivo nueva:
-    /// el archivo compactado arranca una cadena de auditoría fresca.
+    /// Núcleo de la creación, parametrizado por el proveedor cripto y el
+    /// compresor ya construidos (M9/M10). Lo usa `vacuum` para crear el archivo
+    /// temporal con el **mismo** proveedor (misma clave) y la **misma**
+    /// compresión sin volver a manejar la `Key` cruda, o con cripto nueva
+    /// (rotación de clave). Genera una identidad de archivo nueva: el archivo
+    /// compactado arranca una cadena de auditoría fresca.
     pub(crate) fn create_with_crypto(
         path: &Path,
         encrypted: bool,
         crypto: Arc<dyn CryptoProvider>,
+        compressor: Option<Arc<dyn Compressor>>,
     ) -> Result<Pager> {
         let file = DbFile::create_new(path)?;
         if !file.try_lock_exclusive()? {
@@ -175,8 +188,14 @@ impl Pager {
         getrandom::fill(&mut file_id).map_err(|e| Error::Io(std::io::Error::other(e)))?;
         let mut kdf_salt = [0u8; 16];
         getrandom::fill(&mut kdf_salt).map_err(|e| Error::Io(std::io::Error::other(e)))?;
+        let flags = (if encrypted { FLAG_ENCRYPTED } else { 0 })
+            | (if compressor.is_some() {
+                FLAG_COMPRESSED
+            } else {
+                0
+            });
         let header = FileHeader {
-            flags: if encrypted { FLAG_ENCRYPTED } else { 0 },
+            flags,
             file_id,
             kdf_salt,
         };
@@ -186,6 +205,7 @@ impl Pager {
             header,
             plain: PlainProvider,
             crypto,
+            compressor,
             cache: Mutex::new(PageCache::new(CACHE_CAP)),
             state: Mutex::new(AppendState {
                 next_page: FIRST_DATA_PAGE.0,
@@ -259,12 +279,18 @@ impl Pager {
                 ));
             }
         };
+        // Compresión activa (v2, M10): el bit del header fija qué backend abre las
+        // páginas. v1.x tiene un único backend (Lz); un segundo añadiría un id en
+        // el header. Off ⇒ formato sin byte de método (idéntico a A2).
+        let compressor: Option<Arc<dyn Compressor>> =
+            (header.flags & FLAG_COMPRESSED != 0).then(|| Arc::new(Lz) as Arc<dyn Compressor>);
 
         let pager = Pager {
             file,
             header,
             plain: PlainProvider,
             crypto,
+            compressor,
             cache: Mutex::new(PageCache::new(CACHE_CAP)),
             state: Mutex::new(AppendState {
                 next_page: FIRST_DATA_PAGE.0,
@@ -339,9 +365,8 @@ impl Pager {
         let mut state = self.state.lock().expect("estado del pager envenenado");
         let id = PageId(state.next_page);
         let offset = state.write_offset;
-        let stored =
-            self.crypto
-                .seal_bytes(trim_trailing_zeros(page.body()), id, state.nonce_counter);
+        let to_seal = self.body_to_seal(trim_trailing_zeros(page.body()));
+        let stored = self.crypto.seal_bytes(&to_seal, id, state.nonce_counter);
         let framed = frame(&stored);
         self.file.write_all_at(&framed, offset)?;
         state.dir.push(PhysLoc {
@@ -387,7 +412,7 @@ impl Pager {
 
         let mut stored = vec![0u8; loc.len as usize];
         self.file.read_exact_at(&mut stored, loc.offset)?;
-        let body = self.crypto.open_bytes(&stored, id)?;
+        let body = self.decode_body(self.crypto.open_bytes(&stored, id)?, id)?;
         let mut page = PageBuf::zeroed();
         page.body_mut()[..body.len()].copy_from_slice(&body);
         let page = Arc::new(page);
@@ -401,6 +426,46 @@ impl Pager {
     /// fsync de datos: el punto de durabilidad del protocolo de commit.
     pub fn sync(&self) -> Result<()> {
         self.file.sync_data().map_err(Error::from)
+    }
+
+    /// Bytes a sellar para una página de datos (v2, M10): el body recortado tal
+    /// cual si la compresión está off, o `[método][payload]` (comprimido si
+    /// ahorra, crudo si no — nunca inflar) si está on. Transparente para
+    /// `content_hash`/`verify`: el body lógico se reconstruye idéntico al leer.
+    fn body_to_seal<'a>(&self, trimmed: &'a [u8]) -> Cow<'a, [u8]> {
+        let Some(c) = &self.compressor else {
+            return Cow::Borrowed(trimmed);
+        };
+        let (method, payload) = match c.compress(trimmed) {
+            Some(comp) => (METHOD_LZ, comp),
+            None => (METHOD_RAW, trimmed.to_vec()),
+        };
+        let mut out = Vec::with_capacity(1 + payload.len());
+        out.push(method);
+        out.extend_from_slice(&payload);
+        Cow::Owned(out)
+    }
+
+    /// Inverso de `body_to_seal`: del payload abierto al body lógico recortado.
+    fn decode_body(&self, opened: Vec<u8>, id: PageId) -> Result<Vec<u8>> {
+        let Some(c) = &self.compressor else {
+            return Ok(opened);
+        };
+        let (&method, payload) = opened.split_first().ok_or(Error::Corrupt {
+            page: id.0,
+            reason: "página de datos comprimida vacía",
+        })?;
+        match method {
+            METHOD_RAW => Ok(payload.to_vec()),
+            METHOD_LZ => c.decompress(payload).ok_or(Error::Corrupt {
+                page: id.0,
+                reason: "descompresión de página fallida",
+            }),
+            _ => Err(Error::Corrupt {
+                page: id.0,
+                reason: "método de compresión desconocido",
+            }),
+        }
     }
 
     /// Sella, enmarca y escribe `body` (claro) para la página lógica `id` en
@@ -423,9 +488,8 @@ impl Pager {
             state.nonce_counter += 1;
             c
         };
-        let stored = self
-            .crypto
-            .seal_bytes(trim_trailing_zeros(body), id, counter);
+        let to_seal = self.body_to_seal(trim_trailing_zeros(body));
+        let stored = self.crypto.seal_bytes(&to_seal, id, counter);
         let framed = frame(&stored);
         self.file.write_all_at(&framed, offset)?;
         let loc = PhysLoc {
@@ -577,6 +641,12 @@ impl Pager {
     /// clave (vacuum manteniendo el cifrado, M9).
     pub(crate) fn crypto(&self) -> Arc<dyn CryptoProvider> {
         self.crypto.clone()
+    }
+
+    /// Compresor activo (clon del `Arc`), para que `vacuum` cree el archivo
+    /// compactado con la **misma** compresión que el original (M10).
+    pub(crate) fn compressor(&self) -> Option<Arc<dyn Compressor>> {
+        self.compressor.clone()
     }
 
     /// `true` si el archivo está cifrado (bit `FLAG_ENCRYPTED`).

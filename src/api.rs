@@ -34,6 +34,10 @@ pub struct Options {
     /// Clave de cifrado en reposo (M7, D7). `Some` ⇒ al crear se cifra el
     /// archivo, al abrir se descifra. `None` ⇒ sin cifrado.
     pub key: Option<Key>,
+    /// Compresión de página (M10). Solo aplica **al crear** (queda marcada en el
+    /// header); al abrir un archivo existente se respeta lo que diga el header.
+    /// `false` por defecto (D8: el core mínimo no comprime).
+    pub compress: bool,
 }
 
 impl Default for Options {
@@ -41,6 +45,7 @@ impl Default for Options {
         Options {
             create_if_missing: true,
             key: None,
+            compress: false,
         }
     }
 }
@@ -79,6 +84,15 @@ impl Options {
         self.key = Some(key);
         self
     }
+
+    /// Activa la compresión de página al crear (M10). Tras un `trait` y con un
+    /// backend pure-Rust por defecto (D8); off por defecto. No afecta a abrir un
+    /// archivo ya existente (su compresión la fija el header). Nota CRIME: con
+    /// cifrado, comprimir filtra información gruesa por el tamaño de página.
+    pub fn compress(mut self, on: bool) -> Options {
+        self.compress = on;
+        self
+    }
 }
 
 /// Una base de datos Arkeion: un único archivo. Handle clonable y compartible
@@ -93,7 +107,7 @@ impl Database {
         let path = path.as_ref();
         let key = opts.key.as_ref();
         let store = if opts.create_if_missing {
-            match Store::create_keyed(path, key) {
+            match Store::create_with(path, key, opts.compress) {
                 Ok(s) => s,
                 // Ya existe (o carrera con otro creador): abrir.
                 Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::AlreadyExists => {

@@ -20,6 +20,7 @@ use sha2::{Digest, Sha256};
 use crate::btree::{self, Body, Cursor, NodeSource, NodeStore};
 use crate::catalog::{self, TableDef, TableScan, TableSpec};
 use crate::commit::{self, COMMIT_FLAG_CHECKPOINT, CommitHeader, Head};
+use crate::compress::{Compressor, Lz};
 use crate::crypto::Key;
 use crate::error::{Error, Result};
 use crate::format::{MIN_RECORD_LEN, PageBuf, PageId};
@@ -169,7 +170,15 @@ impl Store {
 
     /// Crea el almacén; con `key`, cifrado en reposo (M7, D6).
     pub fn create_keyed(path: &Path, key: Option<&Key>) -> Result<Store> {
-        let pager = Pager::create_keyed(path, key)?;
+        Self::create_with(path, key, false)
+    }
+
+    /// Crea el almacén con cifrado (`key`) y/o compresión de página (`compress`)
+    /// opcionales (M7/M10). La compresión se decide al crear (queda en el header,
+    /// `FLAG_COMPRESSED`) y al abrir se lee de ahí; off por defecto (D8).
+    pub fn create_with(path: &Path, key: Option<&Key>, compress: bool) -> Result<Store> {
+        let compressor = compress.then(|| Arc::new(Lz) as Arc<dyn Compressor>);
+        let pager = Pager::create_with_crypto(path, key.is_some(), provider_for(key), compressor)?;
         let head = commit::genesis_head(&pager.header().file_id);
         Ok(Store::from_parts(path, pager, head))
     }
@@ -698,12 +707,21 @@ impl Store {
         let temp = vacuum_temp_path(&self.path);
         let _ = std::fs::remove_file(&temp); // limpia un temporal de un vacuum abortado
 
-        // Pager temporal con la cripto destino: misma clave (Keep) o nueva (To).
+        // Pager temporal con la cripto destino (misma clave (Keep) o nueva (To))
+        // y la **misma** compresión que el original (M10).
         let new_pager = match rekey {
-            Rekey::Keep => {
-                Pager::create_with_crypto(&temp, old_pager.is_encrypted(), old_pager.crypto())?
-            }
-            Rekey::To(key) => Pager::create_with_crypto(&temp, key.is_some(), provider_for(key))?,
+            Rekey::Keep => Pager::create_with_crypto(
+                &temp,
+                old_pager.is_encrypted(),
+                old_pager.crypto(),
+                old_pager.compressor(),
+            )?,
+            Rekey::To(key) => Pager::create_with_crypto(
+                &temp,
+                key.is_some(),
+                provider_for(key),
+                old_pager.compressor(),
+            )?,
         };
         let new_pager = Arc::new(new_pager);
 

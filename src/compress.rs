@@ -238,6 +238,44 @@ mod tests {
     }
 
     #[test]
+    fn lz_roundtrip_stress() {
+        // Entradas estructuradas (runs de ceros, runs de un byte, regiones
+        // aleatorias) de longitudes variadas: caza bugs de round-trip que las
+        // muestras fijas no tocan (p. ej. páginas de commit con relleno a ceros).
+        let mut s = 0x9E37_79B1u32;
+        let mut rng = || {
+            s ^= s << 13;
+            s ^= s >> 17;
+            s ^= s << 5;
+            s
+        };
+        for _ in 0..3000 {
+            let len = (rng() % 4069) as usize;
+            let mut buf = vec![0u8; len];
+            let mut i = 0;
+            while i < len {
+                let run = 1 + (rng() % 40) as usize;
+                let end = (i + run).min(len);
+                match rng() % 3 {
+                    0 => {} // run de ceros (ya está)
+                    1 => {
+                        let b = rng() as u8;
+                        buf[i..end].fill(b);
+                    }
+                    _ => {
+                        for x in &mut buf[i..end] {
+                            *x = rng() as u8;
+                        }
+                    }
+                }
+                i = end;
+            }
+            let c = lz_compress(&buf);
+            assert_eq!(lz_decompress(&c).as_deref(), Some(&buf[..]), "len={len}");
+        }
+    }
+
+    #[test]
     fn lz_roundtrip_all_samples() {
         for (i, s) in samples().iter().enumerate() {
             let c = lz_compress(s);

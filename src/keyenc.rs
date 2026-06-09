@@ -8,29 +8,36 @@
 //! un índice el tipo de columna es fijo (las filas se coercionan), así que el
 //! byte de presencia basta —no hace falta un tag de tipo—.
 
-use crate::record::{Value, rowid_be};
+use crate::record::{Value, ValueRef, rowid_be};
 
 /// Añade a `out` la codificación memcomparable de `v` (clave de índice).
 pub fn encode_index_value(v: &Value, out: &mut Vec<u8>) {
+    encode_index_value_ref(ValueRef::of(v), out);
+}
+
+/// Como [`encode_index_value`] pero sobre la vista prestada [`ValueRef`]: el
+/// camino sin clones (insert y bulk-load) codifica entradas de índice directo
+/// de los valores resueltos. Único sitio con el formato memcomparable.
+pub fn encode_index_value_ref(v: ValueRef<'_>, out: &mut Vec<u8>) {
     match v {
-        Value::Null => out.push(0x00), // NULL ordena antes que cualquier no-null
-        Value::Integer(n) => {
+        ValueRef::Null => out.push(0x00), // NULL ordena antes que cualquier no-null
+        ValueRef::Integer(n) => {
             out.push(0x01);
-            out.extend_from_slice(&rowid_be(*n)); // i64 BE con bit de signo invertido
+            out.extend_from_slice(&rowid_be(n)); // i64 BE con bit de signo invertido
         }
-        Value::Real(f) => {
+        ValueRef::Real(f) => {
             out.push(0x01);
-            out.extend_from_slice(&real_be(*f));
+            out.extend_from_slice(&real_be(f));
         }
-        Value::Bool(b) => {
+        ValueRef::Bool(b) => {
             out.push(0x01);
-            out.push(u8::from(*b)); // false(0) < true(1)
+            out.push(u8::from(b)); // false(0) < true(1)
         }
-        Value::Text(s) => {
+        ValueRef::Text(s) => {
             out.push(0x01);
             encode_bytes(s.as_bytes(), out);
         }
-        Value::Blob(b) => {
+        ValueRef::Blob(b) => {
             out.push(0x01);
             encode_bytes(b, out);
         }

@@ -920,15 +920,7 @@ pub(crate) fn put_row_buffered<S: NodeStore>(
         // Sin índices (el caso del bulk-load típico): valida y codifica en una
         // pasada sobre los valores prestados, sin clonar texto/blob por fila
         // ni materializar el registro (M10-perf, fase 2).
-        if values.len() > table.columns.len() {
-            return Err(Error::InvalidInput("más valores que columnas"));
-        }
-        record::encode_resolved_into(
-            table.columns.len(),
-            |i| resolve_col(table, values, i),
-            enc_buf,
-        )?;
-        return btree::insert(s, root, &row_key(table.table_id, rowid), enc_buf);
+        return put_row_data(s, root, table, rowid, values, enc_buf);
     }
     // Con índices: las entradas necesitan el registro materializado (claves de
     // índice, dup-check UNIQUE); se reutilizan los buffers.
@@ -936,6 +928,95 @@ pub(crate) fn put_row_buffered<S: NodeStore>(
     record::encode_values_into(rec_buf, enc_buf);
     let root = btree::insert(s, root, &row_key(table.table_id, rowid), enc_buf)?;
     insert_index_entries(s, root, table, rowid, rec_buf.as_slice())
+}
+
+/// Valida y escribe **solo la fila** (sin entradas de índice), codificando en
+/// una pasada sobre los valores prestados — el camino sin clones. La usa
+/// [`put_row_buffered`] para tablas sin índices y el bulk-load, que difiere
+/// las entradas y las inserta en bloque con [`flush_index_entries`].
+pub(crate) fn put_row_data<S: NodeStore>(
+    s: &mut S,
+    root: PageId,
+    table: &TableDef,
+    rowid: i64,
+    values: &[Value],
+    enc_buf: &mut Vec<u8>,
+) -> Result<PageId> {
+    if values.len() > table.columns.len() {
+        return Err(Error::InvalidInput("más valores que columnas"));
+    }
+    record::encode_resolved_into(
+        table.columns.len(),
+        |i| resolve_col(table, values, i),
+        enc_buf,
+    )?;
+    btree::insert(s, root, &row_key(table.table_id, rowid), enc_buf)
+}
+
+/// Clave de entrada de índice resuelta desde los valores **crudos** de un
+/// INSERT (misma resolución que el camino caliente: defaults, promoción,
+/// alias) y si alguna columna indexada quedó NULL — los NULL no participan en
+/// el dup-check UNIQUE (SQL permite varios). Mismos bytes que
+/// `index_entry_key` sobre el registro materializado.
+pub(crate) fn resolved_index_entry(
+    table: &TableDef,
+    values: &[Value],
+    idx: &IndexDef,
+    rowid: i64,
+) -> Result<(Vec<u8>, bool)> {
+    let mut key = index_id_prefix(idx.index_id).to_vec();
+    let mut has_null = false;
+    for &c in &idx.columns {
+        let v = resolve_col(table, values, c)?;
+        if matches!(v, ValueRef::Null) {
+            has_null = true;
+        }
+        keyenc::encode_index_value_ref(v, &mut key);
+    }
+    key.extend_from_slice(&record::rowid_be(rowid));
+    Ok((key, has_null))
+}
+
+/// Inserta en bloque las entradas **diferidas** de un índice (bulk-load).
+/// Ordena primero: mejor localidad de descenso y, si el índice es la cola del
+/// árbol (índice recién creado o el de mayor id), cada insert es un append.
+/// El dup-check UNIQUE corre **antes de escribir nada**: intra-lote por
+/// prefijos adyacentes tras ordenar, y contra lo existente con una sonda por
+/// prefijo distinto (menos sondas que el camino fila a fila).
+pub(crate) fn flush_index_entries<S: NodeStore>(
+    s: &mut S,
+    root: PageId,
+    idx: &IndexDef,
+    entries: &mut [(Vec<u8>, bool)],
+) -> Result<PageId> {
+    entries.sort_unstable();
+    if idx.unique {
+        for w in entries.windows(2) {
+            if !w[0].1 && !w[1].1 && w[0].0[..w[0].0.len() - 8] == w[1].0[..w[1].0.len() - 8] {
+                return Err(Error::Constraint("violación de restricción UNIQUE"));
+            }
+        }
+        let mut prev: Option<&[u8]> = None;
+        for (key, has_null) in entries.iter() {
+            if *has_null {
+                continue;
+            }
+            let prefix = &key[..key.len() - 8];
+            if prev == Some(prefix) {
+                continue; // ya sondado (los iguales son adyacentes tras ordenar)
+            }
+            prev = Some(prefix);
+            let rowid = rowid_from_index_key(key)?;
+            if value_held_by_other(s, root, prefix, rowid)? {
+                return Err(Error::Constraint("violación de restricción UNIQUE"));
+            }
+        }
+    }
+    let mut root = root;
+    for (key, _) in entries.iter() {
+        root = btree::insert(s, root, key, &[])?;
+    }
+    Ok(root)
 }
 
 /// Inserta con rowid automático o explícito, contador incluido (camino directo

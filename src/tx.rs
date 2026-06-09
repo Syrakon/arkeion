@@ -1587,6 +1587,57 @@ impl WriteTx {
         Ok(rowid)
     }
 
+    /// Carga masiva (bulk-load): inserta todas las filas en una pasada. El
+    /// esquema se resuelve **una vez**, el contador de rowid vive en un local
+    /// (ni HashMap por fila) y las entradas de índice se **difieren**: se
+    /// insertan ordenadas al final, con el dup-check UNIQUE intra-lote y
+    /// contra lo existente antes de escribir ninguna.
+    ///
+    /// Contrato: pensado para tx recién abierta + commit inmediato (lo
+    /// garantiza [`Connection::bulk_insert`](crate::Connection::bulk_insert)).
+    /// Si falla a mitad, la tx puede quedar con filas sin sus entradas de
+    /// índice — **descártala**, no la confirmes.
+    pub(crate) fn insert_rows<I, R>(&mut self, table: &str, rows: I) -> Result<usize>
+    where
+        I: IntoIterator<Item = R>,
+        R: AsRef<[Value]>,
+    {
+        let def = self
+            .table_cached(table)?
+            .ok_or(Error::InvalidInput("tabla desconocida"))?;
+        let mut next = match self.rowid_cache.get(&def.table_id) {
+            Some(&c) => c,
+            None => catalog::read_counter(&self.ts, self.data_root, def.table_id)?,
+        };
+        let mut pending: Vec<Vec<(Vec<u8>, bool)>> = vec![Vec::new(); def.indexes.len()];
+        let mut n = 0usize;
+        for row in rows {
+            let values = row.as_ref();
+            let explicit = catalog::explicit_rowid(&def, values)?;
+            let (rowid, new_next) =
+                catalog::resolve_rowid(&self.ts, self.data_root, def.table_id, explicit, next)?;
+            next = new_next;
+            self.data_root = catalog::put_row_data(
+                &mut self.ts,
+                self.data_root,
+                &def,
+                rowid,
+                values,
+                &mut self.enc_buf,
+            )?;
+            for (idx, entries) in def.indexes.iter().zip(&mut pending) {
+                entries.push(catalog::resolved_index_entry(&def, values, idx, rowid)?);
+            }
+            n += 1;
+        }
+        self.rowid_cache.insert(def.table_id, next);
+        for (idx, mut entries) in def.indexes.iter().zip(pending) {
+            self.data_root =
+                catalog::flush_index_entries(&mut self.ts, self.data_root, idx, &mut entries)?;
+        }
+        Ok(n)
+    }
+
     /// Sobrescribe una fila. `false` si el rowid no existe.
     pub fn update_row(&mut self, table: &TableDef, rowid: i64, values: &[Value]) -> Result<bool> {
         let (root, ok) = catalog::update_row(&mut self.ts, self.data_root, table, rowid, values)?;

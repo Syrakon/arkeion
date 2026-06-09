@@ -559,6 +559,53 @@ impl Connection {
         })
     }
 
+    /// Carga masiva: inserta todas las filas de `rows` en `table` en **una
+    /// transacción** (1 fsync), saltándose el executor SQL por fila. Cada fila
+    /// son los valores en orden de columnas; las ausentes al final toman su
+    /// DEFAULT (o NULL) y el alias del rowid admite NULL (autoasignado) o un
+    /// entero explícito, como el INSERT normal. Los índices de la tabla se
+    /// mantienen (las entradas se insertan en bloque, con dup-check UNIQUE).
+    ///
+    /// Solo en autocommit (fuera de `BEGIN`): **o se confirma el lote entero o
+    /// no queda nada** — esa atomicidad es la que permite diferir las entradas
+    /// de índice con seguridad. Devuelve el número de filas insertadas.
+    ///
+    /// ```
+    /// use arkeion::{Database, Options, Value};
+    ///
+    /// let dir = tempfile::tempdir().unwrap();
+    /// let db = Database::open(dir.path().join("t.arkeion"), Options::default()).unwrap();
+    /// let conn = db.connect().unwrap();
+    /// conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER NOT NULL)", &[])
+    ///     .unwrap();
+    /// let filas = conn
+    ///     .bulk_insert("t", (1..=1000i64).map(|i| [Value::Integer(i), Value::Integer(i * 2)]))
+    ///     .unwrap();
+    /// assert_eq!(filas, 1000);
+    /// let n = conn.query("SELECT COUNT(*) FROM t", &[]).unwrap().count();
+    /// assert_eq!(n, 1);
+    /// ```
+    pub fn bulk_insert<I, R>(&self, table: &str, rows: I) -> Result<usize>
+    where
+        I: IntoIterator<Item = R>,
+        R: AsRef<[Value]>,
+    {
+        if self.pinned.is_some() {
+            return Err(sql_err(
+                "conexión de solo lectura (snapshot histórico): no admite escrituras",
+            ));
+        }
+        if self.open_tx.borrow().is_some() {
+            return Err(sql_err(
+                "bulk_insert requiere autocommit: dentro de BEGIN usa INSERT",
+            ));
+        }
+        let mut tx = self.store.begin_on(&self.branch)?;
+        let n = tx.insert_rows(table, rows)?;
+        tx.commit()?;
+        Ok(n)
+    }
+
     /// Transacción explícita multi-sentencia. Adquiere el escritor único:
     /// si ya hay una escritura en curso (incluido un `BEGIN` SQL en esta
     /// misma conexión), devuelve [`Error::Busy`].

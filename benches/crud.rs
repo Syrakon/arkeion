@@ -34,7 +34,7 @@
 
 use std::time::{Duration, Instant};
 
-use arkeion::{Database, Options, params};
+use arkeion::{Database, Options, Value, params};
 
 const CREATE: &str = "CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER NOT NULL)";
 
@@ -137,6 +137,24 @@ fn run_arkeion(durable_n: i64, bulk_n: i64, scan_reps: i64) -> Vec<(&'static str
                 ins.execute(&params![i, i * 2]).unwrap();
             }
             conn.execute("COMMIT", &[]).unwrap();
+            ops(bulk_n, t.elapsed())
+        }),
+    ));
+
+    // 2b) INSERT por lote vía bulk-load API (un commit, sin executor SQL por fila).
+    out.push((
+        "insert lote (bulk API)",
+        median_of(DURABLE_REPS, || {
+            let dir = bench_dir();
+            let db = Database::open(dir.path().join("c.arkeion"), Options::default()).unwrap();
+            let conn = db.connect().unwrap();
+            conn.execute(CREATE, &[]).unwrap();
+            let t = Instant::now();
+            conn.bulk_insert(
+                "t",
+                (1..=bulk_n).map(|i| [Value::Integer(i), Value::Integer(i * 2)]),
+            )
+            .unwrap();
             ops(bulk_n, t.elapsed())
         }),
     ));
@@ -340,6 +358,28 @@ fn run_sqlite(durable_n: i64, bulk_n: i64, scan_reps: i64) -> Vec<(&'static str,
         median_of(DURABLE_REPS, || {
             let dir = bench_dir();
             let conn = open(dir.path().join("b.sqlite"));
+            let t = Instant::now();
+            {
+                let tx = conn.unchecked_transaction().unwrap();
+                {
+                    let mut ins = tx.prepare("INSERT INTO t (id, n) VALUES (?1, ?2)").unwrap();
+                    for i in 1..=bulk_n {
+                        ins.execute(rusqlite::params![i, i * 2]).unwrap();
+                    }
+                }
+                tx.commit().unwrap();
+            }
+            ops(bulk_n, t.elapsed())
+        }),
+    ));
+
+    // 2b) "bulk API": SQLite no tiene una API aparte — su carga masiva idiomática
+    // ES la transacción con sentencia preparada, así que se mide igual que el lote.
+    out.push((
+        "insert lote (bulk API)",
+        median_of(DURABLE_REPS, || {
+            let dir = bench_dir();
+            let conn = open(dir.path().join("c.sqlite"));
             let t = Instant::now();
             {
                 let tx = conn.unchecked_transaction().unwrap();

@@ -3,8 +3,9 @@
 Ergonomía objetivo: que quien viene de `rusqlite` se sienta en casa en cinco minutos, y que las
 capacidades de versionado (time-travel, ramas, auditoría) sean de primera clase, no un añadido.
 
-Paquete: `arkeion` en crates.io — libre a fecha 2026-06-07; conviene reservarlo pronto con una
-publicación placeholder `0.0.1`.
+Paquete: [`arkeion` en crates.io](https://crates.io/crates/arkeion) — nombre reservado con un
+placeholder `0.0.1` (2026-06-07) y publicado de verdad desde `0.10.0` (2026-06-10; el *minor*
+sigue los hitos M0–M10).
 
 ## Tipos principales
 

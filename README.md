@@ -68,7 +68,9 @@ assert_eq!(antes.next().unwrap()?.get::<i64>(0)?, 1); // solo la factura previa 
 
 **Motor funcional — hitos M0 a M10 + índices secundarios + bulk-load y lecturas en streaming,
 implementados y testeados** (259 tests, `clippy -D warnings`, `#![forbid(unsafe_code)]`). **Pre-1.0**:
-el formato puede cambiar y no hay release de producción todavía. La especificación completa vive en
+el formato puede cambiar y no hay release de producción todavía. La versión de
+[crates.io](https://crates.io/crates/arkeion) arranca en **0.10.x** porque refleja los hitos
+completados (M0–M10); `1.0.0` significará una sola cosa: **formato en disco congelado**. La especificación completa vive en
 [`docs/`](docs/):
 
 | Doc | Contenido |

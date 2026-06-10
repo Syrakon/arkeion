@@ -199,10 +199,13 @@ compresión y, opcional, corrección Reed-Solomon.
 
 ## Licencia
 
-[TSAL-1.0](LICENSE) (Torii Source-Available License): el código es libre para uso personal,
-educativo, investigación y evaluación; el uso en producción por organizaciones requiere licencia
-comercial. Cada versión pasa automáticamente a **Apache 2.0** a los diez años de su publicación —
-modelo *source-available* diferido, alineado con la EU Open Source Strategy.
+Doble licencia, a tu elección — la convención del ecosistema Rust:
+
+- [Licencia MIT](LICENSE-MIT)
+- [Licencia Apache 2.0](LICENSE-APACHE)
+
+Salvo indicación explícita en contra, toda contribución enviada para su inclusión queda bajo
+esa misma doble licencia, sin términos ni condiciones adicionales.
 
 ## Contribuir
 

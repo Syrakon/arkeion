@@ -29,6 +29,6 @@ contra el porqué, no contra la decisión.
 
 ## Licencia de las contribuciones
 
-Al enviar una contribución aceptas el
-[Developer Certificate of Origin 1.1](https://developercertificate.org/) y que tu contribución
-se licencie según la sección 6 de la [LICENSE](LICENSE).
+Salvo que indiques explícitamente lo contrario, toda contribución que envíes para su inclusión
+en el proyecto queda bajo la doble licencia [MIT](LICENSE-MIT) o [Apache 2.0](LICENSE-APACHE),
+tal y como define la licencia Apache 2.0, sin términos ni condiciones adicionales.

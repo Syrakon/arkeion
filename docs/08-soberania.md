@@ -54,9 +54,9 @@ Un fork de SQLite/libSQL habría sido más rápido. Se descartó porque:
 
 ## Alineamiento con la estrategia UE
 
-- **EU Open Source Strategy**: licencia [TSAL-1.0](../LICENSE) → Apache 2.0 diferido (cada
-  versión a los diez años), especificación de formato pública, sin lock-in: los datos siempre
-  exportables.
+- **EU Open Source Strategy**: licencia abierta de verdad (doble
+  [MIT](../LICENSE-MIT)/[Apache 2.0](../LICENSE-APACHE), aprobadas por la OSI), especificación
+  de formato pública, sin lock-in: los datos siempre exportables.
 - **Technological Sovereignty Package (jun. 2026)**: Arkeion encaja en la capa de
   infraestructura de datos *made in Europe, for Europe* — candidato natural a programas de
   financiación/adopción pública de OSS europeo.

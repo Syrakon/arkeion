@@ -13,7 +13,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use crate::commit::Head;
-use crate::compress::{Compressor, LzH, METHOD_RAW};
+use crate::compress::{Compressor, Densa, METHOD_RAW};
 use crate::crypto::{Aes256GcmProvider, CryptoProvider, Key, PlainProvider};
 use crate::ecc;
 use crate::error::{Error, Result};
@@ -360,7 +360,7 @@ impl Pager {
         // que cambiar de backend no rompe las páginas ya escritas. Off ⇒ formato
         // sin byte de método (idéntico a A2).
         let compressor: Option<Arc<dyn Compressor>> =
-            (header.flags & FLAG_COMPRESSED != 0).then(|| Arc::new(LzH) as Arc<dyn Compressor>);
+            (header.flags & FLAG_COMPRESSED != 0).then(|| Arc::new(Densa) as Arc<dyn Compressor>);
 
         let pager = Pager {
             file,

@@ -198,8 +198,8 @@ una constante). **Motor-a-motor en modo por defecto: 4.2 MB (arkeion) vs 2.8 MB 
 único b-tree para tablas/índices/catálogo) frente al rowid varint de 1–3 B de SQLite; el resto es el
 byte de flags y la longitud de clave de la celda genérica. El array de punteros v3 (2 B/celda) y la
 reserva cripto por página (28 B) son marginales. Las hojas ya van casi llenas (split sesgado a la derecha
-en inserción secuencial, como SQLite). La compresión opcional usa **LZSS + un codificador de rango
-adaptativo** (pure-Rust, sin deps); SQLite **también** admite compresión (sqlite-zstd, ZIPVFS/CEROD),
+en inserción secuencial, como SQLite). La compresión opcional usa **Densa** (LZSS + un codificador de
+rango adaptativo, pure-Rust, sin deps); SQLite **también** admite compresión (sqlite-zstd, ZIPVFS/CEROD),
 tampoco por defecto. Lo que arkeion sí conserva y SQLite no:
 **historia CoW** (coste explícito, recuperable con `vacuum`), `verify()` y `AS OF`, manteniendo la
 compresión y, opcional, corrección Reed-Solomon.

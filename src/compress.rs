@@ -14,8 +14,8 @@ use crate::format::{put_varint, take_varint};
 pub const METHOD_RAW: u8 = 0;
 /// LZSS pelado ([`Lz`]).
 pub const METHOD_LZ: u8 = 1;
-/// LZSS + etapa de entropía (coder de rango adaptativo) ([`LzH`]).
-pub const METHOD_LZH: u8 = 2;
+/// LZSS + etapa de entropía (coder de rango adaptativo) ([`Densa`]).
+pub const METHOD_DENSA: u8 = 2;
 
 /// Transforma el body de una página para ahorrar espacio. Como `CryptoProvider`
 /// (D8), el motor habla solo con el trait: el algoritmo es sustituible (incluso
@@ -71,17 +71,17 @@ impl Compressor for Lz {
     }
 }
 
-/// LZSS **+ etapa de entropía sin cabecera** (pure-Rust, sin deps, fiel a D8): el
-/// LZSS deja los literales a 1 byte crudo y los códigos de match con layout fijo;
-/// un codificador de rango **adaptativo** sobre esa salida exprime sus
-/// distribuciones sesgadas. Clave a 4 KiB: el modelo arranca uniforme y se adapta
-/// símbolo a símbolo, así que **no paga tabla por página** (la cabecera es lo que
-/// hace perder a un Huffman estático en bloques pequeños). Cada página elige entre
-/// **crudo**, **LZSS** y **LZSS+rango** el más pequeño (nunca inflar); la salida
-/// lleva un sub-tag (0 = LZSS, 1 = LZSS+rango) que el `decompress` deshace.
-pub struct LzH;
+/// **Densa** — LZSS **+ etapa de entropía sin cabecera** (pure-Rust, sin deps,
+/// fiel a D8): el LZSS deja los literales a 1 byte crudo y los códigos de match
+/// con layout fijo; un codificador de rango **adaptativo** sobre esa salida
+/// exprime sus distribuciones sesgadas. Clave a 4 KiB: el modelo arranca uniforme
+/// y se adapta símbolo a símbolo, así que **no paga tabla por página** (la cabecera
+/// es lo que hace perder a un Huffman estático en bloques pequeños). Cada página
+/// elige entre **crudo**, **LZSS** y **LZSS+rango** el más pequeño (nunca inflar);
+/// la salida lleva un sub-tag (0 = LZSS, 1 = LZSS+rango) que el `decompress` deshace.
+pub struct Densa;
 
-impl Compressor for LzH {
+impl Compressor for Densa {
     fn compress(&self, body: &[u8]) -> Option<Vec<u8>> {
         let lz = lz_compress(body);
         // Sub-tag 0 = solo LZSS. Probamos la etapa de entropía sobre la salida
@@ -110,7 +110,7 @@ impl Compressor for LzH {
     }
 
     fn method(&self) -> u8 {
-        METHOD_LZH
+        METHOD_DENSA
     }
 }
 
@@ -622,22 +622,22 @@ mod tests {
         assert_eq!(rc_decompress(&bad).map(|v| v.len()), Some(100));
     }
 
-    /// El códec combinado `LzH` round-trip sobre las muestras, nunca infla, y
+    /// El códec combinado `Densa` round-trip sobre las muestras, nunca infla, y
     /// gana o iguala a `Lz` pelado (la etapa de entropía solo se adopta si ayuda).
     #[test]
-    fn lzh_roundtrip_never_inflates_and_dominates_lz() {
+    fn densa_roundtrip_never_inflates_and_dominates_lz() {
         let lz = Lz;
-        let lzh = LzH;
+        let densa = Densa;
         for (i, s) in samples().iter().enumerate() {
-            match lzh.compress(s) {
+            match densa.compress(s) {
                 Some(c) => {
-                    assert_eq!(lzh.decompress(&c).as_deref(), Some(&s[..]), "muestra {i}");
+                    assert_eq!(densa.decompress(&c).as_deref(), Some(&s[..]), "muestra {i}");
                     assert!(c.len() < s.len(), "muestra {i}: no debe inflar");
-                    // LzH ≤ Lz (+1 del sub-tag): nunca peor que el LZSS pelado.
+                    // Densa ≤ Lz (+1 del sub-tag): nunca peor que el LZSS pelado.
                     if let Some(only_lz) = lz.compress(s) {
                         assert!(
                             c.len() <= only_lz.len() + 1,
-                            "muestra {i}: LzH {} debería ≤ Lz {}+1",
+                            "muestra {i}: Densa {} debería ≤ Lz {}+1",
                             c.len(),
                             only_lz.len()
                         );
@@ -645,7 +645,7 @@ mod tests {
                 }
                 None => assert!(
                     lz.compress(s).is_none(),
-                    "muestra {i}: si Lz gana, LzH también"
+                    "muestra {i}: si Lz gana, Densa también"
                 ),
             }
         }

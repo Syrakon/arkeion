@@ -198,7 +198,7 @@ solo añade un índice.
 commit (`publish_commit`), así que hereda el framing y el directorio en cuanto A
 está hecho.
 
-## Etapa de entropía (`LzH`): por qué de rango y no Huffman
+## Etapa de entropía (`Densa`): por qué de rango y no Huffman
 
 El LZSS de Slice B deja los **literales a 1 byte crudo** y los códigos de match
 con layout fijo; sus distribuciones siguen sesgadas, así que una segunda pasada
@@ -210,7 +210,7 @@ gana en 0 de 400 páginas, incluso infla 0.1%—.
 
 La solución es un coder **sin cabecera**: un **codificador de rango adaptativo**
 (orden 0, Subbotin carryless). El modelo de frecuencias arranca uniforme y se
-adapta símbolo a símbolo, así que no paga tabla por página. `LzH` aplica el coder
+adapta símbolo a símbolo, así que no paga tabla por página. `Densa` aplica el coder
 sobre la salida LZSS y, por página, elige el menor de **{crudo, LZSS,
 LZSS+rango}** (nunca inflar). Resultados medidos:
 
@@ -225,4 +225,4 @@ LZSS+rango}** (nunca inflar). Resultados medidos:
 compara antes de adoptar la etapa de rango), así que un bug del coder jamás
 corrompe una página —en el peor caso se descarta la entropía y queda el LZSS—.
 Sigue siendo pure-Rust, sin dependencias (D8). El tag de método es **por página**
-(`METHOD_LZH`), así que el backend convive con los anteriores sin migrar nada.
+(`METHOD_DENSA`), así que el backend convive con los anteriores sin migrar nada.

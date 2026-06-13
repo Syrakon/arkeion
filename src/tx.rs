@@ -20,7 +20,7 @@ use sha2::{Digest, Sha256};
 use crate::btree::{self, Body, Cursor, NodeSource, NodeStore};
 use crate::catalog::{self, IndexDef, TableDef, TableScan, TableSpec};
 use crate::commit::{self, COMMIT_FLAG_CHECKPOINT, CommitHeader, Head};
-use crate::compress::{Compressor, LzH};
+use crate::compress::{Compressor, Densa};
 use crate::crypto::Key;
 use crate::error::{Error, Result};
 use crate::format::{MIN_RECORD_LEN, PageBuf, PageId};
@@ -199,7 +199,7 @@ impl Store {
         ecc_nsym: u8,
         cache_pages: usize,
     ) -> Result<Store> {
-        let compressor = compress.then(|| Arc::new(LzH) as Arc<dyn Compressor>);
+        let compressor = compress.then(|| Arc::new(Densa) as Arc<dyn Compressor>);
         let pager = Pager::create_with_crypto(
             path,
             key.is_some(),

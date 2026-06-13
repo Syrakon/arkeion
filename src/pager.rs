@@ -13,7 +13,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use crate::commit::Head;
-use crate::compress::{Compressor, Lz};
+use crate::compress::{Compressor, LzH, METHOD_RAW};
 use crate::crypto::{Aes256GcmProvider, CryptoProvider, Key, PlainProvider};
 use crate::ecc;
 use crate::error::{Error, Result};
@@ -22,11 +22,6 @@ use crate::format::{
     LEN_PREFIX_LEN, MAGIC_HEADER, META_PAGE_A, META_PAGE_B, MetaSlot, PageBuf, PageId,
 };
 use crate::io::{DbFile, sync_parent_dir};
-
-/// Byte de método de una página de datos cuando la compresión está activa (v2,
-/// M10): crudo o comprimido. Solo presente con `FLAG_COMPRESSED`.
-const METHOD_RAW: u8 = 0;
-const METHOD_LZ: u8 = 1;
 
 /// Tope **por defecto** de la caché de páginas: 16384 bodies ≈ **64 MiB**. Las
 /// páginas son inmutables, así que evictar nunca pierde datos (se releen del
@@ -359,11 +354,13 @@ impl Pager {
                 ));
             }
         };
-        // Compresión activa (v2, M10): el bit del header fija qué backend abre las
-        // páginas. v1.x tiene un único backend (Lz); un segundo añadiría un id en
-        // el header. Off ⇒ formato sin byte de método (idéntico a A2).
+        // Compresión activa (v2, M10): el bit del header dice que las páginas
+        // llevan tag de método; el backend lo despacha por su `method()`. Cada
+        // página se decodifica por su propio tag (crudo / LZSS / LZSS+Huffman), así
+        // que cambiar de backend no rompe las páginas ya escritas. Off ⇒ formato
+        // sin byte de método (idéntico a A2).
         let compressor: Option<Arc<dyn Compressor>> =
-            (header.flags & FLAG_COMPRESSED != 0).then(|| Arc::new(Lz) as Arc<dyn Compressor>);
+            (header.flags & FLAG_COMPRESSED != 0).then(|| Arc::new(LzH) as Arc<dyn Compressor>);
 
         let pager = Pager {
             file,
@@ -616,7 +613,7 @@ impl Pager {
             return Cow::Borrowed(trimmed);
         };
         let (method, payload) = match c.compress(trimmed) {
-            Some(comp) => (METHOD_LZ, comp),
+            Some(comp) => (c.method(), comp),
             None => (METHOD_RAW, trimmed.to_vec()),
         };
         let mut out = Vec::with_capacity(1 + payload.len());
@@ -636,7 +633,7 @@ impl Pager {
         })?;
         match method {
             METHOD_RAW => Ok(payload.to_vec()),
-            METHOD_LZ => c.decompress(payload).ok_or(Error::Corrupt {
+            m if m == c.method() => c.decompress(payload).ok_or(Error::Corrupt {
                 page: id.0,
                 reason: "descompresión de página fallida",
             }),

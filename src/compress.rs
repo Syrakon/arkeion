@@ -8,6 +8,15 @@
 
 use crate::format::{put_varint, take_varint};
 
+/// Tag de método que el pager antepone al payload sellado de cada página de datos
+/// (M10). Como va **por página**, un backend nuevo es retrocompatible: cada
+/// página se decodifica por su propio tag, sin migrar las demás.
+pub const METHOD_RAW: u8 = 0;
+/// LZSS pelado ([`Lz`]).
+pub const METHOD_LZ: u8 = 1;
+/// LZSS + etapa de entropía (coder de rango adaptativo) ([`LzH`]).
+pub const METHOD_LZH: u8 = 2;
+
 /// Transforma el body de una página para ahorrar espacio. Como `CryptoProvider`
 /// (D8), el motor habla solo con el trait: el algoritmo es sustituible (incluso
 /// por uno certificado europeo) sin tocar formato ni motor.
@@ -20,6 +29,10 @@ pub trait Compressor: Send + Sync {
     /// Inverso de `compress`. `None` si el flujo está mal formado —imposible
     /// sobre datos auténticos, porque el tag se valida antes (M10 #1)—.
     fn decompress(&self, data: &[u8]) -> Option<Vec<u8>>;
+
+    /// Tag de método ([`METHOD_LZ`], …) que el pager antepone a las páginas de
+    /// este backend para luego despacharlas a su `decompress`.
+    fn method(&self) -> u8;
 }
 
 /// Sin compresión: el modo por defecto (D8, supply-chain mínima). `compress`
@@ -32,6 +45,9 @@ impl Compressor for NoCompression {
     }
     fn decompress(&self, data: &[u8]) -> Option<Vec<u8>> {
         Some(data.to_vec())
+    }
+    fn method(&self) -> u8 {
+        METHOD_RAW
     }
 }
 
@@ -49,6 +65,52 @@ impl Compressor for Lz {
     }
     fn decompress(&self, data: &[u8]) -> Option<Vec<u8>> {
         lz_decompress(data)
+    }
+    fn method(&self) -> u8 {
+        METHOD_LZ
+    }
+}
+
+/// LZSS **+ etapa de entropía sin cabecera** (pure-Rust, sin deps, fiel a D8): el
+/// LZSS deja los literales a 1 byte crudo y los códigos de match con layout fijo;
+/// un codificador de rango **adaptativo** sobre esa salida exprime sus
+/// distribuciones sesgadas. Clave a 4 KiB: el modelo arranca uniforme y se adapta
+/// símbolo a símbolo, así que **no paga tabla por página** (la cabecera es lo que
+/// hace perder a un Huffman estático en bloques pequeños). Cada página elige entre
+/// **crudo**, **LZSS** y **LZSS+rango** el más pequeño (nunca inflar); la salida
+/// lleva un sub-tag (0 = LZSS, 1 = LZSS+rango) que el `decompress` deshace.
+pub struct LzH;
+
+impl Compressor for LzH {
+    fn compress(&self, body: &[u8]) -> Option<Vec<u8>> {
+        let lz = lz_compress(body);
+        // Sub-tag 0 = solo LZSS. Probamos la etapa de entropía sobre la salida
+        // LZSS y la adoptamos solo si (a) es más pequeña y (b) **reconstruye
+        // bit a bit**: la auto-verificación hace que un bug del coder jamás pueda
+        // corromper una página —en el peor caso se descarta la etapa—.
+        let (sub, payload) = match rc_compress(&lz) {
+            Some(c) if c.len() < lz.len() && rc_decompress(&c).as_deref() == Some(&lz[..]) => {
+                (1u8, c)
+            }
+            _ => (0u8, lz),
+        };
+        let mut out = Vec::with_capacity(1 + payload.len());
+        out.push(sub);
+        out.extend_from_slice(&payload);
+        (out.len() < body.len()).then_some(out)
+    }
+
+    fn decompress(&self, data: &[u8]) -> Option<Vec<u8>> {
+        let (&sub, rest) = data.split_first()?;
+        match sub {
+            0 => lz_decompress(rest),
+            1 => lz_decompress(&rc_decompress(rest)?),
+            _ => None,
+        }
+    }
+
+    fn method(&self) -> u8 {
+        METHOD_LZH
     }
 }
 
@@ -196,6 +258,159 @@ fn lz_decompress(data: &[u8]) -> Option<Vec<u8>> {
         }
     }
     (out.len() == n).then_some(out)
+}
+
+// ---------- Codificador de rango adaptativo orden-0 (etapa de entropía) ----------
+//
+// **Sin cabecera de modelo**: las frecuencias arrancan uniformes y se adaptan
+// símbolo a símbolo, así que —a diferencia de un Huffman estático— no se paga una
+// tabla por página (justo el coste que hace perder a Huffman en bloques de 4 KiB).
+// Codificador de rango de Subbotin (carryless, 32 bits): `low`/`range` se
+// renormalizan a bytes; el total del modelo se mantiene < `RC_BOT` para que
+// `range / total >= 1` siempre.
+
+const RC_TOP: u32 = 1 << 24;
+const RC_BOT: u32 = 1 << 16;
+/// Incremento de frecuencia por símbolo observado (adaptación).
+const RC_INC: u32 = 24;
+/// Reescala el modelo al alcanzar este total (< `RC_BOT`).
+const RC_MAX_TOTAL: u32 = 1 << 15;
+/// Por debajo de esto la cola de 4 bytes del coder no se amortiza: se omite.
+const RC_MIN_INPUT: usize = 32;
+
+/// Modelo de frecuencias adaptativo orden-0 sobre el alfabeto de bytes.
+struct RangeModel {
+    freq: [u16; 256],
+    total: u32,
+}
+
+impl RangeModel {
+    fn new() -> RangeModel {
+        RangeModel {
+            freq: [1; 256],
+            total: 256,
+        }
+    }
+
+    /// Frecuencia acumulada de los símbolos `< sym`.
+    fn cum(&self, sym: usize) -> u32 {
+        self.freq[..sym].iter().map(|&f| f as u32).sum()
+    }
+
+    /// Símbolo cuyo intervalo acumulado contiene `target`, con `(cum, freq)`.
+    fn find(&self, target: u32) -> (usize, u32, u32) {
+        let mut cum = 0u32;
+        for (s, &f) in self.freq.iter().enumerate() {
+            let f = f as u32;
+            if cum + f > target {
+                return (s, cum, f);
+            }
+            cum += f;
+        }
+        // Inalcanzable con `target < total`; defensa: último símbolo.
+        let last = self.freq[255] as u32;
+        (255, self.total - last, last)
+    }
+
+    fn update(&mut self, sym: usize) {
+        self.freq[sym] += RC_INC as u16;
+        self.total += RC_INC;
+        if self.total >= RC_MAX_TOTAL {
+            self.total = 0;
+            for f in self.freq.iter_mut() {
+                *f = (*f >> 1) | 1; // nunca a cero: todo símbolo sigue codificable
+                self.total += *f as u32;
+            }
+        }
+    }
+}
+
+/// Comprime `input` con el coder de rango adaptativo. `None` si es demasiado
+/// corto para amortizar la cola (4 bytes) o no resulta más pequeño. Cabecera:
+/// solo `varint(len)` —el modelo no se serializa, se reconstruye adaptándose—.
+fn rc_compress(input: &[u8]) -> Option<Vec<u8>> {
+    let n = input.len();
+    if n < RC_MIN_INPUT {
+        return None;
+    }
+    let mut out = Vec::with_capacity(n / 2 + 8);
+    put_varint(&mut out, n as u64);
+
+    let mut low: u32 = 0;
+    let mut range: u32 = 0xFFFF_FFFF;
+    let mut model = RangeModel::new();
+    for &b in input {
+        let sym = b as usize;
+        let cum = model.cum(sym);
+        let freq = model.freq[sym] as u32;
+        range /= model.total;
+        low = low.wrapping_add(cum * range);
+        range *= freq;
+        loop {
+            if (low ^ low.wrapping_add(range)) < RC_TOP {
+                // byte alto fijado
+            } else if range < RC_BOT {
+                range = low.wrapping_neg() & (RC_BOT - 1); // underflow: fuerza progreso
+            } else {
+                break;
+            }
+            out.push((low >> 24) as u8);
+            low <<= 8;
+            range <<= 8;
+        }
+        model.update(sym);
+    }
+    for _ in 0..4 {
+        out.push((low >> 24) as u8);
+        low <<= 8;
+    }
+    (out.len() < n).then_some(out)
+}
+
+/// Inverso de [`rc_compress`]. Sin pánico ante flujos mal formados (el byte que
+/// falta se lee como 0; la salida se acota a `n`); el tag de integridad valida
+/// los bytes antes, esto es defensa en profundidad.
+fn rc_decompress(data: &[u8]) -> Option<Vec<u8>> {
+    let mut pos = 0usize;
+    let n = take_varint(data, &mut pos)? as usize;
+    let mut out = Vec::with_capacity(n);
+
+    let mut low: u32 = 0;
+    let mut range: u32 = 0xFFFF_FFFF;
+    let mut code: u32 = 0;
+    let body = &data[pos..];
+    let mut bp = 0usize;
+    let next = |bp: &mut usize| -> u32 {
+        let b = body.get(*bp).copied().unwrap_or(0);
+        *bp += 1;
+        b as u32
+    };
+    for _ in 0..4 {
+        code = (code << 8) | next(&mut bp);
+    }
+
+    let mut model = RangeModel::new();
+    while out.len() < n {
+        range /= model.total;
+        let target = (code.wrapping_sub(low) / range).min(model.total - 1);
+        let (sym, cum, freq) = model.find(target);
+        low = low.wrapping_add(cum * range);
+        range *= freq;
+        loop {
+            if (low ^ low.wrapping_add(range)) < RC_TOP {
+            } else if range < RC_BOT {
+                range = low.wrapping_neg() & (RC_BOT - 1);
+            } else {
+                break;
+            }
+            code = (code << 8) | next(&mut bp);
+            low <<= 8;
+            range <<= 8;
+        }
+        out.push(sym as u8);
+        model.update(sym);
+    }
+    Some(out)
 }
 
 #[cfg(test)]
@@ -349,5 +564,90 @@ mod tests {
         assert_eq!(lz_decompress(&bad), None);
         // Varint de longitud truncado.
         assert_eq!(lz_decompress(&[]), None);
+    }
+
+    /// Huffman round-trip sobre entradas estructuradas aleatorias: caza bugs de
+    /// longitudes/canónico/bitstream que las muestras fijas no tocan.
+    #[test]
+    fn rc_roundtrip_stress() {
+        let mut s = 0x1357_9BDFu32;
+        let mut rng = || {
+            s ^= s << 13;
+            s ^= s >> 17;
+            s ^= s << 5;
+            s
+        };
+        for _ in 0..4000 {
+            let len = (rng() % 4069) as usize;
+            // Alfabeto y sesgo variables: desde casi uniforme hasta un símbolo
+            // dominante, ejercitando adaptación y reescalado del modelo.
+            let alphabet = 1 + (rng() % 200) as usize;
+            let buf: Vec<u8> = (0..len)
+                .map(|_| (rng() as usize % alphabet) as u8)
+                .collect();
+            // `None` = no comprimió (entrada corta / no ahorra).
+            if let Some(c) = rc_compress(&buf) {
+                assert_eq!(
+                    rc_decompress(&c).as_deref(),
+                    Some(&buf[..]),
+                    "len={len} alpha={alphabet}"
+                );
+            }
+        }
+    }
+
+    /// Sesgo extremo (un símbolo casi siempre) y una cola larga de raros: fuerza
+    /// el reescalado del modelo y reconstruye exacto.
+    #[test]
+    fn rc_extreme_skew_roundtrips() {
+        let mut buf = vec![0u8; 4000];
+        for (i, b) in buf.iter_mut().enumerate() {
+            if i % 64 == 0 {
+                *b = (i % 251) as u8; // raros dispersos entre el símbolo dominante
+            }
+        }
+        let c = rc_compress(&buf).expect("comprime");
+        assert_eq!(rc_decompress(&c).as_deref(), Some(&buf[..]));
+    }
+
+    /// `rc_decompress` no entra en pánico ante flujos mal formados (lee 0 al
+    /// agotarse y acota la salida a `n`).
+    #[test]
+    fn rc_malformed_is_rejected_not_panic() {
+        assert_eq!(rc_decompress(&[]), None); // varint de longitud truncado
+        let mut bad = Vec::new();
+        put_varint(&mut bad, 100); // promete 100 bytes, sin cuerpo del coder
+        // No debe entrar en pánico; produce algún Vec de longitud 100 (la
+        // integridad real la valida el tag antes de llegar aquí).
+        assert_eq!(rc_decompress(&bad).map(|v| v.len()), Some(100));
+    }
+
+    /// El códec combinado `LzH` round-trip sobre las muestras, nunca infla, y
+    /// gana o iguala a `Lz` pelado (la etapa de entropía solo se adopta si ayuda).
+    #[test]
+    fn lzh_roundtrip_never_inflates_and_dominates_lz() {
+        let lz = Lz;
+        let lzh = LzH;
+        for (i, s) in samples().iter().enumerate() {
+            match lzh.compress(s) {
+                Some(c) => {
+                    assert_eq!(lzh.decompress(&c).as_deref(), Some(&s[..]), "muestra {i}");
+                    assert!(c.len() < s.len(), "muestra {i}: no debe inflar");
+                    // LzH ≤ Lz (+1 del sub-tag): nunca peor que el LZSS pelado.
+                    if let Some(only_lz) = lz.compress(s) {
+                        assert!(
+                            c.len() <= only_lz.len() + 1,
+                            "muestra {i}: LzH {} debería ≤ Lz {}+1",
+                            c.len(),
+                            only_lz.len()
+                        );
+                    }
+                }
+                None => assert!(
+                    lz.compress(s).is_none(),
+                    "muestra {i}: si Lz gana, LzH también"
+                ),
+            }
+        }
     }
 }

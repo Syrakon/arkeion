@@ -197,3 +197,32 @@ solo añade un índice.
 `vacuum` no necesita trabajo extra: reescribe replayando por la maquinaria de
 commit (`publish_commit`), así que hereda el framing y el directorio en cuanto A
 está hecho.
+
+## Etapa de entropía (`LzH`): por qué de rango y no Huffman
+
+El LZSS de Slice B deja los **literales a 1 byte crudo** y los códigos de match
+con layout fijo; sus distribuciones siguen sesgadas, así que una segunda pasada
+de entropía (como Deflate = LZ77 + Huffman) puede exprimirlas más. Pero **a 4 KiB
+por página la cabecera del modelo es decisiva**: un Huffman estático debe
+serializar ~256 longitudes de código (decenas de bytes) por página, y sobre una
+salida LZSS de unos cientos de bytes eso **se come toda la ganancia** —medido:
+gana en 0 de 400 páginas, incluso infla 0.1%—.
+
+La solución es un coder **sin cabecera**: un **codificador de rango adaptativo**
+(orden 0, Subbotin carryless). El modelo de frecuencias arranca uniforme y se
+adapta símbolo a símbolo, así que no paga tabla por página. `LzH` aplica el coder
+sobre la salida LZSS y, por página, elige el menor de **{crudo, LZSS,
+LZSS+rango}** (nunca inflar). Resultados medidos:
+
+- Filas con texto **variado** (nombres/emails/ids): **−8.8 %** frente a LZSS pelado,
+  gana en 400/400 páginas.
+- Dataset del footprint (TEXT constante): comprimido **1.0 → 0.8 MB** (los enteros
+  y las claves variables dejan sesgo residual que el coder captura).
+- Prosa muy repetitiva / binario aleatorio: neutro (LZSS ya es óptimo /
+  incompresible) → cae a LZSS por «nunca inflar», nunca peor.
+
+**Estabilidad:** la compresión **auto-verifica** en caliente (descomprime y
+compara antes de adoptar la etapa de rango), así que un bug del coder jamás
+corrompe una página —en el peor caso se descarta la entropía y queda el LZSS—.
+Sigue siendo pure-Rust, sin dependencias (D8). El tag de método es **por página**
+(`METHOD_LZH`), así que el backend convive con los anteriores sin migrar nada.

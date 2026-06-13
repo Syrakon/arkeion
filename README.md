@@ -185,17 +185,22 @@ tamper-evidence como arkeion**, en una transacción (1 fsync). El foso inatacabl
 | | tamaño |
 |---|--:|
 | arkeion — insert (1 commit) | 4.2 MB |
-| arkeion — insert **comprimido** (opt-in) | 1.0 MB |
+| arkeion — insert **comprimido** (opt-in) | 0.8 MB |
 | arkeion — +1 update de todo (historia CoW retenida) | 8.4 MB |
 | arkeion — tras `vacuum KeepLast(1)` | 4.2 MB |
 | SQLite — insert (1 commit) | 2.8 MB |
 | SQLite — +1 update de todo (in-place, sin historia) | 2.8 MB |
 
-**Honestidad**: la fila de 1.0 MB compara el modo **comprimido (opcional, off por defecto)** de arkeion
+**Honestidad**: la fila de 0.8 MB compara el modo **comprimido (opcional, off por defecto)** de arkeion
 contra SQLite **sin** comprimir, y sobre un dataset deliberadamente muy comprimible (la columna TEXT es
 una constante). **Motor-a-motor en modo por defecto: 4.2 MB (arkeion) vs 2.8 MB (SQLite)** — arkeion
-~1.5× **mayor** por el array de punteros v3 + la cabecera por página. SQLite **también** admite
-compresión (sqlite-zstd, ZIPVFS/CEROD), tampoco por defecto. Lo que arkeion sí conserva y SQLite no:
+~1.5× **mayor**, dominado por la **clave de fila de 13 B** (`[0x01][table_id][rowid]`, el namespace de un
+único b-tree para tablas/índices/catálogo) frente al rowid varint de 1–3 B de SQLite; el resto es el
+byte de flags y la longitud de clave de la celda genérica. El array de punteros v3 (2 B/celda) y la
+reserva cripto por página (28 B) son marginales. Las hojas ya van casi llenas (split sesgado a la derecha
+en inserción secuencial, como SQLite). La compresión opcional usa **LZSS + un codificador de rango
+adaptativo** (pure-Rust, sin deps); SQLite **también** admite compresión (sqlite-zstd, ZIPVFS/CEROD),
+tampoco por defecto. Lo que arkeion sí conserva y SQLite no:
 **historia CoW** (coste explícito, recuperable con `vacuum`), `verify()` y `AS OF`, manteniendo la
 compresión y, opcional, corrección Reed-Solomon.
 

@@ -13,10 +13,9 @@
 use std::io::{self, Read, Write};
 use std::time::{Duration, UNIX_EPOCH};
 
-use arkeion::AsOf;
-use arkeion::Value;
 use arkeion::format::{put_varint, take_varint};
 use arkeion::record::{decode_values, encode_values};
+use arkeion::{AsOf, ChangeKind, Diff, RowChange, SchemaChange, Value};
 
 /// Versión del protocolo que habla esta build. El `Hello`/`Welcome` la negocian;
 /// una incompatibilidad se rechaza limpia en vez de malinterpretar bytes.
@@ -32,12 +31,16 @@ const REQ_USE_BRANCH: u8 = 2;
 const REQ_EXECUTE: u8 = 3;
 const REQ_QUERY: u8 = 4;
 const REQ_VERIFY: u8 = 5;
+const REQ_DIFF: u8 = 6;
+const REQ_MERGE: u8 = 7;
 
 const RES_WELCOME: u8 = 1;
 const RES_AFFECTED: u8 = 2;
 const RES_ROWS: u8 = 3;
 const RES_AUDIT: u8 = 4;
 const RES_ERROR: u8 = 5;
+const RES_DIFF: u8 = 6;
+const RES_MERGED: u8 = 7;
 
 /// Error de protocolo: marco/cuerpo mal formado o E/S. Nunca se entrega un
 /// mensaje a medio decodificar.
@@ -168,6 +171,64 @@ fn take_asof(buf: &[u8], pos: &mut usize) -> Result<AsOf, ProtoError> {
     }
 }
 
+fn put_kind(out: &mut Vec<u8>, k: ChangeKind) {
+    out.push(match k {
+        ChangeKind::Added => 0,
+        ChangeKind::Removed => 1,
+        ChangeKind::Modified => 2,
+    });
+}
+
+fn take_kind(buf: &[u8], pos: &mut usize) -> Result<ChangeKind, ProtoError> {
+    match take_u8(buf, pos)? {
+        0 => Ok(ChangeKind::Added),
+        1 => Ok(ChangeKind::Removed),
+        2 => Ok(ChangeKind::Modified),
+        other => Err(ProtoError::BadTag(other)),
+    }
+}
+
+/// `Diff` de ramas: cambios de esquema `(tabla, kind)` y de fila
+/// `(table_id, rowid, kind)`. `rowid` es i64 fijo (8 B LE); el resto, varint.
+fn put_diff(out: &mut Vec<u8>, d: &Diff) {
+    put_varint(out, d.schema.len() as u64);
+    for sc in &d.schema {
+        put_str(out, &sc.table);
+        put_kind(out, sc.kind);
+    }
+    put_varint(out, d.rows.len() as u64);
+    for rc in &d.rows {
+        put_varint(out, rc.table_id as u64);
+        out.extend_from_slice(&rc.rowid.to_le_bytes());
+        put_kind(out, rc.kind);
+    }
+}
+
+fn take_diff(buf: &[u8], pos: &mut usize) -> Result<Diff, ProtoError> {
+    let nschema = take_varint_e(buf, pos)? as usize;
+    let mut schema = Vec::with_capacity(nschema);
+    for _ in 0..nschema {
+        schema.push(SchemaChange {
+            table: take_str(buf, pos)?,
+            kind: take_kind(buf, pos)?,
+        });
+    }
+    let nrows = take_varint_e(buf, pos)? as usize;
+    let mut rows = Vec::with_capacity(nrows);
+    for _ in 0..nrows {
+        let table_id = u32::try_from(take_varint_e(buf, pos)?).map_err(|_| ProtoError::BadValue)?;
+        let bytes = buf.get(*pos..*pos + 8).ok_or(ProtoError::Truncated)?;
+        let rowid = i64::from_le_bytes(bytes.try_into().expect("rango fijo de 8"));
+        *pos += 8;
+        rows.push(RowChange {
+            table_id,
+            rowid,
+            kind: take_kind(buf, pos)?,
+        });
+    }
+    Ok(Diff { schema, rows })
+}
+
 // --- mensajes cliente → servidor ---
 
 /// Petición del cliente. `Query` lleva su `AS OF` —el time-travel es de primera,
@@ -188,6 +249,11 @@ pub enum Request {
     },
     /// Recorre la cadena de hash; responde [`Response::Audit`].
     Verify,
+    /// Diff entre dos ramas; responde [`Response::Diff`].
+    Diff { from: String, to: String },
+    /// Fusiona `from` en `into` (política FailOnConflict); responde
+    /// [`Response::Merged`] o [`Response::Error`] si hay conflicto.
+    Merge { from: String, into: String },
 }
 
 impl Request {
@@ -214,6 +280,16 @@ impl Request {
                 put_asof(&mut o, as_of);
             }
             Request::Verify => o.push(REQ_VERIFY),
+            Request::Diff { from, to } => {
+                o.push(REQ_DIFF);
+                put_str(&mut o, from);
+                put_str(&mut o, to);
+            }
+            Request::Merge { from, into } => {
+                o.push(REQ_MERGE);
+                put_str(&mut o, from);
+                put_str(&mut o, into);
+            }
         }
         o
     }
@@ -235,6 +311,14 @@ impl Request {
                 as_of: take_asof(buf, &mut pos)?,
             },
             REQ_VERIFY => Request::Verify,
+            REQ_DIFF => Request::Diff {
+                from: take_str(buf, &mut pos)?,
+                to: take_str(buf, &mut pos)?,
+            },
+            REQ_MERGE => Request::Merge {
+                from: take_str(buf, &mut pos)?,
+                into: take_str(buf, &mut pos)?,
+            },
             other => return Err(ProtoError::BadTag(other)),
         };
         Ok(req)
@@ -265,6 +349,11 @@ pub enum Response {
     },
     /// Error tipado (el `Display` del error del motor, ya legible).
     Error(String),
+    /// Resultado de un `Diff`: cambios de esquema y de fila entre dos ramas.
+    Diff(Diff),
+    /// Resultado de un `Merge`: versión nueva de la rama destino y nº de cambios
+    /// aplicados (los conflictos llegan como [`Response::Error`]).
+    Merged { version: u64, applied: u64 },
 }
 
 impl Response {
@@ -307,6 +396,15 @@ impl Response {
                 o.push(RES_ERROR);
                 put_str(&mut o, msg);
             }
+            Response::Diff(d) => {
+                o.push(RES_DIFF);
+                put_diff(&mut o, d);
+            }
+            Response::Merged { version, applied } => {
+                o.push(RES_MERGED);
+                put_varint(&mut o, *version);
+                put_varint(&mut o, *applied);
+            }
         }
         o
     }
@@ -348,6 +446,11 @@ impl Response {
                 }
             }
             RES_ERROR => Response::Error(take_str(buf, &mut pos)?),
+            RES_DIFF => Response::Diff(take_diff(buf, &mut pos)?),
+            RES_MERGED => Response::Merged {
+                version: take_varint_e(buf, &mut pos)?,
+                applied: take_varint_e(buf, &mut pos)?,
+            },
             other => return Err(ProtoError::BadTag(other)),
         };
         Ok(res)
@@ -389,6 +492,14 @@ mod tests {
             as_of: AsOf::Timestamp(UNIX_EPOCH + Duration::new(1_718_000_000, 123)),
         });
         req_roundtrip(Request::Verify);
+        req_roundtrip(Request::Diff {
+            from: "main".into(),
+            to: "migracion-iva".into(),
+        });
+        req_roundtrip(Request::Merge {
+            from: "migracion-iva".into(),
+            into: "main".into(),
+        });
     }
 
     #[test]
@@ -412,6 +523,29 @@ mod tests {
             chain_hash: [7u8; 32],
         });
         res_roundtrip(Response::Error("tabla desconocida".into()));
+        res_roundtrip(Response::Diff(Diff {
+            schema: vec![SchemaChange {
+                table: "facturas".into(),
+                kind: ChangeKind::Added,
+            }],
+            rows: vec![
+                RowChange {
+                    table_id: 1,
+                    rowid: 42,
+                    kind: ChangeKind::Modified,
+                },
+                RowChange {
+                    table_id: 2,
+                    rowid: -7,
+                    kind: ChangeKind::Removed,
+                },
+            ],
+        }));
+        res_roundtrip(Response::Diff(Diff::default())); // diff vacío
+        res_roundtrip(Response::Merged {
+            version: 12,
+            applied: 5,
+        });
     }
 
     #[test]

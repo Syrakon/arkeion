@@ -25,6 +25,7 @@ se **aceptan sintácticamente** y quedan registradas en el esquema, pero no se a
 ```sql
 -- DDL
 CREATE TABLE [IF NOT EXISTS] tabla (col TIPO [restricciones], …);
+  -- restricciones: PRIMARY KEY | NOT NULL | DEFAULT v | REFERENCES padre [ON DELETE acción]
 DROP TABLE [IF EXISTS] tabla;
 ALTER TABLE tabla ADD [COLUMN] col TIPO [DEFAULT v] [NOT NULL];  -- al final; no reescribe filas
 ALTER TABLE tabla MOVE COLUMN col {FIRST | BEFORE x | AFTER x};  -- reorden lógico (presentación)
@@ -92,6 +93,11 @@ recursivas.
 SELECT se guarda como texto en el catálogo y se materializa al consultarla (refleja
 los datos actuales). Una vista sobre otra funciona; los nombres no colisionan con
 tablas. No recursivas.
+
+**Claves foráneas** (`col INTEGER REFERENCES padre [ON DELETE {RESTRICT|CASCADE|SET
+NULL}]`): v1 referencia siempre la **PK** del padre. Se comprueban en INSERT/UPDATE
+(el padre debe existir; FK `NULL` permitido) y el DELETE del padre aplica la acción
+(RESTRICT por defecto). Se permite auto-referencia (árboles).
 
 `GROUP BY` / `HAVING` (post-M9): `SELECT … GROUP BY e1, e2 [HAVING cond]` agrupa por el
 valor de las expresiones (normalmente columnas) y emite una fila por grupo, plegando los
@@ -168,7 +174,8 @@ SELECT * FROM facturas AS OF TIMESTAMP '2026-05-01T00:00:00Z';
 | Índices secundarios (`CREATE INDEX`) | hecho (v1.1) — espacio de claves `0x02` ya reservado en el formato |
 | `ALTER TABLE` salvo `ADD COLUMN` / `MOVE COLUMN` / `REORDER COLUMNS` (DROP/RENAME COLUMN) | v1.x |
 | Optimizador de queries (CBO con estadísticas) | fuera de alcance; sí hay un planificador por reglas (index vs scan) |
-| Triggers, FK enforcement | en camino (vistas ✅ hechas) |
+| Triggers | en camino (vistas ✅, FK enforcement ✅) |
+| FK: columna no-PK, composite, ON UPDATE | v1.x (v1: una columna → PK del padre, ON DELETE) |
 
 ## Gramática y codegen (`.gate`)
 

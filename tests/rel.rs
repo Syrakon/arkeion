@@ -18,6 +18,7 @@ fn col(name: &str, t: ColType) -> ColumnSpec {
         not_null: false,
         primary_key: false,
         default: None,
+        references: None,
     }
 }
 

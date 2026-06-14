@@ -1616,6 +1616,7 @@ impl WriteTx {
     /// El contador de rowid se cachea en la tx y se vuelca en el commit, así que
     /// solo se escribe la hoja de la fila (no la del contador) por inserción.
     pub fn insert_row(&mut self, table: &TableDef, values: &[Value]) -> Result<i64> {
+        self.fk_check_parents_exist(table, values)?;
         let explicit = catalog::explicit_rowid(table, values)?;
         let next = match self.rowid_cache.get(&table.table_id) {
             Some(&c) => c,
@@ -1691,6 +1692,7 @@ impl WriteTx {
 
     /// Sobrescribe una fila. `false` si el rowid no existe.
     pub fn update_row(&mut self, table: &TableDef, rowid: i64, values: &[Value]) -> Result<bool> {
+        self.fk_check_parents_exist(table, values)?;
         let (root, ok) = catalog::update_row(&mut self.ts, self.data_root, table, rowid, values)?;
         self.data_root = root;
         Ok(ok)
@@ -1701,9 +1703,89 @@ impl WriteTx {
     }
 
     pub fn delete_row(&mut self, table: &TableDef, rowid: i64) -> Result<bool> {
+        // FKs: RESTRICT (falla si hay hijos), CASCADE (los borra) o SET NULL, ANTES
+        // de borrar el padre.
+        self.fk_handle_parent_delete(table, rowid)?;
         let (root, existed) = catalog::delete_row(&mut self.ts, self.data_root, table, rowid)?;
         self.data_root = root;
         Ok(existed)
+    }
+
+    /// INSERT/UPDATE: por cada FK de `table`, su valor (si no es NULL) debe existir
+    /// como PK en la tabla padre.
+    fn fk_check_parents_exist(&self, table: &TableDef, values: &[Value]) -> Result<()> {
+        for fk in &table.foreign_keys {
+            let child_val = match values.get(fk.column) {
+                Some(Value::Null) | None => continue, // FK NULL: permitido
+                Some(Value::Integer(n)) => *n,
+                Some(_) => {
+                    return Err(Error::Constraint(
+                        "una columna FK debe ser INTEGER (referencia a la PK del padre)",
+                    ));
+                }
+            };
+            let parent = self
+                .table(&fk.parent)?
+                .ok_or(Error::Constraint("tabla padre de FK desconocida"))?;
+            if self.get_row(&parent, child_val)?.is_none() {
+                return Err(Error::Constraint(
+                    "violación de clave foránea: la fila padre no existe",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// DELETE del padre: aplica la acción de cada FK que apunte a `parent` para las
+    /// filas hijas que referencian `rowid`.
+    fn fk_handle_parent_delete(&mut self, parent: &TableDef, rowid: i64) -> Result<()> {
+        // Tablas (def, columna FK, acción) con una FK que referencia a `parent`.
+        let refs: Vec<(TableDef, usize, catalog::FkAction)> =
+            catalog::list_tables(&self.ts, self.data_root)?
+                .into_iter()
+                .flat_map(|t| {
+                    t.foreign_keys
+                        .iter()
+                        .filter(|fk| fk.parent == parent.name)
+                        .map(|fk| (t.clone(), fk.column, fk.on_delete))
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+        for (child, fk_col, action) in refs {
+            // Filas hijas con child[fk_col] == rowid (materializadas: luego se muta).
+            let hits: Vec<(i64, Vec<Value>)> = self
+                .scan_table(&child)?
+                .filter_map(|r| match r {
+                    Ok((id, vals)) => match vals.get(fk_col) {
+                        Some(Value::Integer(n)) if *n == rowid => Some(Ok((id, vals))),
+                        _ => None,
+                    },
+                    Err(e) => Some(Err(e)),
+                })
+                .collect::<Result<_>>()?;
+            if hits.is_empty() {
+                continue;
+            }
+            match action {
+                catalog::FkAction::Restrict => {
+                    return Err(Error::Constraint(
+                        "violación de clave foránea: hay filas hijas (RESTRICT)",
+                    ));
+                }
+                catalog::FkAction::Cascade => {
+                    for (id, _) in hits {
+                        self.delete_row(&child, id)?; // recursivo: re-comprueba las FKs del hijo
+                    }
+                }
+                catalog::FkAction::SetNull => {
+                    for (id, mut vals) in hits {
+                        vals[fk_col] = Value::Null;
+                        self.update_row(&child, id, &vals)?;
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     pub fn scan_table(&self, table: &TableDef) -> Result<TableScan<'_, TxStore>> {
@@ -2807,6 +2889,7 @@ mod tests {
                     not_null: false,
                     primary_key: true,
                     default: None,
+                    references: None,
                 },
                 ColumnSpec {
                     name: "n".into(),
@@ -2814,6 +2897,7 @@ mod tests {
                     not_null: true,
                     primary_key: false,
                     default: None,
+                    references: None,
                 },
             ],
         };

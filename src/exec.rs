@@ -602,6 +602,7 @@ fn table_spec(name: &str, columns: &[ColumnAst]) -> Result<TableSpec> {
             not_null: col.not_null,
             primary_key: col.primary_key,
             default,
+            references: col.references.clone(),
         });
     }
     Ok(TableSpec {
@@ -1182,6 +1183,7 @@ fn synthetic_cte_def(name: &str, columns: &[String], idx: usize) -> TableDef {
         columns: cols,
         indexes: Vec::new(),
         logical_order: (0..n).collect(),
+        foreign_keys: Vec::new(),
     }
 }
 
@@ -3153,6 +3155,7 @@ mod tests {
             }],
             indexes: Vec::new(),
             logical_order: vec![0],
+            foreign_keys: Vec::new(),
         };
         let schema = QuerySchema::single("t", def);
         let rows: Vec<Vec<Value>> = vec![
@@ -3206,6 +3209,7 @@ mod tests {
             }],
             indexes: Vec::new(),
             logical_order: vec![0],
+            foreign_keys: Vec::new(),
         };
         let mut schema = QuerySchema::single("a", table("a"));
         schema.push("b", table("b")).unwrap();

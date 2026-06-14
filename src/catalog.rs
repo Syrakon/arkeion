@@ -38,7 +38,9 @@ const CAT_VIEW: u8 = 0x05;
 /// v2: el esquema serializado incluye la lista de índices de la tabla.
 // v3 añade el orden lógico de columnas (reorden de presentación) al final del
 // registro de esquema; v2 (sin él) se sigue leyendo como identidad.
-const SCHEMA_VERSION: u8 = 3;
+// v4 añade las claves foráneas al final del registro de esquema; v2/v3 (sin
+// ellas) se leen con `foreign_keys` vacío.
+const SCHEMA_VERSION: u8 = 4;
 const NO_ALIAS: u8 = 0xFF;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -73,6 +75,45 @@ impl ColType {
     }
 }
 
+/// Acción al borrar la fila padre referenciada por una FK.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FkAction {
+    /// Falla si quedan hijos referenciando la fila (por defecto).
+    Restrict,
+    /// Borra en cascada los hijos.
+    Cascade,
+    /// Pone a NULL la columna FK de los hijos.
+    SetNull,
+}
+
+impl FkAction {
+    fn as_u8(self) -> u8 {
+        match self {
+            FkAction::Restrict => 0,
+            FkAction::Cascade => 1,
+            FkAction::SetNull => 2,
+        }
+    }
+    fn from_u8(b: u8) -> Option<FkAction> {
+        match b {
+            0 => Some(FkAction::Restrict),
+            1 => Some(FkAction::Cascade),
+            2 => Some(FkAction::SetNull),
+            _ => None,
+        }
+    }
+}
+
+/// Clave foránea (v1: una columna → la **PK** de la tabla padre).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ForeignKey {
+    /// Posición física de la columna hija en `TableDef.columns`.
+    pub column: usize,
+    /// Tabla padre (la columna referenciada es su PK).
+    pub parent: String,
+    pub on_delete: FkAction,
+}
+
 /// Definición de columna tal y como la pide el llamador.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ColumnSpec {
@@ -81,6 +122,9 @@ pub struct ColumnSpec {
     pub not_null: bool,
     pub primary_key: bool,
     pub default: Option<Value>,
+    /// `REFERENCES padre [ON DELETE acción]` (la columna referenciada es la PK del
+    /// padre).
+    pub references: Option<(String, FkAction)>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -127,6 +171,9 @@ pub struct TableDef {
     /// expansión de `*` y el `INSERT` posicional; índices, `rowid_alias` y la
     /// codificación siguen siendo físicos.
     pub logical_order: Vec<usize>,
+    /// Claves foráneas de esta tabla (v4 del esquema). Se comprueban en cada
+    /// INSERT/UPDATE (el padre debe existir) y el DELETE del padre las respeta.
+    pub foreign_keys: Vec<ForeignKey>,
 }
 
 /// Posición destino de `ALTER TABLE … MOVE COLUMN` (reorden lógico).
@@ -285,6 +332,15 @@ fn encode_def(def: &TableDef) -> Vec<u8> {
             put_varint(&mut out, p as u64);
         }
     }
+    // Claves foráneas (v4): cuenta, y por cada una columna hija, acción y nombre
+    // del padre.
+    put_varint(&mut out, def.foreign_keys.len() as u64);
+    for fk in &def.foreign_keys {
+        put_varint(&mut out, fk.column as u64);
+        out.push(fk.on_delete.as_u8());
+        put_varint(&mut out, fk.parent.len() as u64);
+        out.extend_from_slice(fk.parent.as_bytes());
+    }
     out
 }
 
@@ -313,7 +369,7 @@ fn decode_def(name: &str, buf: &[u8]) -> Result<TableDef> {
     };
 
     let version = *take(&mut pos, 1)?.first().expect("len 1");
-    if version != 2 && version != 3 {
+    if !(2..=4).contains(&version) {
         return Err(bad("versión de esquema desconocida"));
     }
     let table_id = u32::from_le_bytes(
@@ -401,6 +457,28 @@ fn decode_def(name: &str, buf: &[u8]) -> Result<TableDef> {
         (0..columns.len()).collect()
     };
 
+    // Claves foráneas (v4). v2/v3 no las llevan ⇒ vacío.
+    let mut foreign_keys = Vec::new();
+    if version >= 4 {
+        let nfk = take_varint(buf, &mut pos).ok_or(bad("esquema truncado"))? as usize;
+        for _ in 0..nfk {
+            let column = take_varint(buf, &mut pos).ok_or(bad("esquema truncado"))? as usize;
+            if column >= columns.len() {
+                return Err(bad("columna de FK fuera de rango"));
+            }
+            let on_delete = FkAction::from_u8(*take(&mut pos, 1)?.first().expect("len 1"))
+                .ok_or(bad("acción de FK desconocida"))?;
+            let plen = take_varint(buf, &mut pos).ok_or(bad("esquema truncado"))? as usize;
+            let parent = String::from_utf8(take(&mut pos, plen)?.to_vec())
+                .map_err(|_| bad("nombre de padre de FK no UTF-8"))?;
+            foreign_keys.push(ForeignKey {
+                column,
+                parent,
+                on_delete,
+            });
+        }
+    }
+
     if pos != buf.len() {
         return Err(bad("bytes sobrantes tras el esquema"));
     }
@@ -416,6 +494,7 @@ fn decode_def(name: &str, buf: &[u8]) -> Result<TableDef> {
         columns,
         indexes,
         logical_order,
+        foreign_keys,
     })
 }
 
@@ -473,6 +552,32 @@ pub fn create_table<S: NodeStore>(
     };
     let mut root = btree::insert(s, root, &meta_key(), &(table_id + 1).to_le_bytes())?;
 
+    // Claves foráneas: el padre debe existir y tener PRIMARY KEY (v1 referencia
+    // siempre a la PK). Se permite auto-referencia (padre = esta tabla).
+    let mut foreign_keys = Vec::new();
+    for (i, col) in spec.columns.iter().enumerate() {
+        if let Some((parent, on_delete)) = &col.references {
+            let parent_has_pk = if parent == &spec.name {
+                rowid_alias.is_some()
+            } else {
+                match get_table(s, root, parent)? {
+                    Some(p) => p.rowid_alias.is_some(),
+                    None => return Err(Error::Constraint("tabla padre de FK desconocida")),
+                }
+            };
+            if !parent_has_pk {
+                return Err(Error::Constraint(
+                    "la tabla padre de una FK necesita PRIMARY KEY",
+                ));
+            }
+            foreign_keys.push(ForeignKey {
+                column: i,
+                parent: parent.clone(),
+                on_delete: *on_delete,
+            });
+        }
+    }
+
     let def = TableDef {
         name: spec.name.clone(),
         table_id,
@@ -490,6 +595,7 @@ pub fn create_table<S: NodeStore>(
             .collect(),
         indexes: Vec::new(),
         logical_order: (0..spec.columns.len()).collect(),
+        foreign_keys,
     };
     root = btree::insert(s, root, &table_key(&spec.name), &encode_def(&def))?;
     Ok((root, def))
@@ -1563,6 +1669,7 @@ mod tests {
             not_null: false,
             primary_key: false,
             default: None,
+            references: None,
         }
     }
 
@@ -1793,18 +1900,28 @@ mod tests {
         let (_, def) = create_table(&mut s, NO_ROOT, &facturas_spec()).unwrap();
         let n = def.columns.len();
 
-        // Identidad: el flag de orden lógico es 0 (no malgasta entradas).
-        let v3 = encode_def(&def);
-        assert_eq!(*v3.last().unwrap(), 0, "tabla identidad ⇒ flag = 0");
+        // v4 (actual) de una tabla identidad sin FKs termina en [flag lógico 0][nº
+        // FKs 0]. Reconstruimos v3 y v2 quitando esos sufijos y bajando la versión.
+        let v4 = encode_def(&def);
+        assert_eq!(*v4.last().unwrap(), 0, "sin FKs ⇒ contador 0");
 
-        // Un esquema v2 (sin el byte de orden lógico, versión 2) se sigue leyendo
-        // como identidad: misma `TableDef` que al decodificar el v3 equivalente.
+        // v3 = v4 sin el contador de FKs, versión 3.
+        let mut v3 = v4.clone();
+        v3.pop();
+        v3[0] = 3;
+        assert_eq!(
+            decode_def("facturas", &v3).unwrap(),
+            decode_def("facturas", &v4).unwrap()
+        );
+
+        // v2 = v3 sin el flag de orden lógico, versión 2.
         let mut v2 = v3.clone();
-        v2.pop(); // quita el flag (el v3 identidad = bytes v2 + [0])
-        v2[0] = 2; // versión de esquema v2
+        assert_eq!(*v2.last().unwrap(), 0, "tabla identidad ⇒ flag lógico 0");
+        v2.pop();
+        v2[0] = 2;
         let from_v2 = decode_def("facturas", &v2).unwrap();
         assert_eq!(from_v2.logical_order, (0..n).collect::<Vec<_>>());
-        assert_eq!(from_v2, decode_def("facturas", &v3).unwrap());
+        assert_eq!(from_v2, decode_def("facturas", &v4).unwrap());
 
         // Una permutación explícita hace round-trip exacto (flag 1 + entradas).
         let mut perm = def.clone();

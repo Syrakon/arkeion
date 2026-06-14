@@ -1,6 +1,6 @@
 //! AST del subconjunto SQL v1 (docs/04-sql.md).
 
-use crate::catalog::{ColType, ColumnPos};
+use crate::catalog::{ColType, ColumnPos, FkAction};
 use crate::record::Value;
 
 // `Select` es bastante más grande que el resto de variantes, pero `Stmt` es un
@@ -89,6 +89,9 @@ pub struct ColumnAst {
     pub primary_key: bool,
     /// Debe evaluar a constante sin parámetros (se valida en exec).
     pub default: Option<Expr>,
+    /// `REFERENCES padre [ON DELETE acción]` (la columna referenciada es la PK
+    /// del padre).
+    pub references: Option<(String, FkAction)>,
 }
 
 /// Tabla con alias opcional: `facturas f` o `facturas AS f`.

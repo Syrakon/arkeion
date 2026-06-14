@@ -1,0 +1,82 @@
+-- Claves foráneas (v1): `col INTEGER REFERENCES padre` referencia la PK del padre.
+-- Se comprueba en INSERT/UPDATE (el padre debe existir; NULL permitido) y el DELETE
+-- del padre respeta ON DELETE {RESTRICT (def) | CASCADE | SET NULL}.
+
+> CREATE TABLE dept (id INTEGER PRIMARY KEY, name TEXT);
+ok
+
+> INSERT INTO dept (name) VALUES ('eng'), ('sales');
+affected 2
+
+> CREATE TABLE emp (id INTEGER PRIMARY KEY, name TEXT, dept_id INTEGER REFERENCES dept);
+ok
+
+-- INSERT con padre existente.
+> INSERT INTO emp (name, dept_id) VALUES ('ada', 1);
+affected 1
+
+-- Padre inexistente → error.
+> INSERT INTO emp (name, dept_id) VALUES ('bob', 99);
+error clave foránea
+
+-- FK NULL: permitido.
+> INSERT INTO emp (name, dept_id) VALUES ('cori', NULL);
+affected 1
+
+-- UPDATE a un padre inexistente → error.
+> UPDATE emp SET dept_id = 99 WHERE name = 'ada';
+error clave foránea
+
+-- DELETE del padre con hijos (RESTRICT por defecto) → error.
+> DELETE FROM dept WHERE id = 1;
+error RESTRICT
+
+-- ON DELETE CASCADE: borra los hijos.
+> CREATE TABLE task (id INTEGER PRIMARY KEY, title TEXT, emp_id INTEGER REFERENCES emp ON DELETE CASCADE);
+ok
+
+> INSERT INTO task (title, emp_id) VALUES ('t1', 1), ('t2', 1);
+affected 2
+
+> DELETE FROM emp WHERE id = 1;
+affected 1
+
+> SELECT id FROM task;
+empty
+
+-- ON DELETE SET NULL: pone a NULL la FK de los hijos.
+> CREATE TABLE note (id INTEGER PRIMARY KEY, body TEXT, dept_id INTEGER REFERENCES dept ON DELETE SET NULL);
+ok
+
+> INSERT INTO note (body, dept_id) VALUES ('n1', 2);
+affected 1
+
+> DELETE FROM dept WHERE id = 2;
+affected 1
+
+> SELECT body, dept_id FROM note;
+n1|NULL
+
+-- Auto-referencia (árbol): manager_id REFERENCES la propia tabla.
+> CREATE TABLE person (id INTEGER PRIMARY KEY, name TEXT, manager_id INTEGER REFERENCES person);
+ok
+
+> INSERT INTO person (name) VALUES ('boss');
+affected 1
+
+> INSERT INTO person (name, manager_id) VALUES ('worker', 1);
+affected 1
+
+> INSERT INTO person (name, manager_id) VALUES ('ghost', 99);
+error clave foránea
+
+-- El padre de una FK debe tener PRIMARY KEY.
+> CREATE TABLE nopk (x INTEGER);
+ok
+
+> CREATE TABLE bad (y INTEGER REFERENCES nopk);
+error necesita PRIMARY KEY
+
+-- Padre inexistente al crear la tabla.
+> CREATE TABLE bad2 (y INTEGER REFERENCES ghosttable);
+error padre de FK desconocida

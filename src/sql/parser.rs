@@ -10,7 +10,7 @@
 //! primary := literal | columna | tabla.columna | func(args) | agregado(expr|*) | ?N | ( expr )
 //! ```
 
-use crate::catalog::{ColType, ColumnPos};
+use crate::catalog::{ColType, ColumnPos, FkAction};
 use crate::error::{Error, Result};
 use crate::record::Value;
 use crate::sql::ast::*;
@@ -358,6 +358,7 @@ impl<'a> Parser<'a> {
             not_null: false,
             primary_key: false,
             default: None,
+            references: None,
         };
         loop {
             if self.eat_kw(Kw::Primary) {
@@ -368,10 +369,41 @@ impl<'a> Parser<'a> {
                 col.not_null = true;
             } else if self.eat_kw(Kw::Default) {
                 col.default = Some(self.expr()?);
+            } else if self.eat_kw(Kw::References) {
+                col.references = Some(self.fk_reference()?);
             } else {
                 return Ok(col);
             }
         }
+    }
+
+    /// Tras `REFERENCES`: `padre [(col)] [ON DELETE {RESTRICT|CASCADE|SET NULL}]`.
+    /// La columna referenciada (si se da) se ignora: v1 referencia siempre la PK.
+    fn fk_reference(&mut self) -> Result<(String, FkAction)> {
+        let parent = self.ident("una tabla padre")?;
+        if self.eat(&Tok::LParen) {
+            let _ = self.ident("una columna del padre")?;
+            self.expect(&Tok::RParen, "')'")?;
+        }
+        let mut on_delete = FkAction::Restrict;
+        // ON DELETE acción (ON UPDATE no se soporta en v1).
+        if self.peek() == Some(&Tok::Kw(Kw::On)) && self.peek2() == Some(&Tok::Kw(Kw::Delete)) {
+            self.i += 2;
+            on_delete = if self.eat_kw(Kw::Cascade) {
+                FkAction::Cascade
+            } else if self.eat_kw(Kw::Restrict) {
+                FkAction::Restrict
+            } else if self.eat_kw(Kw::Set) {
+                self.expect_kw(Kw::Null, "NULL")?;
+                FkAction::SetNull
+            } else {
+                return Err(err_at(
+                    self.pos(),
+                    "se esperaba CASCADE, RESTRICT o SET NULL",
+                ));
+            };
+        }
+        Ok((parent, on_delete))
     }
 
     /// Tras consumir `DROP`: `TABLE [IF EXISTS] nombre`.

@@ -1,0 +1,49 @@
+-- BETWEEN a AND b (inclusivo en ambos extremos) y NOT BETWEEN. Se desazucaran a
+-- `x >= a AND x <= b` / `x < a OR x > b`, así que heredan la lógica trivalente.
+
+> SELECT 5 BETWEEN 1 AND 10;
+TRUE
+
+> SELECT 5 BETWEEN 6 AND 10;
+FALSE
+
+-- Inclusivo en los extremos.
+> SELECT 1 BETWEEN 1 AND 3;
+TRUE
+
+> SELECT 3 BETWEEN 1 AND 3;
+TRUE
+
+-- NOT BETWEEN.
+> SELECT 5 NOT BETWEEN 1 AND 10;
+FALSE
+
+> SELECT 20 NOT BETWEEN 1 AND 10;
+TRUE
+
+-- Texto (orden lexicográfico).
+> SELECT 'm' BETWEEN 'a' AND 'z';
+TRUE
+
+-- NULL en el operando → NULL (trivalente).
+> SELECT NULL BETWEEN 1 AND 5;
+NULL
+
+-- En WHERE.
+> CREATE TABLE n (id INTEGER PRIMARY KEY, v INTEGER);
+ok
+
+> INSERT INTO n (v) VALUES (5), (15), (25);
+affected 3
+
+> SELECT v FROM n WHERE v BETWEEN 10 AND 20 ORDER BY v;
+15
+
+> SELECT v FROM n WHERE v NOT BETWEEN 10 AND 20 ORDER BY v;
+5
+25
+
+-- Precedencia: el AND de BETWEEN no se confunde con el booleano de la condición.
+> SELECT id FROM n WHERE v BETWEEN 1 AND 6 OR v = 25 ORDER BY id;
+1
+3

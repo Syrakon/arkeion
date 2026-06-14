@@ -692,6 +692,32 @@ impl Parser {
                 negated: neg_in,
             });
         }
+        // [NOT] BETWEEN a AND b — desazucarado a comparaciones (el operando se
+        // duplica; sin efectos secundarios salvo funciones volátiles como random()).
+        let neg_btw =
+            self.peek() == Some(&Tok::Kw(Kw::Not)) && self.peek2() == Some(&Tok::Kw(Kw::Between));
+        if neg_btw || self.peek() == Some(&Tok::Kw(Kw::Between)) {
+            self.i += if neg_btw { 2 } else { 1 };
+            let lo = self.add_expr()?;
+            self.expect_kw(Kw::And, "AND")?; // el AND de BETWEEN, no el booleano
+            let hi = self.add_expr()?;
+            let cmp = |l: Expr, op: BinOp, r: Expr| Expr::Binary(Box::new(l), op, Box::new(r));
+            return Ok(if neg_btw {
+                // x < a OR x > b
+                cmp(
+                    cmp(left.clone(), BinOp::Lt, lo),
+                    BinOp::Or,
+                    cmp(left, BinOp::Gt, hi),
+                )
+            } else {
+                // x >= a AND x <= b
+                cmp(
+                    cmp(left.clone(), BinOp::Ge, lo),
+                    BinOp::And,
+                    cmp(left, BinOp::Le, hi),
+                )
+            });
+        }
         let op = match self.peek() {
             Some(Tok::Eq) => BinOp::Eq,
             Some(Tok::Ne) => BinOp::Ne,

@@ -1,0 +1,52 @@
+-- Fecha/hora. El entero de tiempo de arkeion es EPOCH EN MILISEGUNDOS UTC (igual
+-- que los timestamps de auditoría), no el día juliano de SQLite. now() lo da; date/
+-- time/datetime/strftime lo formatean.
+
+> SELECT datetime(0);
+1970-01-01 00:00:00
+
+> SELECT date(1777638645000);
+2026-05-01
+
+> SELECT time(1777638645000);
+12:30:45
+
+> SELECT datetime(1777638645000);
+2026-05-01 12:30:45
+
+> SELECT strftime('%Y/%m/%d %H:%M', 1777638645000);
+2026/05/01 12:30
+
+-- Día del año (2026 no bisiesto): 31+28+31+30 + 1 = 121.
+> SELECT strftime('%j', 1777638645000);
+121
+
+-- %% literal y un código desconocido se copia tal cual.
+> SELECT strftime('100%% %q', 0);
+100% %q
+
+-- NULL propaga.
+> SELECT date(NULL);
+NULL
+
+-- now() es no determinista pero INTEGER (epoch ms); compone con date/datetime.
+> SELECT typeof(now());
+INTEGER
+
+> SELECT typeof(datetime(now()));
+TEXT
+
+-- Componer con la columna de tiempo de una tabla.
+> CREATE TABLE ev (id INTEGER PRIMARY KEY, at INTEGER);
+ok
+
+> INSERT INTO ev (at) VALUES (0), (1777638645000);
+affected 2
+
+> SELECT id, date(at) FROM ev ORDER BY id;
+1|1970-01-01
+2|2026-05-01
+
+-- Error de tipo: el argumento es epoch ms (INTEGER).
+> SELECT date('hoy');
+error epoch ms

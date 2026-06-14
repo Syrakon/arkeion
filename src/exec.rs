@@ -2249,11 +2249,50 @@ fn call_function(name: &str, args: &[Value]) -> Result<Value> {
         "random" => match args {
             // i64 aleatorio (como SQLite). No determinista: escribirlo en una fila
             // produce un valor irreproducible — elección del usuario, igual que
-            // current_timestamp.
+            // now().
             [] => Ok(Value::Integer(next_random())),
             _ => Err(bad_arity()),
         },
+        // Fecha/hora: el entero de tiempo de arkeion es **epoch en milisegundos**
+        // (igual que los timestamps de auditoría), no el día juliano de SQLite.
+        "now" => match args {
+            [] => Ok(Value::Integer(now_ms())), // no determinista, como random()
+            _ => Err(bad_arity()),
+        },
+        "date" => fmt_time(args, "%Y-%m-%d"),
+        "time" => fmt_time(args, "%H:%M:%S"),
+        "datetime" => fmt_time(args, "%Y-%m-%d %H:%M:%S"),
+        "strftime" => match args {
+            [Value::Null, _] | [_, Value::Null] => Ok(Value::Null),
+            [Value::Text(f), Value::Integer(ms)] => {
+                Ok(Value::Text(crate::sql::datetime::strftime(f, *ms)))
+            }
+            [_, _] => Err(sql_err("strftime(formato TEXT, epoch_ms INTEGER)")),
+            _ => Err(bad_arity()),
+        },
         _ => Err(sql_err(format!("función desconocida: {name}()"))),
+    }
+}
+
+/// Instante actual en epoch ms UTC (para `now()`).
+fn now_ms() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// `date/time/datetime(epoch_ms)`: formatea un epoch ms (INTEGER) con `fmt`.
+fn fmt_time(args: &[Value], fmt: &str) -> Result<Value> {
+    match args {
+        [Value::Null] => Ok(Value::Null),
+        [Value::Integer(ms)] => Ok(Value::Text(crate::sql::datetime::strftime(fmt, *ms))),
+        [v] => Err(sql_err(format!(
+            "se esperaba epoch ms (INTEGER), no {}",
+            v.type_name()
+        ))),
+        _ => Err(sql_err("se esperaba 1 argumento (epoch ms INTEGER)")),
     }
 }
 

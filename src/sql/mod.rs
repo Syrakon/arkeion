@@ -2,7 +2,7 @@
 //! cero dependencias (docs/04-sql.md).
 
 pub mod ast;
-mod datetime;
+pub(crate) mod datetime;
 pub mod lexer;
 pub mod parser;
 

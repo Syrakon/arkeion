@@ -106,6 +106,74 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     era * 146_097 + doe - 719_468
 }
 
+/// Inverso de [`days_from_civil`]: `(año, mes, día)` desde días civiles relativos
+/// a 1970-01-01 (algoritmo de Howard Hinnant, gregoriano proléptico).
+pub fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = (if z >= 0 { z } else { z - 146_096 }) / 146_097;
+    let doe = z - era * 146_097; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
+    (y + i64::from(m <= 2), m as u32, d)
+}
+
+/// Epoch **ms** UTC → `(año, mes, día, hora, min, seg)`. Floor-division correcta
+/// para instantes anteriores a 1970.
+pub fn ms_to_parts(ms: i64) -> (i64, u32, u32, u32, u32, u32) {
+    let secs = ms.div_euclid(1000);
+    let days = secs.div_euclid(86_400);
+    let tod = secs.rem_euclid(86_400);
+    let (y, mo, d) = civil_from_days(days);
+    (
+        y,
+        mo,
+        d,
+        (tod / 3600) as u32,
+        ((tod % 3600) / 60) as u32,
+        (tod % 60) as u32,
+    )
+}
+
+/// `strftime` mínimo sobre epoch ms UTC. Soporta `%Y %m %d %H %M %S %j %%`; un
+/// código desconocido se copia literal (`%X`). El entero de tiempo de arkeion es
+/// **epoch en milisegundos** (igual que los timestamps de auditoría), no el día
+/// juliano de SQLite.
+pub fn strftime(fmt: &str, ms: i64) -> String {
+    let (y, mo, d, h, mi, s) = ms_to_parts(ms);
+    let mut out = String::with_capacity(fmt.len() + 8);
+    let mut it = fmt.chars();
+    while let Some(c) = it.next() {
+        if c != '%' {
+            out.push(c);
+            continue;
+        }
+        match it.next() {
+            Some('Y') => out.push_str(&format!("{y:04}")),
+            Some('m') => out.push_str(&format!("{mo:02}")),
+            Some('d') => out.push_str(&format!("{d:02}")),
+            Some('H') => out.push_str(&format!("{h:02}")),
+            Some('M') => out.push_str(&format!("{mi:02}")),
+            Some('S') => out.push_str(&format!("{s:02}")),
+            Some('j') => {
+                let doy =
+                    days_from_civil(y, i64::from(mo), i64::from(d)) - days_from_civil(y, 1, 1);
+                out.push_str(&format!("{:03}", doy + 1));
+            }
+            Some('%') => out.push('%'),
+            Some(other) => {
+                out.push('%');
+                out.push(other);
+            }
+            None => out.push('%'),
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -169,5 +237,17 @@ mod tests {
         assert_eq!(parse_rfc3339_ms("2026-05-01T00:00:00.Z"), None); // fracción vacía
         assert_eq!(parse_rfc3339_ms("2026-05-01T00:00:00Z "), None); // basura final
         assert_eq!(parse_rfc3339_ms("not-a-date-at-all!!"), None);
+    }
+
+    #[test]
+    fn strftime_and_civil_inverse() {
+        // 2026-05-01T12:30:45Z = 1_777_638_645_000 ms (epoch + 45045 s del día).
+        let ms = 1_777_638_645_000;
+        assert_eq!(strftime("%Y-%m-%d %H:%M:%S", ms), "2026-05-01 12:30:45");
+        assert_eq!(strftime("%j", ms), "121"); // día 121 (2026 no bisiesto)
+        assert_eq!(strftime("100%% libre", 0), "100% libre");
+        assert_eq!(ms_to_parts(0), (1970, 1, 1, 0, 0, 0));
+        // `civil_from_days` es el inverso exacto de `days_from_civil` (29-feb bisiesto).
+        assert_eq!(civil_from_days(days_from_civil(2024, 2, 29)), (2024, 2, 29));
     }
 }

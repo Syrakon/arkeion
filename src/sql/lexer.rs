@@ -40,6 +40,7 @@ pub enum Tok {
 pub enum Kw {
     Add,
     After,
+    All,
     Alter,
     And,
     As,
@@ -101,6 +102,7 @@ pub enum Kw {
     Then,
     Timestamp,
     True,
+    Union,
     Unique,
     Update,
     Values,
@@ -113,6 +115,7 @@ fn keyword(word: &str) -> Option<Kw> {
     Some(match word.to_ascii_uppercase().as_str() {
         "ADD" => Kw::Add,
         "AFTER" => Kw::After,
+        "ALL" => Kw::All,
         "ALTER" => Kw::Alter,
         "AND" => Kw::And,
         "AS" => Kw::As,
@@ -174,6 +177,7 @@ fn keyword(word: &str) -> Option<Kw> {
         "THEN" => Kw::Then,
         "TIMESTAMP" => Kw::Timestamp,
         "TRUE" => Kw::True,
+        "UNION" => Kw::Union,
         "UNIQUE" => Kw::Unique,
         "UPDATE" => Kw::Update,
         "VALUES" => Kw::Values,

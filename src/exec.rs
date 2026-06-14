@@ -11,7 +11,7 @@ use crate::catalog::{ColType, ColumnDef, ColumnSpec, IndexDef, TableDef, TableSp
 use crate::error::{Error, Result};
 use crate::record::Value;
 use crate::sql::ast::{
-    AggFunc, BinOp, ColumnAst, Expr, JoinKind, SelectItem, SelectStmt, Stmt, TableRef, UnOp,
+    AggFunc, BinOp, ColumnAst, Expr, JoinKind, SelectItem, SelectStmt, SetOp, Stmt, TableRef, UnOp,
 };
 use crate::tx::{Snapshot, WriteTx};
 
@@ -702,6 +702,11 @@ fn run_select_no_from(stmt: &SelectStmt, params: &[Value]) -> Result<SelectOut> 
 }
 
 pub fn run_select(src: &impl DataSource, stmt: &SelectStmt, params: &[Value]) -> Result<SelectOut> {
+    // `UNION [ALL]`: combina varios núcleos; las cláusulas finales del líder
+    // (ORDER BY/LIMIT) aplican al conjunto.
+    if !stmt.compound.is_empty() {
+        return run_compound(src, stmt, params);
+    }
     // `SELECT <expr>, …` sin `FROM`: no hay tabla que escanear.
     let Some(from_ref) = &stmt.from else {
         return run_select_no_from(stmt, params);
@@ -914,6 +919,76 @@ fn lookup(src: &impl DataSource, table: &TableRef) -> Result<TableDef> {
         .ok_or_else(|| sql_err(format!("tabla desconocida: {}", table.name)))
 }
 
+/// `UNION [ALL]`: ejecuta cada núcleo, los combina por la izquierda (cada `UNION`
+/// deduplica el acumulado; `UNION ALL` conserva duplicados), y aplica las
+/// cláusulas finales del líder — `ORDER BY` por **columna de salida** y luego
+/// `LIMIT`/`OFFSET` — al conjunto entero.
+fn run_compound(src: &impl DataSource, stmt: &SelectStmt, params: &[Value]) -> Result<SelectOut> {
+    // El núcleo líder es este mismo SELECT sin la cola (compound/order/limit).
+    let mut core = stmt.clone();
+    core.compound = Vec::new();
+    core.order_by = Vec::new();
+    core.limit = None;
+    core.offset = None;
+    let lead = run_select(src, &core, params)?;
+    let columns = lead.columns;
+    let mut rows = lead.rows;
+
+    for cu in &stmt.compound {
+        let part = run_select(src, &cu.select, params)?;
+        if part.columns.len() != columns.len() {
+            return Err(sql_err(format!(
+                "UNION: los SELECT tienen distinto número de columnas ({} vs {})",
+                columns.len(),
+                part.columns.len()
+            )));
+        }
+        rows.extend(part.rows);
+        if cu.op == SetOp::Union {
+            rows = dedup_preserving(rows); // dedup del acumulado (asociativo por la izquierda)
+        }
+    }
+
+    // ORDER BY sobre las columnas de SALIDA de la unión (por nombre).
+    if !stmt.order_by.is_empty() {
+        let order: Vec<(usize, bool)> = stmt
+            .order_by
+            .iter()
+            .map(|o| {
+                columns
+                    .iter()
+                    .position(|c| *c == o.column)
+                    .map(|i| (i, o.desc))
+                    .ok_or_else(|| {
+                        sql_err(format!(
+                            "ORDER BY en UNION: columna desconocida «{}»",
+                            o.column
+                        ))
+                    })
+            })
+            .collect::<Result<_>>()?;
+        let mut first_err: Option<Error> = None;
+        rows.sort_by(|a, b| {
+            for (idx, desc) in &order {
+                match cmp_nulls_first(&a[*idx], &b[*idx]) {
+                    Ok(Ordering::Equal) => continue,
+                    Ok(o) => return if *desc { o.reverse() } else { o },
+                    Err(e) => {
+                        first_err.get_or_insert(e);
+                        return Ordering::Equal;
+                    }
+                }
+            }
+            Ordering::Equal
+        });
+        if let Some(e) = first_err {
+            return Err(e);
+        }
+    }
+    let rows = limit_offset(rows, stmt, params)?;
+    Ok(SelectOut { columns, rows })
+}
+
 /// Plan de **streaming** para un SELECT elegible: full scan + proyección de
 /// columnas simples (o `*`), sin WHERE/JOIN/GROUP BY/HAVING/ORDER BY ni
 /// agregados. La capa API responde sin materializar el resultado — el coste
@@ -944,6 +1019,9 @@ pub fn stream_select(
         || !stmt.group_by.is_empty()
         || stmt.having.is_some()
         || !stmt.order_by.is_empty()
+        || stmt.distinct // el streaming no deduplica
+        || !stmt.compound.is_empty()
+    // UNION va por el camino compuesto
     {
         return Ok(None);
     }

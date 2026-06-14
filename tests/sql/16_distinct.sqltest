@@ -12,6 +12,12 @@ affected 5
 a
 b
 
+-- DISTINCT sin ORDER BY: NO debe tomar el atajo de streaming (que no deduplica).
+-- El orden es el de scan, deduplicado conservando el primero visto.
+> SELECT DISTINCT cat FROM d;
+a
+b
+
 -- DISTINCT sobre la fila proyectada (cat, n).
 > SELECT DISTINCT cat, n FROM d ORDER BY cat, n;
 a|1

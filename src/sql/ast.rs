@@ -136,6 +136,26 @@ pub struct SelectStmt {
     /// `AS OF` (time-travel, M5): si está, toda la consulta se evalúa contra
     /// un único snapshot histórico. Cierra la sentencia.
     pub as_of: Option<AsOfClause>,
+    /// `UNION [ALL]`: núcleos encadenados a este. Las cláusulas finales
+    /// (`order_by`/`limit`/`offset`/`as_of`) las lleva este líder y aplican al
+    /// conjunto entero; los núcleos de `compound` no las tienen.
+    pub compound: Vec<CompoundSelect>,
+}
+
+/// Operador de conjunto entre SELECTs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SetOp {
+    /// `UNION`: une y deduplica.
+    Union,
+    /// `UNION ALL`: une conservando duplicados.
+    UnionAll,
+}
+
+/// Un núcleo SELECT encadenado con un operador de conjunto.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CompoundSelect {
+    pub op: SetOp,
+    pub select: SelectStmt,
 }
 
 /// Punto histórico de un `SELECT … AS OF` (docs/04-sql). La versión es la

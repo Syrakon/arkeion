@@ -425,7 +425,9 @@ impl Parser {
         })
     }
 
-    fn select(&mut self) -> Result<SelectStmt> {
+    /// Núcleo de un SELECT: de `SELECT` a `HAVING`. Las cláusulas finales
+    /// (`ORDER BY`/`LIMIT`/`OFFSET`/`AS OF`) y los `UNION` los maneja [`select`].
+    fn select_core(&mut self) -> Result<SelectStmt> {
         self.expect_kw(Kw::Select, "SELECT")?;
         let distinct = self.eat_kw(Kw::Distinct);
         let mut projection = vec![self.select_item()?];
@@ -479,6 +481,39 @@ impl Parser {
         } else {
             None
         };
+        Ok(SelectStmt {
+            distinct,
+            projection,
+            from,
+            joins,
+            where_clause,
+            group_by,
+            having,
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
+            as_of: None,
+            compound: Vec::new(),
+        })
+    }
+
+    /// Un SELECT completo: un núcleo, opcionalmente encadenado con `UNION [ALL]`,
+    /// más las cláusulas finales (`ORDER BY`/`LIMIT`/`OFFSET`/`AS OF`) que aplican
+    /// al conjunto entero y las lleva el núcleo líder.
+    fn select(&mut self) -> Result<SelectStmt> {
+        let mut lead = self.select_core()?;
+        let mut compound = Vec::new();
+        while self.eat_kw(Kw::Union) {
+            let op = if self.eat_kw(Kw::All) {
+                SetOp::UnionAll
+            } else {
+                SetOp::Union
+            };
+            compound.push(CompoundSelect {
+                op,
+                select: self.select_core()?,
+            });
+        }
         let mut order_by = Vec::new();
         if self.eat_kw(Kw::Order) {
             self.expect_kw(Kw::By, "BY")?;
@@ -514,19 +549,12 @@ impl Parser {
             None
         };
         let as_of = self.as_of()?;
-        Ok(SelectStmt {
-            distinct,
-            projection,
-            from,
-            joins,
-            where_clause,
-            group_by,
-            having,
-            order_by,
-            limit,
-            offset,
-            as_of,
-        })
+        lead.compound = compound;
+        lead.order_by = order_by;
+        lead.limit = limit;
+        lead.offset = offset;
+        lead.as_of = as_of;
+        Ok(lead)
     }
 
     /// `AS OF VERSION n | AS OF TIMESTAMP 'rfc3339'`, al cierre de un SELECT

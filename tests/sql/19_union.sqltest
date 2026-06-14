@@ -1,0 +1,51 @@
+-- UNION (une y deduplica) y UNION ALL (conserva duplicados). Las cláusulas
+-- finales (ORDER BY/LIMIT) aplican al conjunto entero y ordenan por columna de
+-- SALIDA (las toma el SELECT líder). Los nombres de columna son los del líder.
+
+> CREATE TABLE a (id INTEGER PRIMARY KEY, v INTEGER);
+ok
+
+> CREATE TABLE b (id INTEGER PRIMARY KEY, v INTEGER);
+ok
+
+> INSERT INTO a (v) VALUES (1), (2), (3);
+affected 3
+
+> INSERT INTO b (v) VALUES (3), (4);
+affected 2
+
+-- UNION deduplica el 3 (está en ambas).
+> SELECT v FROM a UNION SELECT v FROM b ORDER BY v;
+1
+2
+3
+4
+
+-- UNION ALL conserva los dos 3.
+> SELECT v FROM a UNION ALL SELECT v FROM b ORDER BY v;
+1
+2
+3
+3
+4
+
+-- LIMIT sobre el conjunto.
+> SELECT v FROM a UNION SELECT v FROM b ORDER BY v DESC LIMIT 2;
+4
+3
+
+-- Cadena de tres núcleos sin FROM; dedup conserva el primer visto (determinista).
+> SELECT 1 AS n UNION SELECT 2 UNION SELECT 1;
+1
+2
+
+-- Mezcla ALL + distinct, asociativa por la izquierda: (a ALL a) UNION b.
+> SELECT v FROM a UNION ALL SELECT v FROM a UNION SELECT v FROM b ORDER BY v;
+1
+2
+3
+4
+
+-- Error: número de columnas distinto entre SELECTs.
+> SELECT v FROM a UNION SELECT id, v FROM b;
+error distinto número de columnas

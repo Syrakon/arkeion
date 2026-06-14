@@ -1,6 +1,6 @@
 //! AST del subconjunto SQL v1 (docs/04-sql.md).
 
-use crate::catalog::ColType;
+use crate::catalog::{ColType, ColumnPos};
 use crate::record::Value;
 
 // `Select` es bastante más grande que el resto de variantes, pero `Stmt` es un
@@ -42,6 +42,18 @@ pub enum Stmt {
     AlterTableAddColumn {
         table: String,
         column: ColumnAst,
+    },
+    /// `ALTER TABLE t MOVE COLUMN c {FIRST | BEFORE x | AFTER x}` — reorden
+    /// **lógico** (de presentación): no reescribe filas, time-travel intacto.
+    AlterTableMoveColumn {
+        table: String,
+        column: String,
+        pos: ColumnPos,
+    },
+    /// `ALTER TABLE t REORDER COLUMNS (a, b, …)` — fija el orden lógico completo.
+    AlterTableReorderColumns {
+        table: String,
+        order: Vec<String>,
     },
     Update {
         table: String,

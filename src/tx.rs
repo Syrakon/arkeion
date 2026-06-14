@@ -1567,6 +1567,23 @@ impl WriteTx {
         Ok(())
     }
 
+    /// Reordena lógicamente una columna (`ALTER TABLE … MOVE COLUMN`). Solo cambia
+    /// el orden de presentación en el catálogo; no reescribe filas.
+    pub fn move_column(&mut self, table: &str, col: &str, pos: &catalog::ColumnPos) -> Result<()> {
+        self.schema_cache.clear();
+        let (root, _) = catalog::move_column(&mut self.ts, self.data_root, table, col, pos)?;
+        self.data_root = root;
+        Ok(())
+    }
+
+    /// Fija el orden lógico completo de columnas (`ALTER TABLE … REORDER COLUMNS`).
+    pub fn reorder_columns(&mut self, table: &str, order: &[String]) -> Result<()> {
+        self.schema_cache.clear();
+        let (root, _) = catalog::reorder_columns(&mut self.ts, self.data_root, table, order)?;
+        self.data_root = root;
+        Ok(())
+    }
+
     /// Inserta y devuelve el rowid (automático o explícito vía columna alias).
     /// El contador de rowid se cachea en la tx y se vuelca en el commit, así que
     /// solo se escribe la hoja de la fila (no la del contador) por inserción.

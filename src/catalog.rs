@@ -35,7 +35,9 @@ const CAT_INDEX_COUNTER: u8 = 0x03;
 const CAT_INDEX_REF: u8 = 0x04;
 
 /// v2: el esquema serializado incluye la lista de índices de la tabla.
-const SCHEMA_VERSION: u8 = 2;
+// v3 añade el orden lógico de columnas (reorden de presentación) al final del
+// registro de esquema; v2 (sin él) se sigue leyendo como identidad.
+const SCHEMA_VERSION: u8 = 3;
 const NO_ALIAS: u8 = 0xFF;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -114,6 +116,24 @@ pub struct TableDef {
     pub columns: Vec<ColumnDef>,
     /// Índices secundarios de la tabla (se mantienen en cada insert/update/delete).
     pub indexes: Vec<IndexDef>,
+    /// Orden **lógico** (de presentación) de las columnas: `logical_order[i]` es la
+    /// posición **física** de la i-ésima columna lógica — una permutación de
+    /// `0..columns.len()`. Físicamente las columnas y las filas **nunca** se mueven
+    /// (el registro es posicional, ver `record.rs`), así que reordenar es solo
+    /// metadato del catálogo: O(1), sin reescribir filas y con time-travel intacto
+    /// (las filas históricas se decodifican igual; el catálogo se versiona en el
+    /// mismo b-tree, así que un `AS OF` ve el orden de su época). Lo honran solo la
+    /// expansión de `*` y el `INSERT` posicional; índices, `rowid_alias` y la
+    /// codificación siguen siendo físicos.
+    pub logical_order: Vec<usize>,
+}
+
+/// Posición destino de `ALTER TABLE … MOVE COLUMN` (reorden lógico).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ColumnPos {
+    First,
+    Before(String),
+    After(String),
 }
 
 // --- claves ---
@@ -253,7 +273,33 @@ fn encode_def(def: &TableDef) -> Vec<u8> {
         put_varint(&mut out, idx.name.len() as u64);
         out.extend_from_slice(idx.name.as_bytes());
     }
+    // Orden lógico de columnas (v3): flag 0 = identidad (lo común, sin entradas);
+    // 1 = permutación explícita (un varint por columna, posición física en orden
+    // lógico). Nunca afecta a los bytes de las filas.
+    if def.logical_order.iter().enumerate().all(|(i, &p)| i == p) {
+        out.push(0);
+    } else {
+        out.push(1);
+        for &p in &def.logical_order {
+            put_varint(&mut out, p as u64);
+        }
+    }
     out
+}
+
+/// `true` si `order` es una permutación exacta de `0..n`.
+fn is_permutation(order: &[usize], n: usize) -> bool {
+    if order.len() != n {
+        return false;
+    }
+    let mut seen = vec![false; n];
+    for &p in order {
+        match seen.get_mut(p) {
+            Some(s) if !*s => *s = true,
+            _ => return false,
+        }
+    }
+    true
 }
 
 fn decode_def(name: &str, buf: &[u8]) -> Result<TableDef> {
@@ -265,7 +311,8 @@ fn decode_def(name: &str, buf: &[u8]) -> Result<TableDef> {
         Ok(s)
     };
 
-    if *take(&mut pos, 1)?.first().expect("len 1") != SCHEMA_VERSION {
+    let version = *take(&mut pos, 1)?.first().expect("len 1");
+    if version != 2 && version != 3 {
         return Err(bad("versión de esquema desconocida"));
     }
     let table_id = u32::from_le_bytes(
@@ -333,6 +380,26 @@ fn decode_def(name: &str, buf: &[u8]) -> Result<TableDef> {
         });
     }
 
+    // Orden lógico de columnas (v3). v2 no lo lleva ⇒ identidad.
+    let logical_order = if version >= 3 {
+        match *take(&mut pos, 1)?.first().expect("len 1") {
+            0 => (0..columns.len()).collect(),
+            1 => {
+                let mut lo = Vec::with_capacity(columns.len());
+                for _ in 0..columns.len() {
+                    lo.push(take_varint(buf, &mut pos).ok_or(bad("esquema truncado"))? as usize);
+                }
+                if !is_permutation(&lo, columns.len()) {
+                    return Err(bad("orden lógico de columnas inválido"));
+                }
+                lo
+            }
+            _ => return Err(bad("marcador de orden lógico inválido")),
+        }
+    } else {
+        (0..columns.len()).collect()
+    };
+
     if pos != buf.len() {
         return Err(bad("bytes sobrantes tras el esquema"));
     }
@@ -347,6 +414,7 @@ fn decode_def(name: &str, buf: &[u8]) -> Result<TableDef> {
         rowid_alias,
         columns,
         indexes,
+        logical_order,
     })
 }
 
@@ -417,6 +485,7 @@ pub fn create_table<S: NodeStore>(
             })
             .collect(),
         indexes: Vec::new(),
+        logical_order: (0..spec.columns.len()).collect(),
     };
     root = btree::insert(s, root, &table_key(&spec.name), &encode_def(&def))?;
     Ok((root, def))
@@ -447,6 +516,97 @@ pub fn add_column<S: NodeStore>(
         ));
     }
     def.columns.push(col);
+    // La columna nueva aparece **última** en el orden lógico (igual que su posición
+    // física): conserva la semántica de `ADD COLUMN` (se añade al final).
+    def.logical_order.push(def.columns.len() - 1);
+    let root = btree::insert(s, root, &table_key(table_name), &encode_def(&def))?;
+    Ok((root, def))
+}
+
+/// Reordena lógicamente una columna (`ALTER TABLE … MOVE COLUMN c {FIRST | BEFORE
+/// x | AFTER x}`). **No reescribe filas** ni toca la posición física: solo cambia
+/// el orden de presentación en el catálogo. Falla si la tabla o la columna no
+/// existen, o si la referencia es la propia columna o no existe.
+pub fn move_column<S: NodeStore>(
+    s: &mut S,
+    root: PageId,
+    table_name: &str,
+    col: &str,
+    pos: &ColumnPos,
+) -> Result<(PageId, TableDef)> {
+    let mut def = get_table(s, root, table_name)?.ok_or(Error::Constraint("tabla desconocida"))?;
+    let phys = def
+        .columns
+        .iter()
+        .position(|c| c.name == col)
+        .ok_or(Error::Constraint("columna desconocida"))?;
+    // Secuencia lógica sin la columna que se mueve; luego se reinserta en destino.
+    let mut seq: Vec<usize> = def
+        .logical_order
+        .iter()
+        .copied()
+        .filter(|&p| p != phys)
+        .collect();
+    let at = match pos {
+        ColumnPos::First => 0,
+        ColumnPos::Before(name) | ColumnPos::After(name) => {
+            if name == col {
+                return Err(Error::InvalidInput(
+                    "MOVE COLUMN: la referencia no puede ser la propia columna",
+                ));
+            }
+            let tphys = def
+                .columns
+                .iter()
+                .position(|c| c.name == *name)
+                .ok_or(Error::Constraint("columna de referencia desconocida"))?;
+            let idx = seq
+                .iter()
+                .position(|&p| p == tphys)
+                .expect("la referencia está en la permutación");
+            if matches!(pos, ColumnPos::After(_)) {
+                idx + 1
+            } else {
+                idx
+            }
+        }
+    };
+    seq.insert(at, phys);
+    def.logical_order = seq;
+    let root = btree::insert(s, root, &table_key(table_name), &encode_def(&def))?;
+    Ok((root, def))
+}
+
+/// Fija el orden lógico **completo** (`ALTER TABLE … REORDER COLUMNS (…)`).
+/// `order` debe listar todas las columnas exactamente una vez. No toca nada
+/// físico ni reescribe filas.
+pub fn reorder_columns<S: NodeStore>(
+    s: &mut S,
+    root: PageId,
+    table_name: &str,
+    order: &[String],
+) -> Result<(PageId, TableDef)> {
+    let mut def = get_table(s, root, table_name)?.ok_or(Error::Constraint("tabla desconocida"))?;
+    if order.len() != def.columns.len() {
+        return Err(Error::InvalidInput(
+            "REORDER COLUMNS debe listar todas las columnas exactamente una vez",
+        ));
+    }
+    let mut new_logical = Vec::with_capacity(order.len());
+    let mut seen = vec![false; def.columns.len()];
+    for name in order {
+        let phys = def
+            .columns
+            .iter()
+            .position(|c| c.name == *name)
+            .ok_or(Error::Constraint("columna desconocida en REORDER COLUMNS"))?;
+        if seen[phys] {
+            return Err(Error::InvalidInput("columna repetida en REORDER COLUMNS"));
+        }
+        seen[phys] = true;
+        new_logical.push(phys);
+    }
+    def.logical_order = new_logical;
     let root = btree::insert(s, root, &table_key(table_name), &encode_def(&def))?;
     Ok((root, def))
 }
@@ -1550,5 +1710,114 @@ mod tests {
         assert_eq!(row[2], Value::Text("emitida".into()));
         let (_, ok) = update_row(&mut s, root, &def, 999, &[Value::Null]).unwrap();
         assert!(!ok);
+    }
+
+    #[test]
+    fn logical_order_roundtrip_and_v2_compat() {
+        // is_permutation: la guardia de integridad al decodificar.
+        assert!(is_permutation(&[0, 1, 2], 3));
+        assert!(!is_permutation(&[0, 1, 1], 3), "duplicado");
+        assert!(!is_permutation(&[0, 1, 3], 3), "fuera de rango");
+        assert!(!is_permutation(&[0, 1], 3), "longitud distinta");
+
+        let mut s = MemStore::new();
+        let (_, def) = create_table(&mut s, NO_ROOT, &facturas_spec()).unwrap();
+        let n = def.columns.len();
+
+        // Identidad: el flag de orden lógico es 0 (no malgasta entradas).
+        let v3 = encode_def(&def);
+        assert_eq!(*v3.last().unwrap(), 0, "tabla identidad ⇒ flag = 0");
+
+        // Un esquema v2 (sin el byte de orden lógico, versión 2) se sigue leyendo
+        // como identidad: misma `TableDef` que al decodificar el v3 equivalente.
+        let mut v2 = v3.clone();
+        v2.pop(); // quita el flag (el v3 identidad = bytes v2 + [0])
+        v2[0] = 2; // versión de esquema v2
+        let from_v2 = decode_def("facturas", &v2).unwrap();
+        assert_eq!(from_v2.logical_order, (0..n).collect::<Vec<_>>());
+        assert_eq!(from_v2, decode_def("facturas", &v3).unwrap());
+
+        // Una permutación explícita hace round-trip exacto (flag 1 + entradas).
+        let mut perm = def.clone();
+        perm.logical_order = vec![2, 0, 4, 1, 3];
+        let bytes = encode_def(&perm);
+        let decoded = decode_def("facturas", &bytes).unwrap();
+        assert_eq!(decoded.logical_order, vec![2, 0, 4, 1, 3]);
+        assert_eq!(decoded, perm);
+    }
+
+    #[test]
+    fn move_and_reorder_columns_logical() {
+        let mut s = MemStore::new();
+        // físicos: 0 id, 1 total, 2 estado, 3 pagada, 4 adjunto.
+        let (root, _) = create_table(&mut s, NO_ROOT, &facturas_spec()).unwrap();
+
+        let (root, def) =
+            move_column(&mut s, root, "facturas", "adjunto", &ColumnPos::First).unwrap();
+        assert_eq!(def.logical_order, vec![4, 0, 1, 2, 3]);
+
+        // [4,0,1,2,3]: saca id(0) → [4,1,2,3]; total=1 está en idx1; AFTER → idx2.
+        let (root, def) = move_column(
+            &mut s,
+            root,
+            "facturas",
+            "id",
+            &ColumnPos::After("total".into()),
+        )
+        .unwrap();
+        assert_eq!(def.logical_order, vec![4, 1, 0, 2, 3]);
+
+        // BEFORE: [4,1,0,2,3]: saca adjunto(4) → [1,0,2,3]; id=0 en idx1 → insert ahí.
+        let (root, def) = move_column(
+            &mut s,
+            root,
+            "facturas",
+            "adjunto",
+            &ColumnPos::Before("id".into()),
+        )
+        .unwrap();
+        assert_eq!(def.logical_order, vec![1, 4, 0, 2, 3]);
+
+        let cols = ["id", "total", "estado", "pagada", "adjunto"].map(String::from);
+        let (root, def) = reorder_columns(&mut s, root, "facturas", &cols).unwrap();
+        assert_eq!(def.logical_order, vec![0, 1, 2, 3, 4]);
+
+        // La posición FÍSICA y los datos no se tocan nunca.
+        assert_eq!(def.columns[0].name, "id");
+        assert_eq!(def.rowid_alias, Some(0));
+
+        // Errores.
+        assert!(move_column(&mut s, root, "facturas", "nope", &ColumnPos::First).is_err());
+        assert!(
+            move_column(
+                &mut s,
+                root,
+                "facturas",
+                "id",
+                &ColumnPos::After("id".into())
+            )
+            .is_err(),
+            "referencia a sí misma"
+        );
+        assert!(
+            move_column(
+                &mut s,
+                root,
+                "facturas",
+                "id",
+                &ColumnPos::After("nope".into())
+            )
+            .is_err(),
+            "referencia desconocida"
+        );
+        assert!(
+            reorder_columns(&mut s, root, "facturas", &["id".to_string()]).is_err(),
+            "faltan columnas"
+        );
+        let dup = ["id", "total", "estado", "pagada", "pagada"].map(String::from);
+        assert!(
+            reorder_columns(&mut s, root, "facturas", &dup).is_err(),
+            "columna repetida"
+        );
     }
 }

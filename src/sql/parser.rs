@@ -10,7 +10,7 @@
 //! primary := literal | columna | tabla.columna | func(args) | agregado(expr|*) | ?N | ( expr )
 //! ```
 
-use crate::catalog::ColType;
+use crate::catalog::{ColType, ColumnPos};
 use crate::error::{Error, Result};
 use crate::record::Value;
 use crate::sql::ast::*;
@@ -259,10 +259,44 @@ impl Parser {
         self.expect_kw(Kw::Alter, "ALTER")?;
         self.expect_kw(Kw::Table, "TABLE")?;
         let table = self.ident("un nombre de tabla")?;
-        self.expect_kw(Kw::Add, "ADD")?;
-        let _ = self.eat_kw(Kw::Column); // COLUMN es opcional
-        let column = self.column_def()?;
-        Ok(Stmt::AlterTableAddColumn { table, column })
+        if self.eat_kw(Kw::Add) {
+            let _ = self.eat_kw(Kw::Column); // COLUMN es opcional
+            let column = self.column_def()?;
+            return Ok(Stmt::AlterTableAddColumn { table, column });
+        }
+        if self.eat_kw(Kw::Move) {
+            // MOVE COLUMN c {FIRST | BEFORE x | AFTER x} — reorden lógico.
+            self.expect_kw(Kw::Column, "COLUMN")?;
+            let column = self.ident("un nombre de columna")?;
+            let pos = if self.eat_kw(Kw::First) {
+                ColumnPos::First
+            } else if self.eat_kw(Kw::Before) {
+                ColumnPos::Before(self.ident("un nombre de columna")?)
+            } else if self.eat_kw(Kw::After) {
+                ColumnPos::After(self.ident("un nombre de columna")?)
+            } else {
+                return Err(err_at(self.pos(), "se esperaba FIRST, BEFORE o AFTER"));
+            };
+            return Ok(Stmt::AlterTableMoveColumn { table, column, pos });
+        }
+        if self.eat_kw(Kw::Reorder) {
+            // REORDER COLUMNS (a, b, …) — fija el orden lógico completo.
+            self.expect_kw(Kw::Columns, "COLUMNS")?;
+            self.expect(&Tok::LParen, "'('")?;
+            let mut order = Vec::new();
+            loop {
+                order.push(self.ident("un nombre de columna")?);
+                if !self.eat(&Tok::Comma) {
+                    break;
+                }
+            }
+            self.expect(&Tok::RParen, "')'")?;
+            return Ok(Stmt::AlterTableReorderColumns { table, order });
+        }
+        Err(err_at(
+            self.pos(),
+            "se esperaba ADD, MOVE o REORDER tras ALTER TABLE",
+        ))
     }
 
     fn column_def(&mut self) -> Result<ColumnAst> {

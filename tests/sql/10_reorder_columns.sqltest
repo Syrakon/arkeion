@@ -1,0 +1,94 @@
+-- ALTER TABLE … MOVE COLUMN / REORDER COLUMNS — reorden LÓGICO (de presentación).
+-- No reescribe filas ni mueve la posición física: solo cambia el orden de `*` y
+-- el del INSERT posicional. El acceso por nombre y los datos quedan intactos.
+
+> CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, c INTEGER);
+ok
+
+> INSERT INTO t (a, b, c) VALUES (10, 20, 30);
+affected 1
+
+-- Orden inicial: id, a, b, c.
+> SELECT * FROM t;
+1|10|20|30
+
+-- MOVE … FIRST: c pasa al frente → c, id, a, b.
+> ALTER TABLE t MOVE COLUMN c FIRST;
+ok
+
+> SELECT * FROM t;
+30|1|10|20
+
+-- MOVE … AFTER: id detrás de a → c, a, id, b.
+> ALTER TABLE t MOVE COLUMN id AFTER a;
+ok
+
+> SELECT * FROM t;
+30|10|1|20
+
+-- MOVE … BEFORE: b delante de c → b, c, a, id.
+> ALTER TABLE t MOVE COLUMN b BEFORE c;
+ok
+
+> SELECT * FROM t;
+20|30|10|1
+
+-- El acceso por nombre es independiente del orden de presentación.
+> SELECT id, a, b, c FROM t;
+1|10|20|30
+
+-- REORDER COLUMNS fija el orden lógico completo de una vez (vuelve al original).
+> ALTER TABLE t REORDER COLUMNS (id, a, b, c);
+ok
+
+> SELECT * FROM t;
+1|10|20|30
+
+-- El INSERT posicional liga en orden LÓGICO. En una tabla sin PK se ve limpio.
+> CREATE TABLE p (x INTEGER, y INTEGER, z INTEGER);
+ok
+
+> ALTER TABLE p REORDER COLUMNS (z, y, x);
+ok
+
+-- Los tres valores van a z, y, x (orden lógico), no a x, y, z.
+> INSERT INTO p VALUES (100, 200, 300);
+affected 1
+
+> SELECT x, y, z FROM p;
+300|200|100
+
+> SELECT * FROM p;
+100|200|300
+
+-- Reordenar no reescribe filas: una fila escrita con el orden viejo se sigue
+-- leyendo bien por nombre tras varios reordenamientos.
+> SELECT z FROM p;
+100
+
+-- Errores de MOVE.
+> ALTER TABLE t MOVE COLUMN nope FIRST;
+error columna desconocida
+
+> ALTER TABLE t MOVE COLUMN a AFTER a;
+error la referencia no puede ser la propia columna
+
+> ALTER TABLE t MOVE COLUMN a AFTER nope;
+error columna de referencia desconocida
+
+> ALTER TABLE t MOVE COLUMN a LAST;
+error se esperaba FIRST, BEFORE o AFTER
+
+-- Errores de REORDER: debe listar todas las columnas exactamente una vez.
+> ALTER TABLE t REORDER COLUMNS (id, a, b);
+error debe listar todas las columnas exactamente una vez
+
+> ALTER TABLE t REORDER COLUMNS (id, a, b, b);
+error columna repetida
+
+> ALTER TABLE t REORDER COLUMNS (id, a, b, nope);
+error columna desconocida
+
+-- Tabla inexistente.
+> ALTER TABLE nope MOVE COLUMN a FIRST;
+error tabla desconocida

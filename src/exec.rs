@@ -341,6 +341,14 @@ pub fn run_execute(tx: &mut WriteTx, stmt: &Stmt, params: &[Value]) -> Result<us
             )?;
             Ok(0)
         }
+        Stmt::AlterTableMoveColumn { table, column, pos } => {
+            tx.move_column(table, column, pos)?;
+            Ok(0)
+        }
+        Stmt::AlterTableReorderColumns { table, order } => {
+            tx.reorder_columns(table, order)?;
+            Ok(0)
+        }
         Stmt::Update {
             table,
             sets,
@@ -565,15 +573,19 @@ fn insert_values_into(
         // columnas con NULL que el usuario no escribió — para nombrar un
         // subconjunto está la forma `INSERT … (col, …) VALUES …`.
         None => {
-            for e in exprs {
-                out.push(eval_const(e, params)?);
-            }
-            if out.len() != def.columns.len() {
+            if exprs.len() != def.columns.len() {
                 return Err(sql_err(format!(
                     "la tabla tiene {} columnas pero se dieron {} valores",
                     def.columns.len(),
-                    out.len()
+                    exprs.len()
                 )));
+            }
+            // El i-ésimo valor va a la i-ésima columna **lógica** = posición física
+            // `logical_order[i]`. Con orden identidad, `out[i]` = valor i (idéntico
+            // al comportamiento anterior).
+            out.resize(def.columns.len(), Value::Null);
+            for (i, e) in exprs.iter().enumerate() {
+                out[def.logical_order[i]] = eval_const(e, params)?;
             }
             Ok(())
         }
@@ -806,18 +818,31 @@ pub fn run_select(src: &impl DataSource, stmt: &SelectStmt, params: &[Value]) ->
 
     let rows = limit_offset(rows, stmt, params)?;
 
+    // Mapa de la expansión de `*`: posición física (en la fila combinada) en orden
+    // LÓGICO de presentación, tabla a tabla. Con orden lógico identidad en todas
+    // las tablas es la identidad — y entonces el camino rápido (mover la fila tal
+    // cual, sin permutar) se conserva.
+    let mut star_map: Vec<usize> = Vec::new();
+    let mut base = 0;
+    for t in &schema.tables {
+        for &phys in &t.def.logical_order {
+            star_map.push(base + phys);
+        }
+        base += t.def.columns.len();
+    }
+    let star_identity = star_map.iter().enumerate().all(|(i, &p)| i == p);
+
     // Proyección.
     let mut columns = Vec::new();
     let mut projections: Vec<Option<&Expr>> = Vec::new(); // None = toda la fila (Star)
     for (i, item) in stmt.projection.iter().enumerate() {
         match item {
             SelectItem::Star => {
-                columns.extend(
-                    schema
-                        .tables
-                        .iter()
-                        .flat_map(|t| t.def.columns.iter().map(|c| c.name.clone())),
-                );
+                for t in &schema.tables {
+                    for &phys in &t.def.logical_order {
+                        columns.push(t.def.columns[phys].name.clone());
+                    }
+                }
                 projections.push(None);
             }
             SelectItem::Expr { expr: e, alias } => {
@@ -833,7 +858,7 @@ pub fn run_select(src: &impl DataSource, stmt: &SelectStmt, params: &[Value]) ->
     // `SELECT *` (única proyección que copia la fila combinada entera): la salida
     // ES la entrada, así que se mueve sin re-clonar valor a valor (camino canónico
     // del full scan).
-    if matches!(projections.as_slice(), [None]) {
+    if star_identity && matches!(projections.as_slice(), [None]) {
         return Ok(SelectOut { columns, rows });
     }
     let mut out_rows = Vec::with_capacity(rows.len());
@@ -841,7 +866,7 @@ pub fn run_select(src: &impl DataSource, stmt: &SelectStmt, params: &[Value]) ->
         let mut out = Vec::with_capacity(columns.len());
         for proj in &projections {
             match proj {
-                None => out.extend(row.iter().cloned()),
+                None => out.extend(star_map.iter().map(|&i| row[i].clone())),
                 Some(e) => out.push(eval(e, Some((&schema, row)), params)?),
             }
         }
@@ -898,9 +923,10 @@ pub fn stream_select(
     for item in &stmt.projection {
         match item {
             SelectItem::Star => {
-                for (c, col) in def.columns.iter().enumerate() {
-                    columns.push(col.name.clone());
-                    cols.push(c);
+                // Orden LÓGICO de presentación; `cols` mapea salida→posición física.
+                for &phys in &def.logical_order {
+                    columns.push(def.columns[phys].name.clone());
+                    cols.push(phys);
                 }
             }
             SelectItem::Expr {
@@ -2077,6 +2103,7 @@ mod tests {
                 default: None,
             }],
             indexes: Vec::new(),
+            logical_order: vec![0],
         };
         let schema = QuerySchema::single("t", def);
         let rows: Vec<Vec<Value>> = vec![
@@ -2127,6 +2154,7 @@ mod tests {
                 default: None,
             }],
             indexes: Vec::new(),
+            logical_order: vec![0],
         };
         let mut schema = QuerySchema::single("a", table("a"));
         schema.push("b", table("b")).unwrap();

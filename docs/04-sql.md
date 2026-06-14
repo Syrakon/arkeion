@@ -27,6 +27,8 @@ se **aceptan sintácticamente** y quedan registradas en el esquema, pero no se a
 CREATE TABLE [IF NOT EXISTS] tabla (col TIPO [restricciones], …);
 DROP TABLE [IF EXISTS] tabla;
 ALTER TABLE tabla ADD [COLUMN] col TIPO [DEFAULT v] [NOT NULL];  -- al final; no reescribe filas
+ALTER TABLE tabla MOVE COLUMN col {FIRST | BEFORE x | AFTER x};  -- reorden lógico (presentación)
+ALTER TABLE tabla REORDER COLUMNS (col, …);                     -- fija el orden lógico completo
 
 -- DML
 INSERT INTO tabla [(cols)] VALUES (expr, …)[, (expr, …)…];
@@ -45,6 +47,15 @@ SELECT lista | *                            -- FROM opcional: sin él, evalúa
 -- Transacciones
 BEGIN; COMMIT; ROLLBACK;
 ```
+
+`MOVE COLUMN` / `REORDER COLUMNS` reordenan columnas de forma **lógica** (solo el
+orden de presentación: la expansión de `*` y el `INSERT` posicional). La posición
+**física** y los bytes de las filas no se mueven nunca, así que es O(1), no reescribe
+filas y el time-travel queda intacto: un `AS OF` anterior al reorden ve el orden de su
+época (el orden de columnas se versiona en el mismo b-tree que los datos). El acceso
+por nombre, los índices y el `rowid_alias` son independientes del orden lógico. Es el
+modelo de `attlognum` que Postgres planeó y nunca envió; aquí sale gratis porque el
+catálogo ya es versionado. (DROP/RENAME COLUMN siguen fuera de v1.)
 
 Agregados (M4): `COUNT(*)`, `COUNT(col)`, `SUM`, `AVG`, `MIN`, `MAX`.
 
@@ -118,7 +129,7 @@ SELECT * FROM facturas AS OF TIMESTAMP '2026-05-01T00:00:00Z';
 |---|---|
 | Subconsultas, CTEs, `UNION` | v1.x |
 | Índices secundarios (`CREATE INDEX`) | v1.1 — espacio de claves `0x02` ya reservado en el formato |
-| `ALTER TABLE` salvo `ADD COLUMN` (DROP/RENAME COLUMN, etc.) | v1.x |
+| `ALTER TABLE` salvo `ADD COLUMN` / `MOVE COLUMN` / `REORDER COLUMNS` (DROP/RENAME COLUMN) | v1.x |
 | Optimizador de queries | fuera de alcance declarado de v1 |
 | Triggers, vistas, FK enforcement | sin fecha |
 

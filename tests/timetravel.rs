@@ -3,12 +3,20 @@
 //! prueba exhaustiva a nivel KV en `src/tx.rs`; aquí se valida de extremo a
 //! extremo el SQL y el cableado de la conexión.
 
-use arkeion::{AsOf, Connection, Database, Error, Options};
+use arkeion::{AsOf, Connection, Database, Error, Options, Value};
 
 fn fresh() -> (tempfile::TempDir, Database) {
     let dir = tempfile::tempdir().unwrap();
     let db = Database::open(dir.path().join("tt.arkeion"), Options::default()).unwrap();
     (dir, db)
+}
+
+/// Valores de la única fila de `sql`, en el orden de columnas que devuelve.
+fn star_row(conn: &Connection, sql: &str) -> Vec<Value> {
+    let mut rows = conn.query(sql, &[]).unwrap();
+    let ncols = rows.columns().len();
+    let row = rows.next().expect("la consulta no devolvió filas").unwrap();
+    (0..ncols).map(|i| row.get::<Value>(i).unwrap()).collect()
 }
 
 /// Valores de la columna `n` de una consulta, en orden de fila.
@@ -143,4 +151,63 @@ fn pinned_snapshot_connection_is_read_only_at_its_version() {
 
     // Fijar a una versión inexistente falla en el acto.
     assert!(conn.snapshot(AsOf::Version(conn.version() + 50)).is_err());
+}
+
+/// Reordenar columnas es **lógico** (de presentación): un `AS OF` anterior al
+/// reorden ve el orden de su época. La fila histórica nunca se reescribe (el
+/// registro es posicional-físico); solo cambia la permutación de presentación,
+/// que se versiona en el mismo b-tree que los datos. El acceso por nombre es
+/// independiente del orden, en head y en el pasado.
+#[test]
+fn column_reorder_is_logical_and_time_travel_safe() {
+    let (_dir, db) = fresh();
+    let conn = db.connect().unwrap();
+
+    conn.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, c INTEGER)",
+        &[],
+    )
+    .unwrap();
+    conn.execute("INSERT INTO t (a, b, c) VALUES (10, 20, 30)", &[])
+        .unwrap();
+    let v_before = conn.version(); // orden de presentación de entonces: id, a, b, c
+
+    conn.execute("ALTER TABLE t REORDER COLUMNS (c, b, a, id)", &[])
+        .unwrap();
+
+    // Head: `*` sale en el orden nuevo c, b, a, id.
+    assert_eq!(
+        star_row(&conn, "SELECT * FROM t"),
+        vec![
+            Value::Integer(30),
+            Value::Integer(20),
+            Value::Integer(10),
+            Value::Integer(1),
+        ],
+    );
+
+    // AS OF antes del reorden: el orden de entonces, id, a, b, c. La fila en disco
+    // es idéntica; solo se versionó la permutación de presentación.
+    assert_eq!(
+        star_row(&conn, &format!("SELECT * FROM t AS OF VERSION {v_before}")),
+        vec![
+            Value::Integer(1),
+            Value::Integer(10),
+            Value::Integer(20),
+            Value::Integer(30),
+        ],
+    );
+
+    // El acceso por nombre no depende del orden, ni en head ni en el pasado.
+    assert_eq!(
+        star_row(&conn, "SELECT a, b, c FROM t"),
+        vec![Value::Integer(10), Value::Integer(20), Value::Integer(30)],
+    );
+    assert_eq!(
+        star_row(
+            &conn,
+            &format!("SELECT a, b, c FROM t AS OF VERSION {v_before}")
+        ),
+        vec![Value::Integer(10), Value::Integer(20), Value::Integer(30)],
+    );
 }

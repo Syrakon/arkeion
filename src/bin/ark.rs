@@ -424,12 +424,15 @@ fn pad(s: &str, w: usize) -> String {
 }
 
 fn print_schema(t: &TableDef) {
+    // En orden LÓGICO de presentación (`logical_order`); el `rowid_alias` y las
+    // columnas de índice siguen siendo posiciones físicas.
     let cols: Vec<String> = t
-        .columns
+        .logical_order
         .iter()
-        .map(|c| {
+        .map(|&phys| {
+            let c = &t.columns[phys];
             let mut s = format!("{} {}", c.name, c.col_type.name());
-            if Some(c) == t.rowid_alias.and_then(|i| t.columns.get(i)) {
+            if t.rowid_alias == Some(phys) {
                 s.push_str(" PRIMARY KEY");
             } else if c.not_null {
                 s.push_str(" NOT NULL");

@@ -135,6 +135,13 @@ impl Parser {
 
     fn statement(&mut self) -> Result<Stmt> {
         match self.peek() {
+            Some(Tok::Kw(Kw::With)) => {
+                // `WITH … <select>`: las CTEs se adjuntan al SELECT que sigue.
+                let ctes = self.with_ctes()?;
+                let mut sel = self.select()?;
+                sel.with = ctes;
+                Ok(Stmt::Select(sel))
+            }
             Some(Tok::Kw(Kw::Create)) => self.create(),
             Some(Tok::Kw(Kw::Alter)) => self.alter_table(),
             Some(Tok::Kw(Kw::Drop)) => self.drop(),
@@ -494,7 +501,27 @@ impl Parser {
             offset: None,
             as_of: None,
             compound: Vec::new(),
+            with: Vec::new(),
         })
+    }
+
+    /// `WITH n1 AS (SELECT …)[, n2 AS (…)]`: CTEs, materializadas en orden (cada
+    /// una ve las anteriores). Se adjuntan al SELECT que las sigue.
+    fn with_ctes(&mut self) -> Result<Vec<Cte>> {
+        self.expect_kw(Kw::With, "WITH")?;
+        let mut ctes = Vec::new();
+        loop {
+            let name = self.ident("un nombre de CTE")?;
+            self.expect_kw(Kw::As, "AS")?;
+            self.expect(&Tok::LParen, "'(' tras AS")?;
+            let query = self.select()?;
+            self.expect(&Tok::RParen, "')'")?;
+            ctes.push(Cte { name, query });
+            if !self.eat(&Tok::Comma) {
+                break;
+            }
+        }
+        Ok(ctes)
     }
 
     /// Un SELECT completo: un núcleo, opcionalmente encadenado con `UNION [ALL]`,

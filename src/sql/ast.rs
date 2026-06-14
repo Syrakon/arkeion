@@ -140,6 +140,17 @@ pub struct SelectStmt {
     /// (`order_by`/`limit`/`offset`/`as_of`) las lleva este líder y aplican al
     /// conjunto entero; los núcleos de `compound` no las tienen.
     pub compound: Vec<CompoundSelect>,
+    /// `WITH …`: CTEs (tablas con nombre) visibles en este SELECT, materializadas
+    /// en orden (cada una ve las anteriores). Solo lo lleva el SELECT de nivel
+    /// superior; v1: no recursivo.
+    pub with: Vec<Cte>,
+}
+
+/// Una CTE: `nombre AS (SELECT …)`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Cte {
+    pub name: String,
+    pub query: SelectStmt,
 }
 
 /// Operador de conjunto entre SELECTs.

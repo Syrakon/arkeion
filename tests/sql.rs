@@ -65,10 +65,14 @@ fn run_file(path: &Path) {
 
 fn run_case(conn: &Connection, stmt: &str, expected: &[String], file: &str, line: usize) {
     let ctx = format!("{file}:{line}: {stmt}");
-    let is_select = stmt
+    // `SELECT` y `WITH … SELECT` devuelven filas (van por `query`).
+    let first_word = stmt
         .trim_start()
-        .get(..6)
-        .is_some_and(|s| s.eq_ignore_ascii_case("select"));
+        .split(|c: char| c.is_whitespace() || c == '(')
+        .next()
+        .unwrap_or("");
+    let is_select =
+        first_word.eq_ignore_ascii_case("select") || first_word.eq_ignore_ascii_case("with");
 
     // ¿Se espera un error?
     if let Some(sub) = expected.first().and_then(|e| e.strip_prefix("error")) {

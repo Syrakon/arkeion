@@ -109,6 +109,7 @@ pub enum Kw {
     Version,
     When,
     Where,
+    With,
 }
 
 fn keyword(word: &str) -> Option<Kw> {
@@ -184,6 +185,7 @@ fn keyword(word: &str) -> Option<Kw> {
         "VERSION" => Kw::Version,
         "WHEN" => Kw::When,
         "WHERE" => Kw::Where,
+        "WITH" => Kw::With,
         _ => return None,
     })
 }

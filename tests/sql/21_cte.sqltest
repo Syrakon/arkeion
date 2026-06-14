@@ -1,0 +1,41 @@
+-- WITH (CTEs no recursivas): tablas con nombre materializadas, visibles en el
+-- SELECT que las sigue. Una CTE ve las anteriores y tapa a una tabla real
+-- homónima. Existen solo dentro de su sentencia WITH.
+
+> CREATE TABLE sales (id INTEGER PRIMARY KEY, region TEXT, amount INTEGER);
+ok
+
+> INSERT INTO sales (region, amount) VALUES ('n', 10), ('n', 20), ('s', 30), ('s', 5);
+affected 4
+
+-- CTE simple: filtra y se consulta.
+> WITH big AS (SELECT region, amount FROM sales WHERE amount >= 20) SELECT region, amount FROM big ORDER BY amount;
+n|20
+s|30
+
+-- CTE con agregado.
+> WITH tot AS (SELECT region, sum(amount) AS s FROM sales GROUP BY region) SELECT region, s FROM tot ORDER BY region;
+n|30
+s|35
+
+-- Dos CTEs: la segunda ve la primera.
+> WITH a AS (SELECT amount FROM sales WHERE region = 'n'), b AS (SELECT amount FROM a WHERE amount > 10) SELECT amount FROM b;
+20
+
+-- CTE en un JOIN con una tabla real.
+> WITH hi AS (SELECT id, amount FROM sales WHERE amount >= 20) SELECT s.region, hi.amount FROM sales s INNER JOIN hi ON s.id = hi.id ORDER BY hi.amount;
+n|20
+s|30
+
+-- La CTE tapa a una tabla real del mismo nombre.
+> WITH sales AS (SELECT 99 AS amount) SELECT amount FROM sales;
+99
+
+-- Combina con subconsulta (que también ve la CTE).
+> WITH t AS (SELECT amount FROM sales WHERE region = 's') SELECT amount FROM t WHERE amount IN (SELECT amount FROM t) ORDER BY amount;
+5
+30
+
+-- Fuera del WITH la CTE no existe.
+> SELECT amount FROM big;
+error tabla desconocida

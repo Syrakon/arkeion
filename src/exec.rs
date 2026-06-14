@@ -706,6 +706,11 @@ fn run_select_no_from(stmt: &SelectStmt, params: &[Value]) -> Result<SelectOut> 
 }
 
 pub fn run_select(src: &impl DataSource, stmt: &SelectStmt, params: &[Value]) -> Result<SelectOut> {
+    // `WITH …`: materializa las CTEs y resuelve el resto contra un overlay que las
+    // expone como tablas. (`&dyn DataSource` para no recursar tipos sin fin.)
+    if !stmt.with.is_empty() {
+        return run_with_ctes(src, stmt, params);
+    }
     // Subconsultas NO correlacionadas: se ejecutan una vez y se sustituyen por su
     // valor (escalar → literal, IN → lista, EXISTS → bool) antes de evaluar nada.
     let resolved;
@@ -930,6 +935,105 @@ pub fn run_select(src: &impl DataSource, stmt: &SelectStmt, params: &[Value]) ->
 fn lookup(src: &impl DataSource, table: &TableRef) -> Result<TableDef> {
     src.table(&table.name)?
         .ok_or_else(|| sql_err(format!("tabla desconocida: {}", table.name)))
+}
+
+// --- CTEs (`WITH`): tablas con nombre materializadas, expuestas vía overlay ---
+
+/// Una CTE materializada: una `TableDef` sintética y sus filas en memoria.
+struct CteEntry {
+    name: String,
+    def: TableDef,
+    rows: Vec<Vec<Value>>,
+}
+
+/// `DataSource` que superpone CTEs materializadas sobre otra fuente. Una CTE
+/// **tapa** a una tabla real del mismo nombre (como en SQL). Usa `&dyn` para el
+/// interior para que anidar `WITH` no genere tipos sin fin en la monomorfización.
+struct CteSource<'a> {
+    inner: &'a dyn DataSource,
+    ctes: Vec<CteEntry>,
+}
+
+impl DataSource for CteSource<'_> {
+    fn table(&self, name: &str) -> Result<Option<TableDef>> {
+        match self.ctes.iter().find(|e| e.name == name) {
+            Some(e) => Ok(Some(e.def.clone())),
+            None => self.inner.table(name),
+        }
+    }
+    fn get_row(&self, table: &TableDef, rowid: i64) -> Result<Option<Vec<Value>>> {
+        // Las CTEs no tienen alias de rowid ⇒ el planificador nunca llega aquí por
+        // ellas; se delega por seguridad.
+        if self.ctes.iter().any(|e| e.def.table_id == table.table_id) {
+            return Ok(None);
+        }
+        self.inner.get_row(table, rowid)
+    }
+    fn scan_rows(&self, table: &TableDef) -> Result<Vec<Vec<Value>>> {
+        match self.ctes.iter().find(|e| e.def.table_id == table.table_id) {
+            Some(e) => Ok(e.rows.clone()),
+            None => self.inner.scan_rows(table),
+        }
+    }
+    // Las CTEs no tienen índices (def sin `indexes`) ⇒ el planificador no las usa
+    // por aquí; se delega siempre.
+    fn index_lookup(&self, table: &TableDef, idx: &IndexDef, values: &[Value]) -> Result<Vec<i64>> {
+        self.inner.index_lookup(table, idx, values)
+    }
+    fn index_range(
+        &self,
+        table: &TableDef,
+        idx: &IndexDef,
+        lo: Option<(&Value, bool)>,
+        hi: Option<(&Value, bool)>,
+    ) -> Result<Vec<i64>> {
+        self.inner.index_range(table, idx, lo, hi)
+    }
+}
+
+/// `TableDef` sintética para una CTA con esas columnas de salida. El `table_id`
+/// usa el rango alto (`u32::MAX - i`) para no chocar con tablas reales (que
+/// arrancan en 1). El tipo de columna no se consulta al leer, así que es relleno.
+fn synthetic_cte_def(name: &str, columns: &[String], idx: usize) -> TableDef {
+    let cols: Vec<ColumnDef> = columns
+        .iter()
+        .map(|c| ColumnDef {
+            name: c.clone(),
+            col_type: ColType::Integer, // relleno: no se consulta en lectura
+            not_null: false,
+            default: None,
+        })
+        .collect();
+    let n = cols.len();
+    TableDef {
+        name: name.to_string(),
+        table_id: u32::MAX - idx as u32,
+        rowid_alias: None,
+        columns: cols,
+        indexes: Vec::new(),
+        logical_order: (0..n).collect(),
+    }
+}
+
+/// Materializa las CTEs en orden (cada una ve las anteriores) y ejecuta el SELECT
+/// principal contra el overlay. No recursivo (v1).
+fn run_with_ctes(src: &dyn DataSource, stmt: &SelectStmt, params: &[Value]) -> Result<SelectOut> {
+    let mut overlay = CteSource {
+        inner: src,
+        ctes: Vec::new(),
+    };
+    for (i, cte) in stmt.with.iter().enumerate() {
+        let out = run_select(&overlay, &cte.query, params)?;
+        let def = synthetic_cte_def(&cte.name, &out.columns, i);
+        overlay.ctes.push(CteEntry {
+            name: cte.name.clone(),
+            def,
+            rows: out.rows,
+        });
+    }
+    let mut main = stmt.clone();
+    main.with = Vec::new();
+    run_select(&overlay, &main, params)
 }
 
 // --- subconsultas no correlacionadas (pre-pasada) ---
@@ -1220,8 +1324,9 @@ pub fn stream_select(
         || stmt.having.is_some()
         || !stmt.order_by.is_empty()
         || stmt.distinct // el streaming no deduplica
-        || !stmt.compound.is_empty()
-    // UNION va por el camino compuesto
+        || !stmt.compound.is_empty() // UNION va por el camino compuesto
+        || !stmt.with.is_empty()
+    // las CTEs necesitan el overlay (no el src crudo)
     {
         return Ok(None);
     }

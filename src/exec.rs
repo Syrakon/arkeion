@@ -1693,6 +1693,17 @@ fn eval(e: &Expr, row: Option<(&QuerySchema, &[Value])>, params: &[Value]) -> Re
                 BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod => {
                     arith(*op, l, eval(right, row, params)?)
                 }
+                // `||`: TEXT || TEXT (NULL propaga). Sin coerción implícita
+                // (filosofía del motor) — para concatenar otros tipos, `CAST`.
+                BinOp::Concat => match (l, eval(right, row, params)?) {
+                    (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
+                    (Value::Text(a), Value::Text(b)) => Ok(Value::Text(a + &b)),
+                    (a, b) => Err(sql_err(format!(
+                        "|| requiere TEXT, no {} y {} (usa CAST)",
+                        a.type_name(),
+                        b.type_name()
+                    ))),
+                },
             }
         }
         Expr::Function { name, args } => {

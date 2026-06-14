@@ -1,0 +1,37 @@
+-- Operador `||` (concatenación de TEXT). NULL propaga; otros tipos son error
+-- (sin coerción implícita — para eso está CAST). Precedencia estilo SQLite: liga
+-- más fuerte que `* / %` y que la comparación, más débil que el unario.
+
+> SELECT 'foo' || 'bar';
+foobar
+
+> SELECT 'a' || 'b' || 'c';
+abc
+
+> SELECT 'x' || NULL;
+NULL
+
+> SELECT NULL || 'y';
+NULL
+
+-- || liga más fuerte que `=`: se evalúa ('a'||'b') = 'ab'.
+> SELECT 'a' || 'b' = 'ab';
+TRUE
+
+-- En proyección y en WHERE sobre una tabla.
+> CREATE TABLE u (id INTEGER PRIMARY KEY, nombre TEXT, apellido TEXT);
+ok
+
+> INSERT INTO u (nombre, apellido) VALUES ('Ada', 'Lovelace'), ('Alan', 'Turing');
+affected 2
+
+> SELECT nombre || ' ' || apellido FROM u ORDER BY id;
+Ada Lovelace
+Alan Turing
+
+> SELECT id FROM u WHERE nombre || apellido = 'AlanTuring';
+2
+
+-- Tipo no-TEXT → error que guía a CAST.
+> SELECT 'n=' || 5;
+error requiere TEXT

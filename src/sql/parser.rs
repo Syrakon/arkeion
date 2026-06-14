@@ -717,7 +717,7 @@ impl Parser {
     }
 
     fn mul_expr(&mut self) -> Result<Expr> {
-        let mut left = self.unary_expr()?;
+        let mut left = self.concat_expr()?;
         loop {
             let op = match self.peek() {
                 Some(Tok::Star) => BinOp::Mul,
@@ -726,9 +726,20 @@ impl Parser {
                 _ => return Ok(left),
             };
             self.i += 1;
-            let right = self.unary_expr()?;
+            let right = self.concat_expr()?;
             left = Expr::Binary(Box::new(left), op, Box::new(right));
         }
+    }
+
+    /// `||` (concatenación): entre `mul` y `unary`, como en SQLite (`||` liga más
+    /// fuerte que `* / %` y más débil que el unario).
+    fn concat_expr(&mut self) -> Result<Expr> {
+        let mut left = self.unary_expr()?;
+        while self.eat(&Tok::Concat) {
+            let right = self.unary_expr()?;
+            left = Expr::Binary(Box::new(left), BinOp::Concat, Box::new(right));
+        }
+        Ok(left)
     }
 
     fn unary_expr(&mut self) -> Result<Expr> {

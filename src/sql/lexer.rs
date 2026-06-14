@@ -27,6 +27,8 @@ pub enum Tok {
     Star,
     Slash,
     Percent,
+    /// `||` — concatenación de texto.
+    Concat,
     LParen,
     RParen,
     Comma,
@@ -207,6 +209,13 @@ pub fn lex(sql: &str) -> Result<Vec<Spanned>> {
             b'/' => push(&mut out, Tok::Slash, start, &mut i),
             b'%' => push(&mut out, Tok::Percent, start, &mut i),
             b'=' => push(&mut out, Tok::Eq, start, &mut i),
+            b'|' if bytes.get(i + 1) == Some(&b'|') => {
+                out.push(Spanned {
+                    tok: Tok::Concat,
+                    pos: start,
+                });
+                i += 2;
+            }
             b'!' if bytes.get(i + 1) == Some(&b'=') => {
                 out.push(Spanned {
                     tok: Tok::Ne,

@@ -227,6 +227,8 @@ pub enum BinOp {
     Mul,
     Div,
     Mod,
+    /// `||` — concatenación de texto.
+    Concat,
 }
 
 impl Expr {

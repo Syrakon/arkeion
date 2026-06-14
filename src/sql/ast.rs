@@ -115,6 +115,8 @@ pub struct OrderBy {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct SelectStmt {
+    /// `SELECT DISTINCT`: deduplica las filas ya proyectadas.
+    pub distinct: bool,
     pub projection: Vec<SelectItem>,
     /// `FROM` es opcional: `SELECT <expr>, …` sin `FROM` evalúa expresiones
     /// constantes contra una única fila implícita (estilo SQLite). Sin tabla, la
@@ -185,10 +187,11 @@ pub enum Expr {
         pattern: Box<Expr>,
         negated: bool,
     },
-    /// `arg = None` solo para `COUNT(*)`.
+    /// `arg = None` solo para `COUNT(*)`. `distinct` para `COUNT(DISTINCT x)` etc.
     Aggregate {
         func: AggFunc,
         arg: Option<Box<Expr>>,
+        distinct: bool,
     },
     /// Llamada a una función **escalar** built-in: `nombre(arg, …)` (no agregado).
     /// El nombre se resuelve en exec (insensible a mayúsculas); aridad y tipos se

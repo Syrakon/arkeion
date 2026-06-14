@@ -427,6 +427,7 @@ impl Parser {
 
     fn select(&mut self) -> Result<SelectStmt> {
         self.expect_kw(Kw::Select, "SELECT")?;
+        let distinct = self.eat_kw(Kw::Distinct);
         let mut projection = vec![self.select_item()?];
         while self.eat(&Tok::Comma) {
             projection.push(self.select_item()?);
@@ -514,6 +515,7 @@ impl Parser {
         };
         let as_of = self.as_of()?;
         Ok(SelectStmt {
+            distinct,
             projection,
             from,
             joins,
@@ -871,7 +873,11 @@ impl Parser {
                         _ => None,
                     };
                     if let Some(func) = agg {
+                        let distinct = self.eat_kw(Kw::Distinct); // COUNT(DISTINCT x)
                         let arg = if self.eat(&Tok::Star) {
+                            if distinct {
+                                return Err(err_at(pos, "DISTINCT no admite '*'"));
+                            }
                             if func != AggFunc::Count {
                                 return Err(err_at(pos, "solo COUNT admite '*'"));
                             }
@@ -880,7 +886,11 @@ impl Parser {
                             Some(Box::new(self.expr()?))
                         };
                         self.expect(&Tok::RParen, "')'")?;
-                        return Ok(Expr::Aggregate { func, arg });
+                        return Ok(Expr::Aggregate {
+                            func,
+                            arg,
+                            distinct,
+                        });
                     }
                     // Función escalar built-in: `nombre(arg, …)` (el nombre se
                     // resuelve en exec; `*` no se admite como argumento).
@@ -1104,7 +1114,8 @@ mod tests {
             SelectItem::Expr {
                 expr: Expr::Aggregate {
                     func: AggFunc::Count,
-                    arg: None
+                    arg: None,
+                    ..
                 },
                 ..
             }
@@ -1114,7 +1125,8 @@ mod tests {
             SelectItem::Expr {
                 expr: Expr::Aggregate {
                     func: AggFunc::Sum,
-                    arg: Some(_)
+                    arg: Some(_),
+                    ..
                 },
                 ..
             }

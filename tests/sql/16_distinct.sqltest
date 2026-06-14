@@ -1,0 +1,49 @@
+-- SELECT DISTINCT (deduplica las filas ya proyectadas, antes del LIMIT) y
+-- COUNT/SUM(DISTINCT x) (deduplica los valores del grupo antes de plegar).
+
+> CREATE TABLE d (id INTEGER PRIMARY KEY, cat TEXT, n INTEGER);
+ok
+
+> INSERT INTO d (cat, n) VALUES ('a', 1), ('a', 1), ('b', 2), ('a', 3), ('b', 2);
+affected 5
+
+-- DISTINCT sobre una columna.
+> SELECT DISTINCT cat FROM d ORDER BY cat;
+a
+b
+
+-- DISTINCT sobre la fila proyectada (cat, n).
+> SELECT DISTINCT cat, n FROM d ORDER BY cat, n;
+a|1
+a|3
+b|2
+
+-- DISTINCT con LIMIT: deduplica ANTES de recortar.
+> SELECT DISTINCT cat FROM d ORDER BY cat LIMIT 1;
+a
+
+-- DISTINCT * (todas las filas son distintas por su PK).
+> SELECT DISTINCT * FROM d ORDER BY id LIMIT 2;
+1|a|1
+2|a|1
+
+-- COUNT(DISTINCT x) vs COUNT(x).
+> SELECT COUNT(DISTINCT cat) FROM d;
+2
+
+> SELECT COUNT(DISTINCT n) FROM d;
+3
+
+> SELECT COUNT(n) FROM d;
+5
+
+-- SUM(DISTINCT n) = 1+2+3 = 6, no 1+1+2+3+2 = 9.
+> SELECT SUM(DISTINCT n) FROM d;
+6
+
+> SELECT SUM(n) FROM d;
+9
+
+-- Error: DISTINCT con '*' en un agregado.
+> SELECT COUNT(DISTINCT *) FROM d;
+error DISTINCT no admite

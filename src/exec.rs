@@ -833,7 +833,14 @@ pub fn run_select(src: &impl DataSource, stmt: &SelectStmt, params: &[Value]) ->
         }
     }
 
-    let rows = limit_offset(rows, stmt, params)?;
+    // Sin DISTINCT, LIMIT/OFFSET se aplica ya (cada fila de entrada da una de
+    // salida). Con DISTINCT la proyección cambia la cardinalidad ⇒ se proyecta
+    // todo, se deduplica y se recorta DESPUÉS.
+    let rows = if stmt.distinct {
+        rows
+    } else {
+        limit_offset(rows, stmt, params)?
+    };
 
     // Mapa de la expansión de `*`: posición física (en la fila combinada) en orden
     // LÓGICO de presentación, tabla a tabla. Con orden lógico identidad en todas
@@ -874,8 +881,9 @@ pub fn run_select(src: &impl DataSource, stmt: &SelectStmt, params: &[Value]) ->
     }
     // `SELECT *` (única proyección que copia la fila combinada entera): la salida
     // ES la entrada, así que se mueve sin re-clonar valor a valor (camino canónico
-    // del full scan).
-    if star_identity && matches!(projections.as_slice(), [None]) {
+    // del full scan). Con DISTINCT hay que materializar para deduplicar, así que se
+    // salta este atajo.
+    if !stmt.distinct && star_identity && matches!(projections.as_slice(), [None]) {
         return Ok(SelectOut { columns, rows });
     }
     let mut out_rows = Vec::with_capacity(rows.len());
@@ -888,6 +896,12 @@ pub fn run_select(src: &impl DataSource, stmt: &SelectStmt, params: &[Value]) ->
             }
         }
         out_rows.push(out);
+    }
+    // DISTINCT: deduplica conservando el orden (la primera ocurrencia), y recorta
+    // ya sobre el resultado deduplicado.
+    if stmt.distinct {
+        out_rows = dedup_preserving(out_rows);
+        out_rows = limit_offset(out_rows, stmt, params)?;
     }
     Ok(SelectOut {
         columns,
@@ -978,6 +992,18 @@ pub fn stream_select(
         offset,
         limit,
     }))
+}
+
+/// Deduplica filas conservando la primera ocurrencia (`SELECT DISTINCT`). O(n²):
+/// `Value` no es `Hash` (REAL/BLOB), pero n suele ser pequeño tras los filtros.
+fn dedup_preserving(rows: Vec<Vec<Value>>) -> Vec<Vec<Value>> {
+    let mut out: Vec<Vec<Value>> = Vec::with_capacity(rows.len());
+    for r in rows {
+        if !out.contains(&r) {
+            out.push(r);
+        }
+    }
+    out
 }
 
 fn limit_offset(
@@ -1499,9 +1525,14 @@ fn fold_aggregates(
     params: &[Value],
 ) -> Result<Expr> {
     Ok(match e {
-        Expr::Aggregate { func, arg } => Expr::Literal(compute_aggregate(
+        Expr::Aggregate {
+            func,
+            arg,
+            distinct,
+        } => Expr::Literal(compute_aggregate(
             *func,
             arg.as_deref(),
+            *distinct,
             schema,
             rows,
             params,
@@ -1582,6 +1613,7 @@ fn fold_aggregates(
 fn compute_aggregate(
     func: AggFunc,
     arg: Option<&Expr>,
+    distinct: bool,
     schema: &QuerySchema,
     rows: &[Vec<Value>],
     params: &[Value],
@@ -1593,16 +1625,31 @@ fn compute_aggregate(
     if arg.has_aggregate() {
         return Err(sql_err("agregados anidados"));
     }
+    // Valores no-NULL del argumento (NULL se ignora, estándar SQL). DISTINCT
+    // deduplica conservando el orden antes de plegar (Value no es Hash → O(n²),
+    // pero n es el de un grupo, pequeño).
+    let mut values: Vec<Value> = Vec::new();
+    for row in rows {
+        let v = eval(arg, Some((schema, row)), params)?;
+        if !matches!(v, Value::Null) {
+            values.push(v);
+        }
+    }
+    if distinct {
+        let mut seen: Vec<Value> = Vec::with_capacity(values.len());
+        for v in values {
+            if !seen.contains(&v) {
+                seen.push(v);
+            }
+        }
+        values = seen;
+    }
     let mut count: i64 = 0;
     let mut sum_i: i64 = 0;
     let mut sum_f: f64 = 0.0;
     let mut real_seen = false;
     let mut best: Option<Value> = None;
-    for row in rows {
-        let v = eval(arg, Some((schema, row)), params)?;
-        if matches!(v, Value::Null) {
-            continue;
-        }
+    for v in values {
         count += 1;
         match func {
             AggFunc::Count => {}
@@ -2467,7 +2514,7 @@ mod tests {
             vec![Value::Integer(30)],
         ];
         let agg = |func: AggFunc, arg: Option<Expr>| {
-            compute_aggregate(func, arg.as_ref(), &schema, &rows, &[]).unwrap()
+            compute_aggregate(func, arg.as_ref(), false, &schema, &rows, &[]).unwrap()
         };
         let col = Expr::Column {
             table: None,
@@ -2487,6 +2534,7 @@ mod tests {
                 table: None,
                 name: "v".into(),
             }),
+            false,
             &schema,
             &[],
             &[],

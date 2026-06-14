@@ -29,6 +29,8 @@ DROP TABLE [IF EXISTS] tabla;
 ALTER TABLE tabla ADD [COLUMN] col TIPO [DEFAULT v] [NOT NULL];  -- al final; no reescribe filas
 ALTER TABLE tabla MOVE COLUMN col {FIRST | BEFORE x | AFTER x};  -- reorden lógico (presentación)
 ALTER TABLE tabla REORDER COLUMNS (col, …);                     -- fija el orden lógico completo
+CREATE VIEW [IF NOT EXISTS] vista AS <select>;                  -- SELECT con nombre (no recursiva)
+DROP VIEW [IF EXISTS] vista;
 
 -- DML
 INSERT INTO tabla [(cols)] VALUES (expr, …)[, (expr, …)…];
@@ -85,6 +87,11 @@ evaluar la consulta exterior; una subconsulta escalar con >1 fila es error, con 
 **CTEs** (`WITH n AS (SELECT …)`): tablas con nombre materializadas, visibles en el
 SELECT que sigue; cada una ve las anteriores y tapa a una tabla real homónima. No
 recursivas.
+
+**Vistas** (`CREATE VIEW v AS SELECT …`): como una CTE pero **persistente** — su
+SELECT se guarda como texto en el catálogo y se materializa al consultarla (refleja
+los datos actuales). Una vista sobre otra funciona; los nombres no colisionan con
+tablas. No recursivas.
 
 `GROUP BY` / `HAVING` (post-M9): `SELECT … GROUP BY e1, e2 [HAVING cond]` agrupa por el
 valor de las expresiones (normalmente columnas) y emite una fila por grupo, plegando los
@@ -160,8 +167,8 @@ SELECT * FROM facturas AS OF TIMESTAMP '2026-05-01T00:00:00Z';
 | `INTERSECT` / `EXCEPT` (`UNION [ALL]` sí) | v1.x |
 | Índices secundarios (`CREATE INDEX`) | hecho (v1.1) — espacio de claves `0x02` ya reservado en el formato |
 | `ALTER TABLE` salvo `ADD COLUMN` / `MOVE COLUMN` / `REORDER COLUMNS` (DROP/RENAME COLUMN) | v1.x |
-| Optimizador de queries | fuera de alcance declarado de v1 |
-| Triggers, vistas, FK enforcement | sin fecha |
+| Optimizador de queries (CBO con estadísticas) | fuera de alcance; sí hay un planificador por reglas (index vs scan) |
+| Triggers, FK enforcement | en camino (vistas ✅ hechas) |
 
 ## Gramática y codegen (`.gate`)
 

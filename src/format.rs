@@ -38,10 +38,12 @@ pub const MAGIC_COMMIT: &[u8; 8] = b"ARKCMT01";
 /// registros de longitud variable + directorio de páginas. v3: nodos b-tree con
 /// **array de punteros a celda** (búsqueda binaria in-page). v4: **clave de fila
 /// de longitud variable** (`[0x01][enc_oint(table_id)][enc_oint(rowid)]`, ~6 B vs
-/// 13 fijos). Ruptura limpia entre versiones (pre-1.0 no hay DBs persistidas): no
-/// se implementa lectura dual; una migración entre formatos sería un rewrite
-/// estilo `vacuum`.
-pub const FORMAT_VERSION: u32 = 4;
+/// 13 fijos). v5: misma clave **sin byte de namespace** (`[enc_oint(table_id)]
+/// [enc_oint(rowid)]`, ~5 B) — la cabecera `0x80+` de `table_id` ya la distingue
+/// de los keyspaces de catálogo (`0x00`) e índice (`0x02`). Ruptura limpia entre
+/// versiones (pre-1.0 no hay DBs persistidas): no se implementa lectura dual; una
+/// migración entre formatos sería un rewrite estilo `vacuum`.
+pub const FORMAT_VERSION: u32 = 5;
 
 /// `FileHeader.flags` bit 0: cifrado en reposo activo.
 pub const FLAG_ENCRYPTED: u32 = 1;

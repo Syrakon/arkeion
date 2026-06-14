@@ -9,8 +9,9 @@
 //! [0x00,0x02, table_id BE]          → próximo rowid (i64 LE)
 //! [0x00,0x03]                       → próximo index_id (u32 LE)
 //! [0x00,0x04, nombre índice UTF-8]  → nombre de tabla (ref global del índice)
-//! [0x01, enc_oint(table_id), enc_oint(rowid)] → registro (v4: enteros
-//!                                    order-preserving de longitud variable)
+//! [enc_oint(table_id), enc_oint(rowid)] → registro (v5: enteros
+//!     order-preserving de longitud variable; sin byte de namespace — la
+//!     cabecera 0x80+ de table_id ya lo distingue de 0x00/0x02)
 //! [0x02, index_id BE, valor*, rowid BE*] → entrada de índice (valor memcomparable)
 //! ```
 
@@ -24,7 +25,8 @@ pub const MAX_COLUMNS: usize = 255;
 pub const MAX_NAME_LEN: usize = 128;
 
 const KS_CATALOG: u8 = 0x00;
-const KS_ROW: u8 = 0x01;
+// 0x01 era el byte de namespace de las filas (v4); en v5 la clave de fila empieza
+// directo por enc_oint(table_id) (cabecera 0x80+), disjunta de 0x00 y 0x02.
 const KS_INDEX: u8 = 0x02;
 const CAT_META: u8 = 0x00;
 const CAT_TABLE: u8 = 0x01;
@@ -133,35 +135,38 @@ fn counter_key(table_id: u32) -> [u8; 6] {
     k
 }
 
-/// Clave de fila `[0x01][enc_oint(table_id)][enc_oint(rowid)]` (v4): `table_id` y
+/// Clave de fila `[enc_oint(table_id)][enc_oint(rowid)]` (v5): `table_id` y
 /// `rowid` van en el entero order-preserving de longitud variable de `keyenc`, así
-/// que una fila típica cuesta ~6 B en vez de los 13 fijos de v3 — conservando el
-/// orden `(table_id, rowid)` del b-tree (ambos códigos son self-delimitados y
-/// ninguno es prefijo de otro).
+/// que una fila típica cuesta ~5 B (~6 con el byte de namespace de v4, 13 fijos en
+/// v3) — conservando el orden `(table_id, rowid)` del b-tree (ambos códigos son
+/// self-delimitados y ninguno es prefijo de otro). **No lleva byte de namespace**:
+/// `table_id ≥ 1` ⇒ la cabecera de `enc_oint` es `0x81..=0x84`, disjunta de los
+/// keyspaces de catálogo (`0x00`) e índice (`0x02`), así que la clave se
+/// auto-identifica por su primer byte (≥ `0x80`).
 pub fn row_key(table_id: u32, rowid: i64) -> Vec<u8> {
-    let mut k = Vec::with_capacity(7);
-    k.push(KS_ROW);
+    let mut k = Vec::with_capacity(6);
     keyenc::encode_oint(table_id as i64, &mut k);
     keyenc::encode_oint(rowid, &mut k);
     k
 }
 
-/// Prefijo de **todas** las filas de una tabla: `[0x01][enc_oint(table_id)]`.
+/// Prefijo de **todas** las filas de una tabla: `[enc_oint(table_id)]`.
 fn row_prefix(table_id: u32) -> Vec<u8> {
-    let mut p = Vec::with_capacity(3);
-    p.push(KS_ROW);
+    let mut p = Vec::with_capacity(2);
     keyenc::encode_oint(table_id as i64, &mut p);
     p
 }
 
 /// Decodifica una clave de fila en `(table_id, rowid)`, o `None` si no es una
 /// (otro keyspace o mal formada). Inverso de [`row_key`]; lo usan el diff de ramas
-/// y la extracción del alias de rowid en el scan.
+/// y la extracción del alias de rowid en el scan. Una clave de fila empieza por
+/// `enc_oint(table_id ≥ 1)` ⇒ primer byte `≥ 0x80`, lo que la distingue del
+/// catálogo (`0x00`) y los índices (`0x02`).
 pub(crate) fn decode_row_key(key: &[u8]) -> Option<(u32, i64)> {
-    if key.first() != Some(&KS_ROW) {
+    if *key.first()? < 0x80 {
         return None;
     }
-    let mut pos = 1;
+    let mut pos = 0;
     let table_id = keyenc::decode_oint(key, &mut pos)?;
     let rowid = keyenc::decode_oint(key, &mut pos)?;
     Some((u32::try_from(table_id).ok()?, rowid))

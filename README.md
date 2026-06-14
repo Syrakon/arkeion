@@ -184,19 +184,20 @@ tamper-evidence como arkeion**, en una transacción (1 fsync). El foso inatacabl
 
 | | tamaño |
 |---|--:|
-| arkeion — insert (1 commit) | 3.5 MB |
+| arkeion — insert (1 commit) | 3.4 MB |
 | arkeion — insert **comprimido** (opt-in) | 0.8 MB |
-| arkeion — +1 update de todo (historia CoW retenida) | 7.0 MB |
-| arkeion — tras `vacuum KeepLast(1)` | 3.5 MB |
+| arkeion — +1 update de todo (historia CoW retenida) | 6.9 MB |
+| arkeion — tras `vacuum KeepLast(1)` | 3.4 MB |
 | SQLite — insert (1 commit) | 2.8 MB |
 | SQLite — +1 update de todo (in-place, sin historia) | 2.8 MB |
 
 **Honestidad**: la fila de 0.8 MB compara el modo **comprimido (opcional, off por defecto)** de arkeion
 contra SQLite **sin** comprimir, y sobre un dataset deliberadamente muy comprimible (la columna TEXT es
-una constante). **Motor-a-motor en modo por defecto: 3.5 MB (arkeion) vs 2.8 MB (SQLite)** — arkeion
-~1.25× **mayor**. La **clave de fila es de longitud variable** (v4: `[0x01][enc_oint(table_id)][enc_oint(rowid)]`,
-~6 B típicos en vez de los 13 fijos de antes — entero order-preserving que mantiene el orden del b-tree);
-el resto del gap es el byte de flags y la longitud de clave de la celda genérica (un único b-tree para
+una constante). **Motor-a-motor en modo por defecto: 3.4 MB (arkeion) vs 2.8 MB (SQLite)** — arkeion
+~1.21× **mayor**. La **clave de fila es de longitud variable** (v5: `[enc_oint(table_id)][enc_oint(rowid)]`,
+~5 B típicos en vez de los 13 fijos de antes — enteros order-preserving que mantienen el orden del b-tree,
+sin byte de namespace porque su cabecera `0x80+` ya la distingue del catálogo y los índices); el resto del
+gap es el byte de flags y la longitud de clave de la celda genérica (un único b-tree para
 tablas/índices/catálogo) más el registro auto-descriptivo. El array de punteros v3 (2 B/celda) y la
 reserva cripto por página (28 B) son marginales; las hojas ya van casi llenas (split sesgado a la derecha
 en inserción secuencial, como SQLite). La compresión opcional usa **Densa** (LZSS + un codificador de

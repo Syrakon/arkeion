@@ -73,9 +73,9 @@ pub(crate) fn decode(key_diffs: &[KeyDiff]) -> Diff {
             }
             // Otros metadatos del catálogo (contadores): internos, se omiten.
             Some(0x00) => {}
-            // Fila: [0x01, enc_oint(table_id), enc_oint(rowid)] (v4, longitud
-            // variable). `decode_row_key` es la única fuente del layout.
-            Some(0x01) => {
+            // Fila: [enc_oint(table_id), enc_oint(rowid)] (v5). La cabecera de
+            // table_id es ≥ 0x80; `decode_row_key` es la única fuente del layout.
+            Some(&b) if b >= 0x80 => {
                 if let Some((table_id, rowid)) = catalog::decode_row_key(key) {
                     diff.rows.push(RowChange {
                         table_id,
@@ -84,7 +84,7 @@ pub(crate) fn decode(key_diffs: &[KeyDiff]) -> Diff {
                     });
                 }
             }
-            // Espacios reservados (índices secundarios, v1.1): se ignoran.
+            // Índices secundarios (0x02) y demás: se ignoran en el diff de filas.
             _ => {}
         }
     }

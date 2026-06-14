@@ -64,7 +64,9 @@ paralelo y nunca bloquean. Consecuencias a vigilar:
    + `Client`; CRUD, **aislamiento de rama**, **`AS OF`** y **`verify`** por el cable.
    **Hecho** (incluye `verify`, que estaba previsto aquí).
 3. **`diff`/`merge` por la red** — los RPCs de branching que rematan la semántica
-   git en la conexión.
+   git en la conexión. `Client::diff`/`merge` espejan `Database::diff`/`merge`;
+   conflictos → `Error`. e2e: rama, `diff` (fila Added), `merge`, comprobar fusión.
+   **Hecho.**
 4. **Transacciones multi-sentencia** (con timeout del escritor).
 5. **TLS + auth + permisos por rama.**
 6. *(Opcional)* capa de compatibilidad **pgwire** para CRUD genérico.

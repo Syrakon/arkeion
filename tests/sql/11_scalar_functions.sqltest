@@ -1,0 +1,107 @@
+-- Librería escalar ampliada: nullif, replace, instr, reverse, hex, ceil/floor,
+-- sqrt, pow/power, mod, sign, random. NULL se propaga salvo donde se indique.
+
+-- nullif: complemento de coalesce/ifnull.
+> SELECT nullif(5, 5);
+NULL
+
+> SELECT nullif(5, 9);
+5
+
+> SELECT nullif(NULL, 1);
+NULL
+
+> SELECT nullif(1, NULL);
+1
+
+-- replace: patrón vacío no sustituye (como SQLite); NULL propaga.
+> SELECT replace('banana', 'a', 'o');
+bonono
+
+> SELECT replace('abc', '', 'X');
+abc
+
+> SELECT replace(NULL, 'a', 'b');
+NULL
+
+-- instr: 1-based en caracteres, 0 si no aparece, aguja vacía → 1, unicode OK.
+> SELECT instr('hello', 'l');
+3
+
+> SELECT instr('hello', 'z');
+0
+
+> SELECT instr('héllo', 'llo');
+3
+
+> SELECT instr('abc', '');
+1
+
+-- reverse: por caracteres (unicode), no por bytes.
+> SELECT reverse('abc');
+cba
+
+> SELECT reverse('café');
+éfac
+
+-- hex: TEXT/BLOB → hex en mayúsculas.
+> SELECT hex('AB');
+4142
+
+-- ceil/floor: REAL → REAL; INTEGER pasa tal cual.
+> SELECT ceil(4.2);
+5.0
+
+> SELECT floor(4.8);
+4.0
+
+> SELECT ceil(7);
+7
+
+-- sqrt: negativo → NULL (no error).
+> SELECT sqrt(9);
+3.0
+
+> SELECT sqrt(-4);
+NULL
+
+-- pow/power.
+> SELECT pow(2, 10);
+1024.0
+
+> SELECT power(2, 3);
+8.0
+
+-- mod: mismo cero→NULL que el operador %.
+> SELECT mod(7, 3);
+1
+
+> SELECT mod(10, 0);
+NULL
+
+-- sign: -1 / 0 / 1 como INTEGER.
+> SELECT sign(-5);
+-1
+
+> SELECT sign(0);
+0
+
+> SELECT sign(3.5);
+1
+
+> SELECT sign(NULL);
+NULL
+
+-- random(): no determinista, pero siempre INTEGER.
+> SELECT typeof(random());
+INTEGER
+
+-- Errores.
+> SELECT reverse(1);
+error requiere TEXT
+
+> SELECT bogus(1);
+error función desconocida
+
+> SELECT nullif(1);
+error número de argumentos inválido

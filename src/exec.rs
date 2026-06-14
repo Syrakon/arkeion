@@ -1857,8 +1857,168 @@ fn call_function(name: &str, args: &[Value]) -> Result<Value> {
             let (b, e) = (begin.min(n) as usize, end.max(begin).min(n) as usize);
             Ok(Value::Text(chars[b..e].iter().collect()))
         }
+        "nullif" => match args {
+            // a, salvo que a == b ⇒ NULL. Complemento de coalesce/ifnull.
+            [a, b] => Ok(match cmp_values(a, b)? {
+                Some(Ordering::Equal) => Value::Null,
+                _ => a.clone(),
+            }),
+            _ => Err(bad_arity()),
+        },
+        "replace" => match args {
+            [Value::Null, _, _] | [_, Value::Null, _] | [_, _, Value::Null] => Ok(Value::Null),
+            [Value::Text(s), Value::Text(from), Value::Text(to)] => {
+                Ok(Value::Text(if from.is_empty() {
+                    s.clone() // patrón vacío no sustituye (como SQLite)
+                } else {
+                    s.replace(from.as_str(), to)
+                }))
+            }
+            [_, _, _] => Err(sql_err("replace(texto, de, a) requiere TEXT")),
+            _ => Err(bad_arity()),
+        },
+        "instr" => match args {
+            [Value::Null, _] | [_, Value::Null] => Ok(Value::Null),
+            [Value::Text(hay), Value::Text(needle)] => {
+                // 1-based en caracteres; 0 si no aparece; aguja vacía ⇒ 1 (SQLite).
+                let pos = if needle.is_empty() {
+                    1
+                } else {
+                    match hay.find(needle.as_str()) {
+                        Some(byte_idx) => hay[..byte_idx].chars().count() as i64 + 1,
+                        None => 0,
+                    }
+                };
+                Ok(Value::Integer(pos))
+            }
+            [_, _] => Err(sql_err("instr(texto, sub) requiere TEXT")),
+            _ => Err(bad_arity()),
+        },
+        "reverse" => match args {
+            [Value::Null] => Ok(Value::Null),
+            [Value::Text(s)] => Ok(Value::Text(s.chars().rev().collect())),
+            [v] => Err(need_text(v)),
+            _ => Err(bad_arity()),
+        },
+        "hex" => match args {
+            [Value::Null] => Ok(Value::Null),
+            [Value::Text(s)] => Ok(Value::Text(to_hex(s.as_bytes()))),
+            [Value::Blob(b)] => Ok(Value::Text(to_hex(b))),
+            [v] => Err(sql_err(format!(
+                "hex() requiere TEXT o BLOB, no {}",
+                v.type_name()
+            ))),
+            _ => Err(bad_arity()),
+        },
+        "ceil" | "ceiling" | "floor" => match args {
+            [Value::Null] => Ok(Value::Null),
+            [Value::Integer(n)] => Ok(Value::Integer(*n)),
+            [Value::Real(f)] => Ok(Value::Real(if lname == "floor" {
+                f.floor()
+            } else {
+                f.ceil()
+            })),
+            [v] => Err(need_num(v)),
+            _ => Err(bad_arity()),
+        },
+        "sqrt" => match args {
+            // Raíz de negativo ⇒ NULL (como SQLite), no error.
+            [Value::Null] => Ok(Value::Null),
+            [Value::Integer(n)] => Ok(if *n < 0 {
+                Value::Null
+            } else {
+                Value::Real((*n as f64).sqrt())
+            }),
+            [Value::Real(f)] => Ok(if *f < 0.0 {
+                Value::Null
+            } else {
+                Value::Real(f.sqrt())
+            }),
+            [v] => Err(need_num(v)),
+            _ => Err(bad_arity()),
+        },
+        "pow" | "power" => match args {
+            [Value::Null, _] | [_, Value::Null] => Ok(Value::Null),
+            [a, b] => {
+                let x = num_f64(a).ok_or_else(|| need_num(a))?;
+                let y = num_f64(b).ok_or_else(|| need_num(b))?;
+                Ok(Value::Real(x.powf(y)))
+            }
+            _ => Err(bad_arity()),
+        },
+        "mod" => match args {
+            // Mismo cero→NULL y desbordamiento que el operador `%`.
+            [a, b] => arith(BinOp::Mod, a.clone(), b.clone()),
+            _ => Err(bad_arity()),
+        },
+        "sign" => match args {
+            [Value::Null] => Ok(Value::Null),
+            [Value::Integer(n)] => Ok(Value::Integer(n.signum())),
+            [Value::Real(f)] => Ok(if f.is_nan() {
+                Value::Null
+            } else if *f > 0.0 {
+                Value::Integer(1)
+            } else if *f < 0.0 {
+                Value::Integer(-1)
+            } else {
+                Value::Integer(0)
+            }),
+            [v] => Err(need_num(v)),
+            _ => Err(bad_arity()),
+        },
+        "random" => match args {
+            // i64 aleatorio (como SQLite). No determinista: escribirlo en una fila
+            // produce un valor irreproducible — elección del usuario, igual que
+            // current_timestamp.
+            [] => Ok(Value::Integer(next_random())),
+            _ => Err(bad_arity()),
+        },
         _ => Err(sql_err(format!("función desconocida: {name}()"))),
     }
+}
+
+/// Bytes → hex en mayúsculas (para `hex()`).
+fn to_hex(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(s, "{b:02X}");
+    }
+    s
+}
+
+/// Valor numérico como `f64` (INTEGER o REAL), o `None` si no es numérico.
+fn num_f64(v: &Value) -> Option<f64> {
+    match v {
+        Value::Integer(n) => Some(*n as f64),
+        Value::Real(f) => Some(*f),
+        _ => None,
+    }
+}
+
+/// PRNG por hilo para `random()`: xorshift64 sembrado del reloj. Sin dependencias
+/// externas (supply-chain mínima, D8) y sin `unsafe` (`Cell` basta).
+fn next_random() -> i64 {
+    use std::cell::Cell;
+    fn seed() -> u64 {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0x9E37_79B9_7F4A_7C15);
+        (nanos ^ 0x9E37_79B9_7F4A_7C15) | 1 // nunca 0 (xorshift se quedaría en 0)
+    }
+    thread_local! {
+        static STATE: Cell<u64> = Cell::new(seed());
+    }
+    STATE.with(|s| {
+        let mut x = s.get();
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        s.set(x);
+        x as i64
+    })
 }
 
 /// Lógica trivalente: `Some(bool)` o `None` (NULL = desconocido).

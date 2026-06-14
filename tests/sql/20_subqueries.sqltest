@@ -1,0 +1,52 @@
+-- Subconsultas NO correlacionadas: escalar `(SELECT …)`, `[NOT] IN (SELECT …)` y
+-- `[NOT] EXISTS (SELECT …)`. Se ejecutan una vez y se sustituyen por su valor
+-- (escalar→literal, IN→lista, EXISTS→bool) antes de evaluar la consulta exterior.
+
+> CREATE TABLE emp (id INTEGER PRIMARY KEY, dept TEXT, salary INTEGER);
+ok
+
+> INSERT INTO emp (dept, salary) VALUES ('eng', 100), ('eng', 120), ('sales', 80), ('sales', 90);
+affected 4
+
+-- Escalar en WHERE: por encima de la media (390/4 = 97.5).
+> SELECT salary FROM emp WHERE salary > (SELECT avg(salary) FROM emp) ORDER BY salary;
+100
+120
+
+-- Escalar en la proyección.
+> SELECT id, (SELECT max(salary) FROM emp) FROM emp WHERE id = 1;
+1|120
+
+-- Escalar sin filas → NULL.
+> SELECT (SELECT salary FROM emp WHERE dept = 'none');
+NULL
+
+-- Escalar con más de una fila → error.
+> SELECT (SELECT salary FROM emp);
+error más de una fila
+
+-- IN (SELECT …) / NOT IN (SELECT …).
+> CREATE TABLE big (id INTEGER PRIMARY KEY, sal INTEGER);
+ok
+
+> INSERT INTO big (sal) VALUES (100), (120);
+affected 2
+
+> SELECT id FROM emp WHERE salary IN (SELECT sal FROM big) ORDER BY id;
+1
+2
+
+> SELECT id FROM emp WHERE salary NOT IN (SELECT sal FROM big) ORDER BY id;
+3
+4
+
+-- EXISTS / NOT EXISTS.
+> SELECT 'hay' WHERE EXISTS (SELECT 1 FROM emp WHERE dept = 'eng');
+hay
+
+> SELECT 'no' WHERE NOT EXISTS (SELECT 1 FROM emp WHERE dept = 'zzz');
+no
+
+-- Anidada: una subconsulta dentro de otra.
+> SELECT salary FROM emp WHERE salary = (SELECT max(sal) FROM big WHERE sal IN (SELECT salary FROM emp));
+120

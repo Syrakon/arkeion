@@ -706,6 +706,16 @@ impl Parser {
         if neg_in || self.peek() == Some(&Tok::Kw(Kw::In)) {
             self.i += if neg_in { 2 } else { 1 };
             self.expect(&Tok::LParen, "'(' tras IN")?;
+            // `IN (SELECT …)` (subconsulta de una columna) vs `IN (v1, v2, …)`.
+            if matches!(self.peek(), Some(Tok::Kw(Kw::Select))) {
+                let sub = self.select()?;
+                self.expect(&Tok::RParen, "')'")?;
+                return Ok(Expr::InSubquery {
+                    expr: Box::new(left),
+                    query: Box::new(sub),
+                    negated: neg_in,
+                });
+            }
             let mut list = Vec::new();
             if self.peek() != Some(&Tok::RParen) {
                 loop {
@@ -944,10 +954,24 @@ impl Parser {
                 }
                 Ok(Expr::Column { table: None, name })
             }
-            Some(Tok::LParen) => {
-                let e = self.expr()?;
+            Some(Tok::Kw(Kw::Exists)) => {
+                self.expect(&Tok::LParen, "'(' tras EXISTS")?;
+                let sub = self.select()?;
                 self.expect(&Tok::RParen, "')'")?;
-                Ok(e)
+                Ok(Expr::Exists(Box::new(sub)))
+            }
+            Some(Tok::LParen) => {
+                // `(SELECT …)` es una subconsulta escalar; si no, expresión entre
+                // paréntesis.
+                if matches!(self.peek(), Some(Tok::Kw(Kw::Select))) {
+                    let sub = self.select()?;
+                    self.expect(&Tok::RParen, "')'")?;
+                    Ok(Expr::ScalarSubquery(Box::new(sub)))
+                } else {
+                    let e = self.expr()?;
+                    self.expect(&Tok::RParen, "')'")?;
+                    Ok(e)
+                }
             }
             _ => Err(err_at(pos, "se esperaba una expresión")),
         }

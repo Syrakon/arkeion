@@ -239,6 +239,10 @@ fn validate_columns(e: &Expr, schema: &QuerySchema) -> Result<()> {
                 .as_deref()
                 .map_or(Ok(()), |e| validate_columns(e, schema))
         }
+        // El cuerpo de la subconsulta se valida al ejecutarse (otro ámbito); aquí
+        // solo la parte externa del `IN`.
+        Expr::ScalarSubquery(_) | Expr::Exists(_) => Ok(()),
+        Expr::InSubquery { expr, .. } => validate_columns(expr, schema),
     }
 }
 
@@ -702,6 +706,15 @@ fn run_select_no_from(stmt: &SelectStmt, params: &[Value]) -> Result<SelectOut> 
 }
 
 pub fn run_select(src: &impl DataSource, stmt: &SelectStmt, params: &[Value]) -> Result<SelectOut> {
+    // Subconsultas NO correlacionadas: se ejecutan una vez y se sustituyen por su
+    // valor (escalar → literal, IN → lista, EXISTS → bool) antes de evaluar nada.
+    let resolved;
+    let stmt = if select_has_subquery(stmt) {
+        resolved = resolve_select_subqueries(src, stmt, params)?;
+        &resolved
+    } else {
+        stmt
+    };
     // `UNION [ALL]`: combina varios núcleos; las cláusulas finales del líder
     // (ORDER BY/LIMIT) aplican al conjunto.
     if !stmt.compound.is_empty() {
@@ -917,6 +930,193 @@ pub fn run_select(src: &impl DataSource, stmt: &SelectStmt, params: &[Value]) ->
 fn lookup(src: &impl DataSource, table: &TableRef) -> Result<TableDef> {
     src.table(&table.name)?
         .ok_or_else(|| sql_err(format!("tabla desconocida: {}", table.name)))
+}
+
+// --- subconsultas no correlacionadas (pre-pasada) ---
+
+/// `true` si alguna expresión **propia** del SELECT (no de sus núcleos `UNION`,
+/// que se resuelven aparte) lleva una subconsulta.
+fn select_has_subquery(stmt: &SelectStmt) -> bool {
+    let in_item = |it: &SelectItem| match it {
+        SelectItem::Expr { expr, .. } => expr_has_subquery(expr),
+        SelectItem::Star => false,
+    };
+    stmt.where_clause.as_ref().is_some_and(expr_has_subquery)
+        || stmt.projection.iter().any(in_item)
+        || stmt.having.as_ref().is_some_and(expr_has_subquery)
+        || stmt.joins.iter().any(|j| expr_has_subquery(&j.on))
+        || stmt.group_by.iter().any(expr_has_subquery)
+}
+
+fn expr_has_subquery(e: &Expr) -> bool {
+    match e {
+        Expr::ScalarSubquery(_) | Expr::Exists(_) | Expr::InSubquery { .. } => true,
+        Expr::Literal(_) | Expr::Column { .. } | Expr::Param(_) => false,
+        Expr::Unary(_, x) => expr_has_subquery(x),
+        Expr::Binary(a, _, b) => expr_has_subquery(a) || expr_has_subquery(b),
+        Expr::IsNull { expr, .. } => expr_has_subquery(expr),
+        Expr::Like { expr, pattern, .. } => expr_has_subquery(expr) || expr_has_subquery(pattern),
+        Expr::Aggregate { arg, sep, .. } => {
+            arg.as_deref().is_some_and(expr_has_subquery)
+                || sep.as_deref().is_some_and(expr_has_subquery)
+        }
+        Expr::Function { args, .. } => args.iter().any(expr_has_subquery),
+        Expr::In { expr, list, .. } => {
+            expr_has_subquery(expr) || list.iter().any(expr_has_subquery)
+        }
+        Expr::Cast { expr, .. } => expr_has_subquery(expr),
+        Expr::Case {
+            operand,
+            whens,
+            else_,
+        } => {
+            operand.as_deref().is_some_and(expr_has_subquery)
+                || whens
+                    .iter()
+                    .any(|(c, r)| expr_has_subquery(c) || expr_has_subquery(r))
+                || else_.as_deref().is_some_and(expr_has_subquery)
+        }
+    }
+}
+
+/// Devuelve una copia del SELECT con sus subconsultas (propias) sustituidas por su
+/// valor. Los núcleos `UNION` no se tocan aquí: cada uno se resuelve cuando
+/// `run_compound` lo pasa por `run_select`.
+fn resolve_select_subqueries(
+    src: &impl DataSource,
+    stmt: &SelectStmt,
+    params: &[Value],
+) -> Result<SelectStmt> {
+    let mut s = stmt.clone();
+    if let Some(w) = s.where_clause.take() {
+        s.where_clause = Some(resolve_expr(src, &w, params)?);
+    }
+    if let Some(h) = s.having.take() {
+        s.having = Some(resolve_expr(src, &h, params)?);
+    }
+    for item in &mut s.projection {
+        if let SelectItem::Expr { expr, .. } = item {
+            let r = resolve_expr(src, expr, params)?;
+            *expr = r;
+        }
+    }
+    for j in &mut s.joins {
+        let on = resolve_expr(src, &j.on, params)?;
+        j.on = on;
+    }
+    for g in &mut s.group_by {
+        let r = resolve_expr(src, g, params)?;
+        *g = r;
+    }
+    Ok(s)
+}
+
+/// Una subconsulta escalar `(SELECT …)` → su único valor (0 filas → NULL, >1 →
+/// error; exactamente una columna).
+fn eval_scalar_subquery(src: &impl DataSource, q: &SelectStmt, params: &[Value]) -> Result<Value> {
+    let out = run_select(src, q, params)?;
+    if out.columns.len() != 1 {
+        return Err(sql_err(
+            "una subconsulta escalar debe devolver exactamente una columna",
+        ));
+    }
+    match out.rows.len() {
+        0 => Ok(Value::Null),
+        1 => Ok(out.rows.into_iter().next().expect("1 fila").remove(0)),
+        _ => Err(sql_err("una subconsulta escalar devolvió más de una fila")),
+    }
+}
+
+/// Reescribe un `Expr` sustituyendo cada subconsulta por su resultado. Las
+/// subconsultas se ejecutan **una vez**, sin la fila exterior: v1 no soporta
+/// correlación (una referencia a una columna externa, o falla al resolverse, o
+/// —si coincide el nombre— se resuelve dentro de la subconsulta).
+fn resolve_expr(src: &impl DataSource, e: &Expr, params: &[Value]) -> Result<Expr> {
+    let res = |x: &Expr| resolve_expr(src, x, params);
+    let boxed = |x: &Expr| res(x).map(Box::new);
+    let opt = |x: &Option<Box<Expr>>| -> Result<Option<Box<Expr>>> {
+        x.as_deref().map(boxed).transpose()
+    };
+    Ok(match e {
+        Expr::ScalarSubquery(q) => Expr::Literal(eval_scalar_subquery(src, q, params)?),
+        Expr::Exists(q) => Expr::Literal(Value::Bool(!run_select(src, q, params)?.rows.is_empty())),
+        Expr::InSubquery {
+            expr,
+            query,
+            negated,
+        } => {
+            let out = run_select(src, query, params)?;
+            if out.columns.len() != 1 {
+                return Err(sql_err("IN (SELECT …) requiere exactamente una columna"));
+            }
+            let list = out
+                .rows
+                .into_iter()
+                .map(|mut r| Expr::Literal(r.remove(0)))
+                .collect();
+            Expr::In {
+                expr: boxed(expr)?,
+                list,
+                negated: *negated,
+            }
+        }
+        Expr::Literal(_) | Expr::Column { .. } | Expr::Param(_) => e.clone(),
+        Expr::Unary(op, x) => Expr::Unary(*op, boxed(x)?),
+        Expr::Binary(a, op, b) => Expr::Binary(boxed(a)?, *op, boxed(b)?),
+        Expr::IsNull { expr, negated } => Expr::IsNull {
+            expr: boxed(expr)?,
+            negated: *negated,
+        },
+        Expr::Like {
+            expr,
+            pattern,
+            negated,
+        } => Expr::Like {
+            expr: boxed(expr)?,
+            pattern: boxed(pattern)?,
+            negated: *negated,
+        },
+        Expr::Aggregate {
+            func,
+            arg,
+            distinct,
+            sep,
+        } => Expr::Aggregate {
+            func: *func,
+            arg: opt(arg)?,
+            distinct: *distinct,
+            sep: opt(sep)?,
+        },
+        Expr::Function { name, args } => Expr::Function {
+            name: name.clone(),
+            args: args.iter().map(res).collect::<Result<_>>()?,
+        },
+        Expr::In {
+            expr,
+            list,
+            negated,
+        } => Expr::In {
+            expr: boxed(expr)?,
+            list: list.iter().map(res).collect::<Result<_>>()?,
+            negated: *negated,
+        },
+        Expr::Cast { expr, to } => Expr::Cast {
+            expr: boxed(expr)?,
+            to: *to,
+        },
+        Expr::Case {
+            operand,
+            whens,
+            else_,
+        } => Expr::Case {
+            operand: opt(operand)?,
+            whens: whens
+                .iter()
+                .map(|(c, r)| Ok((res(c)?, res(r)?)))
+                .collect::<Result<_>>()?,
+            else_: opt(else_)?,
+        },
+    })
 }
 
 /// `UNION [ALL]`: ejecuta cada núcleo, los combina por la izquierda (cada `UNION`
@@ -1397,6 +1597,8 @@ fn col_outside_agg(e: &Expr) -> Option<&str> {
                     .find_map(|(c, r)| col_outside_agg(c).or_else(|| col_outside_agg(r)))
             })
             .or_else(|| else_.as_deref().and_then(col_outside_agg)),
+        Expr::ScalarSubquery(_) | Expr::Exists(_) => None,
+        Expr::InSubquery { expr, .. } => col_outside_agg(expr),
     }
 }
 
@@ -1450,6 +1652,9 @@ fn collect_columns(e: &Expr, skip_agg: bool, out: &mut Vec<ColRef>) {
                 collect_columns(e, skip_agg, out);
             }
         }
+        // El cuerpo de una subconsulta es otro ámbito; solo cuenta la parte externa.
+        Expr::ScalarSubquery(_) | Expr::Exists(_) => {}
+        Expr::InSubquery { expr, .. } => collect_columns(expr, skip_agg, out),
     }
 }
 
@@ -1685,6 +1890,9 @@ fn fold_aggregates(
                 None => None,
             },
         },
+        // Las subconsultas ya se resolvieron a literales; no contienen agregados
+        // del SELECT exterior, así que pasan tal cual.
+        Expr::ScalarSubquery(_) | Expr::Exists(_) | Expr::InSubquery { .. } => e.clone(),
     })
 }
 
@@ -2014,6 +2222,11 @@ fn eval(e: &Expr, row: Option<(&QuerySchema, &[Value])>, params: &[Value]) -> Re
                 None => Ok(Value::Null),
             }
         }
+        // Las subconsultas se sustituyen en la pre-pasada (`resolve_select_subqueries`)
+        // antes de evaluar; si una llega aquí es correlacionada (no soportada en v1).
+        Expr::ScalarSubquery(_) | Expr::Exists(_) | Expr::InSubquery { .. } => Err(sql_err(
+            "subconsulta sin resolver (las correlacionadas no se soportan en v1)",
+        )),
     }
 }
 

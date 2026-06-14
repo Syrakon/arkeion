@@ -246,6 +246,19 @@ pub enum Expr {
         whens: Vec<(Expr, Expr)>,
         else_: Option<Box<Expr>>,
     },
+    /// `(SELECT …)` escalar: una pre-pasada (exec) la ejecuta y la sustituye por su
+    /// único valor (0 filas → NULL, >1 → error). v1: **no correlacionada**.
+    ScalarSubquery(Box<SelectStmt>),
+    /// `EXISTS (SELECT …)`: `true` si la subconsulta devuelve alguna fila. `NOT
+    /// EXISTS` lo envuelve el `NOT` exterior. v1: **no correlacionada**.
+    Exists(Box<SelectStmt>),
+    /// `expr [NOT] IN (SELECT …)`: pertenencia al conjunto de la subconsulta
+    /// (una columna). v1: **no correlacionada**.
+    InSubquery {
+        expr: Box<Expr>,
+        query: Box<SelectStmt>,
+        negated: bool,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -296,6 +309,8 @@ impl Expr {
                     && whens.iter().all(|(c, r)| c.is_const() && r.is_const())
                     && else_.as_ref().is_none_or(|e| e.is_const())
             }
+            // Una subconsulta depende de los datos: no es constante.
+            Expr::ScalarSubquery(_) | Expr::Exists(_) | Expr::InSubquery { .. } => false,
         }
     }
 
@@ -324,6 +339,8 @@ impl Expr {
                         .any(|(c, r)| c.contains_param() || r.contains_param())
                     || else_.as_ref().is_some_and(|e| e.contains_param())
             }
+            // Las subconsultas no aparecen en contextos con parámetros enlazados.
+            Expr::ScalarSubquery(_) | Expr::Exists(_) | Expr::InSubquery { .. } => false,
         }
     }
 
@@ -351,6 +368,8 @@ impl Expr {
                         .any(|(c, r)| c.has_aggregate() || r.has_aggregate())
                     || else_.as_ref().is_some_and(|e| e.has_aggregate())
             }
+            // Un agregado dentro de la subconsulta es de su propio ámbito.
+            Expr::ScalarSubquery(_) | Expr::Exists(_) | Expr::InSubquery { .. } => false,
         }
     }
 }

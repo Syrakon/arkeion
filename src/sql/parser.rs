@@ -299,21 +299,25 @@ impl Parser {
         ))
     }
 
+    /// Un tipo SQL (`INTEGER | REAL | TEXT | BLOB | BOOLEAN`). Compartido por
+    /// `column_def` y `CAST(… AS tipo)`.
+    fn coltype(&mut self) -> Result<ColType> {
+        match self.next() {
+            Some(Tok::Kw(Kw::Integer)) => Ok(ColType::Integer),
+            Some(Tok::Kw(Kw::Real)) => Ok(ColType::Real),
+            Some(Tok::Kw(Kw::Text)) => Ok(ColType::Text),
+            Some(Tok::Kw(Kw::Blob)) => Ok(ColType::Blob),
+            Some(Tok::Kw(Kw::Boolean)) => Ok(ColType::Boolean),
+            _ => Err(err_at(
+                self.pos(),
+                "se esperaba un tipo: INTEGER, REAL, TEXT, BLOB o BOOLEAN",
+            )),
+        }
+    }
+
     fn column_def(&mut self) -> Result<ColumnAst> {
         let name = self.ident("un nombre de columna")?;
-        let col_type = match self.next() {
-            Some(Tok::Kw(Kw::Integer)) => ColType::Integer,
-            Some(Tok::Kw(Kw::Real)) => ColType::Real,
-            Some(Tok::Kw(Kw::Text)) => ColType::Text,
-            Some(Tok::Kw(Kw::Blob)) => ColType::Blob,
-            Some(Tok::Kw(Kw::Boolean)) => ColType::Boolean,
-            _ => {
-                return Err(err_at(
-                    self.pos(),
-                    "se esperaba un tipo: INTEGER, REAL, TEXT, BLOB o BOOLEAN",
-                ));
-            }
-        };
+        let col_type = self.coltype()?;
         let mut col = ColumnAst {
             name,
             col_type,
@@ -759,6 +763,17 @@ impl Parser {
             Some(Tok::Kw(Kw::Null)) => Ok(Expr::Literal(Value::Null)),
             Some(Tok::Kw(Kw::True)) => Ok(Expr::Literal(Value::Bool(true))),
             Some(Tok::Kw(Kw::False)) => Ok(Expr::Literal(Value::Bool(false))),
+            Some(Tok::Kw(Kw::Cast)) => {
+                self.expect(&Tok::LParen, "'(' tras CAST")?;
+                let inner = self.expr()?;
+                self.expect_kw(Kw::As, "AS")?;
+                let to = self.coltype()?;
+                self.expect(&Tok::RParen, "')'")?;
+                Ok(Expr::Cast {
+                    expr: Box::new(inner),
+                    to,
+                })
+            }
             Some(Tok::Param(n)) => {
                 if !self.param_names.is_empty() {
                     return Err(err_at(pos, MIX_PARAMS));

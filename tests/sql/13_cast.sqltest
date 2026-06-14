@@ -1,0 +1,61 @@
+-- CAST(x AS tipo): conversión explícita — la válvula de escape del tipado
+-- estricto. NULL → NULL en cualquier destino; lo que no tiene conversión natural
+-- es un error (human-first), no un valor sorpresa.
+
+-- a INTEGER: REAL trunca hacia cero; TEXT parsea; BOOL → 1/0.
+> SELECT CAST(3.9 AS INTEGER);
+3
+
+> SELECT CAST('42' AS INTEGER);
+42
+
+> SELECT CAST('12.7' AS INTEGER);
+12
+
+> SELECT CAST(TRUE AS INTEGER);
+1
+
+> SELECT CAST(NULL AS INTEGER);
+NULL
+
+-- a REAL.
+> SELECT CAST(5 AS REAL);
+5.0
+
+> SELECT CAST('3.14' AS REAL);
+3.14
+
+-- a TEXT.
+> SELECT CAST(42 AS TEXT);
+42
+
+> SELECT CAST(1.5 AS TEXT);
+1.5
+
+> SELECT CAST(TRUE AS TEXT);
+TRUE
+
+-- a BOOLEAN: 0/≠0, y 'true'/'false'/'1'/'0'.
+> SELECT CAST(0 AS BOOLEAN);
+FALSE
+
+> SELECT CAST(7 AS BOOLEAN);
+TRUE
+
+> SELECT CAST('true' AS BOOLEAN);
+TRUE
+
+-- || con un número vía CAST (lo que prometía el error de ||).
+> SELECT 'n=' || CAST(5 AS TEXT);
+n=5
+
+-- a BLOB: TEXT → bytes (se renderiza x'..').
+> SELECT CAST('AB' AS BLOB);
+x'4142'
+
+-- Errores.
+> SELECT CAST('abc' AS INTEGER);
+error no se puede convertir
+
+> SELECT CAST(3.5 AS BLOB);
+error no se puede convertir

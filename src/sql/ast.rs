@@ -204,6 +204,12 @@ pub enum Expr {
         list: Vec<Expr>,
         negated: bool,
     },
+    /// `CAST(expr AS tipo)`: conversión **explícita** de tipo (la válvula de escape
+    /// del tipado estricto del motor). NULL se propaga.
+    Cast {
+        expr: Box<Expr>,
+        to: ColType,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -244,6 +250,7 @@ impl Expr {
             Expr::Like { expr, pattern, .. } => expr.is_const() && pattern.is_const(),
             Expr::Function { args, .. } => args.iter().all(Expr::is_const),
             Expr::In { expr, list, .. } => expr.is_const() && list.iter().all(Expr::is_const),
+            Expr::Cast { expr, .. } => expr.is_const(),
         }
     }
 
@@ -260,6 +267,7 @@ impl Expr {
             Expr::In { expr, list, .. } => {
                 expr.contains_param() || list.iter().any(Expr::contains_param)
             }
+            Expr::Cast { expr, .. } => expr.contains_param(),
         }
     }
 
@@ -275,6 +283,7 @@ impl Expr {
             Expr::In { expr, list, .. } => {
                 expr.has_aggregate() || list.iter().any(Expr::has_aggregate)
             }
+            Expr::Cast { expr, .. } => expr.has_aggregate(),
         }
     }
 }

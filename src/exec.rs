@@ -222,6 +222,7 @@ fn validate_columns(e: &Expr, schema: &QuerySchema) -> Result<()> {
             validate_columns(expr, schema)?;
             list.iter().try_for_each(|e| validate_columns(e, schema))
         }
+        Expr::Cast { expr, .. } => validate_columns(expr, schema),
     }
 }
 
@@ -1262,6 +1263,7 @@ fn col_outside_agg(e: &Expr) -> Option<&str> {
         Expr::In { expr, list, .. } => {
             col_outside_agg(expr).or_else(|| list.iter().find_map(col_outside_agg))
         }
+        Expr::Cast { expr, .. } => col_outside_agg(expr),
     }
 }
 
@@ -1298,6 +1300,7 @@ fn collect_columns(e: &Expr, skip_agg: bool, out: &mut Vec<ColRef>) {
             collect_columns(expr, skip_agg, out);
             list.iter().for_each(|e| collect_columns(e, skip_agg, out));
         }
+        Expr::Cast { expr, .. } => collect_columns(expr, skip_agg, out),
     }
 }
 
@@ -1498,6 +1501,10 @@ fn fold_aggregates(
                 .map(|e| fold_aggregates(e, schema, rows, params))
                 .collect::<Result<_>>()?,
             negated: *negated,
+        },
+        Expr::Cast { expr, to } => Expr::Cast {
+            expr: Box::new(fold_aggregates(expr, schema, rows, params)?),
+            to: *to,
         },
     })
 }
@@ -1743,7 +1750,84 @@ fn eval(e: &Expr, row: Option<(&QuerySchema, &[Value])>, params: &[Value]) -> Re
                 (false, false) => Value::Bool(*negated),
             })
         }
+        Expr::Cast { expr, to } => cast_value(eval(expr, row, params)?, *to),
     }
+}
+
+/// `CAST(v AS to)` — conversión **explícita**. NULL → NULL en cualquier destino;
+/// el resto sigue reglas human-first: lo que no tiene conversión natural es un
+/// error, no un valor sorpresa.
+fn cast_value(v: Value, to: crate::catalog::ColType) -> Result<Value> {
+    use crate::catalog::ColType;
+    if matches!(v, Value::Null) {
+        return Ok(Value::Null);
+    }
+    let err = || {
+        sql_err(format!(
+            "no se puede convertir {} a {}",
+            v.type_name(),
+            to.name()
+        ))
+    };
+    match to {
+        ColType::Integer => match &v {
+            Value::Integer(n) => Ok(Value::Integer(*n)),
+            Value::Bool(b) => Ok(Value::Integer(i64::from(*b))),
+            Value::Real(f) if f.is_nan() => Err(sql_err("no se puede convertir NaN a INTEGER")),
+            // `as i64` satura (comportamiento definido en Rust) para |f| enorme.
+            Value::Real(f) => Ok(Value::Integer(f.trunc() as i64)),
+            Value::Text(s) => parse_int(s).ok_or_else(err),
+            Value::Blob(_) => Err(err()),
+            Value::Null => unreachable!(),
+        },
+        ColType::Real => match &v {
+            Value::Real(f) => Ok(Value::Real(*f)),
+            Value::Integer(n) => Ok(Value::Real(*n as f64)),
+            Value::Bool(b) => Ok(Value::Real(if *b { 1.0 } else { 0.0 })),
+            Value::Text(s) => s.trim().parse::<f64>().map(Value::Real).map_err(|_| err()),
+            Value::Blob(_) => Err(err()),
+            Value::Null => unreachable!(),
+        },
+        ColType::Text => match &v {
+            Value::Text(s) => Ok(Value::Text(s.clone())),
+            Value::Integer(n) => Ok(Value::Text(n.to_string())),
+            Value::Real(f) => Ok(Value::Text(format!("{f:?}"))),
+            Value::Bool(b) => Ok(Value::Text(if *b { "TRUE" } else { "FALSE" }.to_string())),
+            Value::Blob(b) => String::from_utf8(b.clone())
+                .map(Value::Text)
+                .map_err(|_| sql_err("CAST de BLOB no-UTF-8 a TEXT")),
+            Value::Null => unreachable!(),
+        },
+        ColType::Blob => match &v {
+            Value::Blob(b) => Ok(Value::Blob(b.clone())),
+            Value::Text(s) => Ok(Value::Blob(s.clone().into_bytes())),
+            _ => Err(err()),
+        },
+        ColType::Boolean => match &v {
+            Value::Bool(b) => Ok(Value::Bool(*b)),
+            Value::Integer(n) => Ok(Value::Bool(*n != 0)),
+            Value::Real(f) => Ok(Value::Bool(*f != 0.0)),
+            Value::Text(s) => match s.trim().to_ascii_lowercase().as_str() {
+                "true" | "1" => Ok(Value::Bool(true)),
+                "false" | "0" => Ok(Value::Bool(false)),
+                _ => Err(err()),
+            },
+            Value::Blob(_) => Err(err()),
+            Value::Null => unreachable!(),
+        },
+    }
+}
+
+/// TEXT → INTEGER para `CAST`: i64 directo y, si no, f64 finito truncado.
+fn parse_int(s: &str) -> Option<Value> {
+    let t = s.trim();
+    if let Ok(n) = t.parse::<i64>() {
+        return Some(Value::Integer(n));
+    }
+    t.parse::<f64>()
+        .ok()
+        .filter(|f| f.is_finite())
+        .map(|f| Value::Integer(f.trunc() as i64))
 }
 
 /// Funciones escalares built-in (insensibles a mayúsculas). NULL se propaga

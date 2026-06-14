@@ -179,3 +179,19 @@ assert!(db.verify()?.chain_ok);
 - `snapshot()` y las conexiones de rama comparten la misma caché de páginas del `Database`.
 - Toda lectura valida integridad (tag); `Corrupt`/`ChainBroken`/`WrongKey` son errores tipados,
   nunca datos silenciosamente malos.
+
+## Acceso por red (cliente-servidor, M11)
+
+La API de arriba es **embebida** (in-process). Para acceder por red, el módulo de
+conexión (ver [11-cliente-servidor](11-cliente-servidor.md)) lo expone con un
+protocolo nativo —rama por sesión, `AS OF` y `verify` de primera clase— en crates
+aparte:
+
+- **`arkeion-client`** (`Client`, MIT/Apache, repo propio): `connect`, `use_branch`,
+  `execute`, `query` / `query_as_of`, `verify`. Espejo del subconjunto de
+  `Connection` que viaja por el cable.
+- **`arkeiond`** (`arkeion-server`, EUPL-1.2): el daemon, thread-por-conexión, que
+  sirve cada sesión sobre una rama del mismo `Database`.
+
+El protocolo va a mano (`arkeion-proto`), sin serde, reusando el `varint` y la
+codificación de `Value` de este motor.

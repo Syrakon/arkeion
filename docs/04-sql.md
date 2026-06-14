@@ -183,7 +183,7 @@ SELECT * FROM facturas AS OF TIMESTAMP '2026-05-01T00:00:00Z';
 | `INTERSECT` / `EXCEPT` (`UNION [ALL]` sí) | v1.x |
 | Índices secundarios (`CREATE INDEX`) | hecho (v1.1) — espacio de claves `0x02` ya reservado en el formato |
 | `ALTER TABLE` salvo `ADD COLUMN` / `MOVE COLUMN` / `REORDER COLUMNS` (DROP/RENAME COLUMN) | v1.x |
-| Optimizador de queries (CBO con estadísticas) | fuera de alcance; sí hay un planificador por reglas (index vs scan) |
+| Optimizador de queries (CBO con estadísticas) | fuera de alcance; hay un planificador **determinista por reglas**: índice-vs-scan y *predicate pushdown* en JOINs |
 | FK: columna no-PK, composite, ON UPDATE | v1.x (v1: una columna → PK del padre, ON DELETE) |
 | Triggers `INSTEAD OF` / statement-level / cuerpo no-DML | v1.x (v1: row-level BEFORE/AFTER, cuerpo DML) |
 

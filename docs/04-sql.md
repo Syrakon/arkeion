@@ -32,6 +32,9 @@ ALTER TABLE tabla MOVE COLUMN col {FIRST | BEFORE x | AFTER x};  -- reorden lóg
 ALTER TABLE tabla REORDER COLUMNS (col, …);                     -- fija el orden lógico completo
 CREATE VIEW [IF NOT EXISTS] vista AS <select>;                  -- SELECT con nombre (no recursiva)
 DROP VIEW [IF EXISTS] vista;
+CREATE TRIGGER [IF NOT EXISTS] t {BEFORE|AFTER} {INSERT|UPDATE|DELETE} ON tabla
+  [FOR EACH ROW] BEGIN <dml>; … END;                            -- row-level; cuerpo con OLD./NEW.
+DROP TRIGGER [IF EXISTS] t;
 
 -- DML
 INSERT INTO tabla [(cols)] VALUES (expr, …)[, (expr, …)…];
@@ -98,6 +101,13 @@ tablas. No recursivas.
 NULL}]`): v1 referencia siempre la **PK** del padre. Se comprueban en INSERT/UPDATE
 (el padre debe existir; FK `NULL` permitido) y el DELETE del padre aplica la acción
 (RESTRICT por defecto). Se permite auto-referencia (árboles).
+
+**Triggers** (`CREATE TRIGGER … {BEFORE|AFTER} {INSERT|UPDATE|DELETE} ON t BEGIN …
+END`): **row-level**, se disparan una vez por fila afectada. El cuerpo son sentencias
+`INSERT`/`UPDATE`/`DELETE` (re-parseadas al disparar) con `OLD.col`/`NEW.col` ligadas
+a los valores de la fila (`NEW` en INSERT/UPDATE, `OLD` en UPDATE/DELETE; en `AFTER
+INSERT`, `NEW.id` es el rowid asignado). Hay guarda de recursión (un trigger que
+dispara otra escritura). Buenos para **bitácoras de auditoría**.
 
 `GROUP BY` / `HAVING` (post-M9): `SELECT … GROUP BY e1, e2 [HAVING cond]` agrupa por el
 valor de las expresiones (normalmente columnas) y emite una fila por grupo, plegando los
@@ -174,8 +184,8 @@ SELECT * FROM facturas AS OF TIMESTAMP '2026-05-01T00:00:00Z';
 | Índices secundarios (`CREATE INDEX`) | hecho (v1.1) — espacio de claves `0x02` ya reservado en el formato |
 | `ALTER TABLE` salvo `ADD COLUMN` / `MOVE COLUMN` / `REORDER COLUMNS` (DROP/RENAME COLUMN) | v1.x |
 | Optimizador de queries (CBO con estadísticas) | fuera de alcance; sí hay un planificador por reglas (index vs scan) |
-| Triggers | en camino (vistas ✅, FK enforcement ✅) |
 | FK: columna no-PK, composite, ON UPDATE | v1.x (v1: una columna → PK del padre, ON DELETE) |
+| Triggers `INSTEAD OF` / statement-level / cuerpo no-DML | v1.x (v1: row-level BEFORE/AFTER, cuerpo DML) |
 
 ## Gramática y codegen (`.gate`)
 

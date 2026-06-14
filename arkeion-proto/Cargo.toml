@@ -1,0 +1,16 @@
+[package]
+name = "arkeion-proto"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+description = "Protocolo de cable nativo de arkeion (cliente-servidor, M11)."
+homepage = "https://arkeion.tech"
+repository = "https://gitlab.com/syrakon/arkeion"
+license = "MIT OR Apache-2.0"
+publish = false
+
+# Sin serde ni deps de terceros: el protocolo va a mano (fiel a D8), reusando el
+# varint y la codificación de `Value` del core. La única dependencia es el propio
+# motor, por sus tipos públicos (`Value`, `AsOf`).
+[dependencies]
+arkeion = { path = ".." }

@@ -1,3 +1,10 @@
+# Workspace: el core embebido (raíz) se queda D8-mínimo; el módulo de conexión
+# (M11) vive en crates aparte para no contaminar sus dependencias y dejar sitio
+# al límite open-core (la lib sigue MIT/Apache; el servidor podrá llevar otra
+# licencia). Ver docs/11-cliente-servidor.md.
+[workspace]
+members = ["arkeion-proto"]
+
 [package]
 name = "arkeion"
 version = "0.10.0"

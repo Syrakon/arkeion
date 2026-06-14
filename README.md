@@ -184,20 +184,21 @@ tamper-evidence como arkeion**, en una transacción (1 fsync). El foso inatacabl
 
 | | tamaño |
 |---|--:|
-| arkeion — insert (1 commit) | 4.2 MB |
+| arkeion — insert (1 commit) | 3.5 MB |
 | arkeion — insert **comprimido** (opt-in) | 0.8 MB |
-| arkeion — +1 update de todo (historia CoW retenida) | 8.4 MB |
-| arkeion — tras `vacuum KeepLast(1)` | 4.2 MB |
+| arkeion — +1 update de todo (historia CoW retenida) | 7.0 MB |
+| arkeion — tras `vacuum KeepLast(1)` | 3.5 MB |
 | SQLite — insert (1 commit) | 2.8 MB |
 | SQLite — +1 update de todo (in-place, sin historia) | 2.8 MB |
 
 **Honestidad**: la fila de 0.8 MB compara el modo **comprimido (opcional, off por defecto)** de arkeion
 contra SQLite **sin** comprimir, y sobre un dataset deliberadamente muy comprimible (la columna TEXT es
-una constante). **Motor-a-motor en modo por defecto: 4.2 MB (arkeion) vs 2.8 MB (SQLite)** — arkeion
-~1.5× **mayor**, dominado por la **clave de fila de 13 B** (`[0x01][table_id][rowid]`, el namespace de un
-único b-tree para tablas/índices/catálogo) frente al rowid varint de 1–3 B de SQLite; el resto es el
-byte de flags y la longitud de clave de la celda genérica. El array de punteros v3 (2 B/celda) y la
-reserva cripto por página (28 B) son marginales. Las hojas ya van casi llenas (split sesgado a la derecha
+una constante). **Motor-a-motor en modo por defecto: 3.5 MB (arkeion) vs 2.8 MB (SQLite)** — arkeion
+~1.25× **mayor**. La **clave de fila es de longitud variable** (v4: `[0x01][enc_oint(table_id)][enc_oint(rowid)]`,
+~6 B típicos en vez de los 13 fijos de antes — entero order-preserving que mantiene el orden del b-tree);
+el resto del gap es el byte de flags y la longitud de clave de la celda genérica (un único b-tree para
+tablas/índices/catálogo) más el registro auto-descriptivo. El array de punteros v3 (2 B/celda) y la
+reserva cripto por página (28 B) son marginales; las hojas ya van casi llenas (split sesgado a la derecha
 en inserción secuencial, como SQLite). La compresión opcional usa **Densa** (LZSS + un codificador de
 rango adaptativo, pure-Rust, sin deps); SQLite **también** admite compresión (sqlite-zstd, ZIPVFS/CEROD),
 tampoco por defecto. Lo que arkeion sí conserva y SQLite no:

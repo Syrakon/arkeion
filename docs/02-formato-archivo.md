@@ -145,10 +145,14 @@ la compactación de `vacuum` (M9) reequilibra al reescribir.
 ```
 [0x00, 0x01, nombre_tabla UTF-8]            → {table_id u32, schema}     catálogo
 [0x00, 0x02, table_id BE]                   → next_rowid u64             contador rowid
-[0x01, table_id u32 BE, rowid u64 BE*]      → registro (fila)
-[0x02, …]                                     reservado: índices secundarios
+[0x01, enc_oint(table_id), enc_oint(rowid)] → registro (fila)            v4
+[0x02, index_id BE, valor*, rowid u64 BE]   → entrada de índice secundario
 ```
-\* rowid `i64` con el bit de signo invertido → orden memcomparable correcto para negativos.
+\* `enc_oint` (v4): entero `i64` **order-preserving**, **self-delimitado** y de longitud
+variable — una cabecera codifica signo y nº de bytes significativos; magnitudes pequeñas ocupan
+~2 B. Sustituye al `table_id`/`rowid` de ancho fijo (4+8 B) de v3, manteniendo el orden
+`(table_id, rowid)` del b-tree. La entrada de índice conserva el `rowid u64 BE` fijo al final
+(sufijo tras un valor de longitud variable).
 
 El esquema vive en el árbol de datos **a propósito**: una migración en una rama cambia el
 esquema solo en esa rama.

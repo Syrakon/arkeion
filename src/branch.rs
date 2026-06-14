@@ -5,7 +5,7 @@
 //! (`[0x00,0x01,nombre]`) legibles. El contador interno de rowid no aparece.
 
 use crate::btree::{KeyChange, KeyDiff};
-use crate::record;
+use crate::catalog;
 
 /// Tipo de cambio sobre una fila o tabla.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -73,10 +73,10 @@ pub(crate) fn decode(key_diffs: &[KeyDiff]) -> Diff {
             }
             // Otros metadatos del catálogo (contadores): internos, se omiten.
             Some(0x00) => {}
-            // Fila: [0x01, table_id BE (4), rowid BE memcomparable (8)].
-            Some(0x01) if key.len() >= 13 => {
-                let table_id = u32::from_be_bytes(key[1..5].try_into().expect("4 bytes"));
-                if let Some(rowid) = record::rowid_from_be(&key[5..13]) {
+            // Fila: [0x01, enc_oint(table_id), enc_oint(rowid)] (v4, longitud
+            // variable). `decode_row_key` es la única fuente del layout.
+            Some(0x01) => {
+                if let Some((table_id, rowid)) = catalog::decode_row_key(key) {
                     diff.rows.push(RowChange {
                         table_id,
                         rowid,
@@ -99,10 +99,8 @@ mod tests {
     fn decodes_schema_and_row_changes() {
         // Esquema: tabla "t" creada.
         let schema_key = [&[0x00u8, 0x01][..], b"t"].concat();
-        // Fila: table_id 1, rowid 42.
-        let mut row_key = vec![0x01u8];
-        row_key.extend_from_slice(&1u32.to_be_bytes());
-        row_key.extend_from_slice(&record::rowid_be(42));
+        // Fila: table_id 1, rowid 42 (clave de fila real v4).
+        let row_key = catalog::row_key(1, 42);
         // Contador interno: debe omitirse.
         let counter_key = vec![0x00u8, 0x02, 0, 0, 0, 1];
 

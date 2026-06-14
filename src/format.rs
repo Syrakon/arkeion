@@ -36,10 +36,12 @@ pub const MAGIC_META: &[u8; 8] = b"ARKMETA1";
 pub const MAGIC_COMMIT: &[u8; 8] = b"ARKCMT01";
 /// Versión del formato que escribe esta build. v2 (M10): zona append como log de
 /// registros de longitud variable + directorio de páginas. v3: nodos b-tree con
-/// **array de punteros a celda** (búsqueda binaria in-page). Ruptura limpia entre
-/// versiones (pre-1.0 no hay DBs persistidas): no se implementa lectura dual; una
-/// migración entre formatos sería un rewrite estilo `vacuum`.
-pub const FORMAT_VERSION: u32 = 3;
+/// **array de punteros a celda** (búsqueda binaria in-page). v4: **clave de fila
+/// de longitud variable** (`[0x01][enc_oint(table_id)][enc_oint(rowid)]`, ~6 B vs
+/// 13 fijos). Ruptura limpia entre versiones (pre-1.0 no hay DBs persistidas): no
+/// se implementa lectura dual; una migración entre formatos sería un rewrite
+/// estilo `vacuum`.
+pub const FORMAT_VERSION: u32 = 4;
 
 /// `FileHeader.flags` bit 0: cifrado en reposo activo.
 pub const FLAG_ENCRYPTED: u32 = 1;

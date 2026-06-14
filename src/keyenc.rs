@@ -74,6 +74,63 @@ fn encode_bytes(b: &[u8], out: &mut Vec<u8>) {
     out.push(0x00);
 }
 
+/// Entero `i64` **order-preserving**, **self-delimitado** y de **longitud
+/// variable**: las magnitudes pequeñas ocupan menos bytes y el orden
+/// lexicográfico de los bytes coincide con el orden numérico. Reemplaza los
+/// `table_id`/`rowid` de ancho fijo de la clave de fila (`[0x01][tid][rowid]`,
+/// 4+8 B) por ~2–5 B típicos sin perder el orden del b-tree.
+///
+/// Un byte de cabecera codifica signo y nº de bytes significativos: los
+/// no-negativos usan cabeceras `0x80..=0x88` (por encima de cualquier negativa),
+/// los negativos `0x77..=0x7F` (por debajo). Dentro de cada signo, más bytes ⇒
+/// mayor magnitud; los negativos llevan los bytes **complementados** para que el
+/// más negativo ordene primero. Como ningún código es prefijo de otro, concatenar
+/// `enc(tid) ‖ enc(rowid)` ordena por `(tid, rowid)`.
+pub fn encode_oint(v: i64, out: &mut Vec<u8>) {
+    if v >= 0 {
+        let u = v as u64;
+        let nbytes = 8 - (u.leading_zeros() / 8) as usize; // 0 si v == 0
+        out.push(0x80 | nbytes as u8);
+        out.extend_from_slice(&u.to_be_bytes()[8 - nbytes..]);
+    } else {
+        let c = !(v as u64); // = -v - 1, en 0..=2^63-1; más negativo ⇒ mayor c
+        let nbytes = 8 - (c.leading_zeros() / 8) as usize;
+        out.push(0x7F - nbytes as u8);
+        for &b in &c.to_be_bytes()[8 - nbytes..] {
+            out.push(!b); // complementado: mayor c (más negativo) ⇒ bytes menores
+        }
+    }
+}
+
+/// Inverso de [`encode_oint`], avanzando `pos`. `None` si el flujo está mal
+/// formado (cabecera fuera de rango o bytes insuficientes).
+pub fn decode_oint(buf: &[u8], pos: &mut usize) -> Option<i64> {
+    let header = *buf.get(*pos)?;
+    *pos += 1;
+    let mut arr = [0u8; 8];
+    if header >= 0x80 {
+        let nbytes = (header - 0x80) as usize;
+        if nbytes > 8 {
+            return None;
+        }
+        let bytes = buf.get(*pos..*pos + nbytes)?;
+        arr[8 - nbytes..].copy_from_slice(bytes);
+        *pos += nbytes;
+        Some(u64::from_be_bytes(arr) as i64)
+    } else {
+        let nbytes = (0x7F - header) as usize;
+        if nbytes > 8 {
+            return None;
+        }
+        let bytes = buf.get(*pos..*pos + nbytes)?;
+        for (i, &b) in bytes.iter().enumerate() {
+            arr[8 - nbytes + i] = !b; // des-complementar los bytes de c
+        }
+        *pos += nbytes;
+        Some(!u64::from_be_bytes(arr) as i64) // v = !c
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -184,5 +241,115 @@ mod tests {
                 w[1]
             );
         }
+    }
+
+    fn enc_oint(v: i64) -> Vec<u8> {
+        let mut o = Vec::new();
+        encode_oint(v, &mut o);
+        o
+    }
+
+    /// `encode_oint` preserva el orden y es self-delimitado: para una lista de
+    /// i64 estrictamente creciente (con todos los bordes), los bytes codificados
+    /// también lo están, y `decode_oint` es su inverso exacto.
+    #[test]
+    fn oint_order_and_roundtrip() {
+        let vals = [
+            i64::MIN,
+            i64::MIN + 1,
+            -4_294_967_296,
+            -65_537,
+            -65_536,
+            -257,
+            -256,
+            -255,
+            -2,
+            -1,
+            0,
+            1,
+            2,
+            127,
+            128,
+            255,
+            256,
+            65_535,
+            65_536,
+            16_777_215,
+            16_777_216,
+            4_294_967_295,
+            4_294_967_296,
+            i64::MAX - 1,
+            i64::MAX,
+        ];
+        for w in vals.windows(2) {
+            assert!(
+                enc_oint(w[0]) < enc_oint(w[1]),
+                "orden roto: {} debería ir antes que {}",
+                w[0],
+                w[1]
+            );
+        }
+        for &v in &vals {
+            let e = enc_oint(v);
+            let mut pos = 0;
+            assert_eq!(decode_oint(&e, &mut pos), Some(v), "round-trip {v}");
+            assert_eq!(pos, e.len(), "self-delimitado: consume exacto, {v}");
+            assert!(e.len() <= 9, "máximo 9 bytes (cabecera + 8), {v}");
+        }
+    }
+
+    /// Orden preservado sobre pares aleatorios (incluye el cruce de signo).
+    #[test]
+    fn oint_order_random_pairs() {
+        let mut rng = Rng(0x0BAD_F00D_DEAD_BEEF);
+        for _ in 0..20_000 {
+            let a = rng.next() as i64;
+            let b = rng.next() as i64;
+            assert_eq!(
+                enc_oint(a).cmp(&enc_oint(b)),
+                a.cmp(&b),
+                "orden roto: {a} vs {b}"
+            );
+        }
+    }
+
+    /// La concatenación `enc(tid) ‖ enc(rowid)` ordena por `(tid, rowid)` — la
+    /// propiedad que necesita la clave de fila del b-tree.
+    #[test]
+    fn oint_concatenation_orders_lexicographically() {
+        let keys = [
+            (1u32, 5i64),
+            (1, 50_000),
+            (1, i64::MAX),
+            (2, -1),
+            (2, 0),
+            (300, 1),
+        ];
+        let enc_key = |tid: u32, rid: i64| {
+            let mut k = Vec::new();
+            encode_oint(tid as i64, &mut k);
+            encode_oint(rid, &mut k);
+            k
+        };
+        let encoded: Vec<Vec<u8>> = keys.iter().map(|&(t, r)| enc_key(t, r)).collect();
+        let sorted = {
+            let mut s = encoded.clone();
+            s.sort();
+            s
+        };
+        // `keys` ya está en orden (tid, rowid); su codificación debe coincidir
+        // con el orden lexicográfico de los bytes.
+        assert_eq!(
+            encoded, sorted,
+            "el orden de bytes debe seguir (tid, rowid)"
+        );
+    }
+
+    /// `decode_oint` no entra en pánico ante cabeceras/colas mal formadas.
+    #[test]
+    fn oint_malformed_is_none_not_panic() {
+        assert_eq!(decode_oint(&[], &mut 0), None);
+        assert_eq!(decode_oint(&[0x88], &mut 0), None); // promete 8 bytes, no hay
+        assert_eq!(decode_oint(&[0x83, 0x01], &mut 0), None); // promete 3, hay 1
     }
 }

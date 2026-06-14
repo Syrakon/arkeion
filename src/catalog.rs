@@ -9,7 +9,8 @@
 //! [0x00,0x02, table_id BE]          → próximo rowid (i64 LE)
 //! [0x00,0x03]                       → próximo index_id (u32 LE)
 //! [0x00,0x04, nombre índice UTF-8]  → nombre de tabla (ref global del índice)
-//! [0x01, table_id BE, rowid BE*]    → registro      (* bit de signo invertido)
+//! [0x01, enc_oint(table_id), enc_oint(rowid)] → registro (v4: enteros
+//!                                    order-preserving de longitud variable)
 //! [0x02, index_id BE, valor*, rowid BE*] → entrada de índice (valor memcomparable)
 //! ```
 
@@ -132,19 +133,38 @@ fn counter_key(table_id: u32) -> [u8; 6] {
     k
 }
 
-pub fn row_key(table_id: u32, rowid: i64) -> [u8; 13] {
-    let mut k = [0u8; 13];
-    k[0] = KS_ROW;
-    k[1..5].copy_from_slice(&table_id.to_be_bytes());
-    k[5..13].copy_from_slice(&record::rowid_be(rowid));
+/// Clave de fila `[0x01][enc_oint(table_id)][enc_oint(rowid)]` (v4): `table_id` y
+/// `rowid` van en el entero order-preserving de longitud variable de `keyenc`, así
+/// que una fila típica cuesta ~6 B en vez de los 13 fijos de v3 — conservando el
+/// orden `(table_id, rowid)` del b-tree (ambos códigos son self-delimitados y
+/// ninguno es prefijo de otro).
+pub fn row_key(table_id: u32, rowid: i64) -> Vec<u8> {
+    let mut k = Vec::with_capacity(7);
+    k.push(KS_ROW);
+    keyenc::encode_oint(table_id as i64, &mut k);
+    keyenc::encode_oint(rowid, &mut k);
     k
 }
 
-fn row_prefix(table_id: u32) -> [u8; 5] {
-    let mut p = [0u8; 5];
-    p[0] = KS_ROW;
-    p[1..5].copy_from_slice(&table_id.to_be_bytes());
+/// Prefijo de **todas** las filas de una tabla: `[0x01][enc_oint(table_id)]`.
+fn row_prefix(table_id: u32) -> Vec<u8> {
+    let mut p = Vec::with_capacity(3);
+    p.push(KS_ROW);
+    keyenc::encode_oint(table_id as i64, &mut p);
     p
+}
+
+/// Decodifica una clave de fila en `(table_id, rowid)`, o `None` si no es una
+/// (otro keyspace o mal formada). Inverso de [`row_key`]; lo usan el diff de ramas
+/// y la extracción del alias de rowid en el scan.
+pub(crate) fn decode_row_key(key: &[u8]) -> Option<(u32, i64)> {
+    if key.first() != Some(&KS_ROW) {
+        return None;
+    }
+    let mut pos = 1;
+    let table_id = keyenc::decode_oint(key, &mut pos)?;
+    let rowid = keyenc::decode_oint(key, &mut pos)?;
+    Some((u32::try_from(table_id).ok()?, rowid))
 }
 
 // --- claves de índice secundario (keyspace 0x02) ---
@@ -1183,7 +1203,7 @@ impl ScanProjection {
 /// reconstruido y columnas ausentes con su DEFAULT (o NULL).
 pub struct ScanState {
     cur: btree::CursorState,
-    prefix: [u8; 5],
+    prefix: Vec<u8>,
     done: bool,
 }
 
@@ -1210,13 +1230,13 @@ impl ScanState {
         if self.done {
             return Ok(false);
         }
-        let prefix = self.prefix;
+        let prefix = &self.prefix;
         let row = self.cur.advance_view(src, |key, record| {
-            if !key.starts_with(&prefix) {
+            if !key.starts_with(prefix) {
                 return Ok(None); // primera clave fuera de la tabla: fin
             }
-            let rowid = record::rowid_from_be(&key[5..])
-                .ok_or(Error::CorruptRecord("clave de fila mal formada"))?;
+            let (_, rowid) =
+                decode_row_key(key).ok_or(Error::CorruptRecord("clave de fila mal formada"))?;
             record::decode_cols_sorted(record, &proj.stored, scratch)?;
             Ok(Some(rowid))
         })?;
@@ -1248,7 +1268,7 @@ impl ScanState {
 /// Iterador por rowid ascendente: el orden del scan ES el orden del rowid.
 pub struct TableScan<'s, S: NodeSource> {
     cur: Cursor<'s, S>,
-    prefix: [u8; 5],
+    prefix: Vec<u8>,
     /// Esquema (clonado) para reconstruir cada fila con `finish_row`: rellena
     /// las columnas añadidas por `ALTER TABLE` con su DEFAULT, igual que el
     /// camino de point lookup.
@@ -1287,8 +1307,8 @@ impl<S: NodeSource> Iterator for TableScan<'_, S> {
             return None;
         }
         let parse = || -> Result<(i64, Vec<Value>)> {
-            let rowid = record::rowid_from_be(&key[5..])
-                .ok_or(Error::CorruptRecord("clave de fila mal formada"))?;
+            let (_, rowid) =
+                decode_row_key(&key).ok_or(Error::CorruptRecord("clave de fila mal formada"))?;
             let values = finish_row(&self.def, rowid, record::decode_values(&payload)?)?;
             Ok((rowid, values))
         };

@@ -29,6 +29,7 @@ pub fn parse(sql: &str) -> Result<Stmt> {
 pub fn parse_full(sql: &str) -> Result<(Stmt, Vec<String>)> {
     let toks = lex(sql)?;
     let mut p = Parser {
+        src: sql,
         toks,
         i: 0,
         end: sql.len(),
@@ -51,7 +52,9 @@ fn err_at(pos: usize, msg: impl Into<String>) -> Error {
     }
 }
 
-struct Parser {
+struct Parser<'a> {
+    /// SQL original, para recortar el texto del SELECT de un `CREATE VIEW`.
+    src: &'a str,
     toks: Vec<Spanned>,
     i: usize,
     end: usize,
@@ -71,7 +74,7 @@ struct Parser {
 /// humano, muy por debajo del desbordamiento de pila.
 const MAX_EXPR_DEPTH: usize = 256;
 
-impl Parser {
+impl<'a> Parser<'a> {
     fn peek_spanned(&self) -> Option<&Spanned> {
         self.toks.get(self.i)
     }
@@ -168,21 +171,45 @@ impl Parser {
         }
     }
 
-    /// `CREATE` → tabla o índice según lo que siga (`[UNIQUE] INDEX` vs `TABLE`).
+    /// `CREATE` → tabla, índice o vista según lo que siga.
     fn create(&mut self) -> Result<Stmt> {
         self.expect_kw(Kw::Create, "CREATE")?;
         if matches!(self.peek(), Some(Tok::Kw(Kw::Unique | Kw::Index))) {
             self.create_index()
+        } else if matches!(self.peek(), Some(Tok::Kw(Kw::View))) {
+            self.create_view()
         } else {
             self.create_table()
         }
     }
 
-    /// `DROP` → tabla o índice.
+    /// `CREATE VIEW [IF NOT EXISTS] nombre AS <select>` — el SELECT se guarda como
+    /// texto (recortado del SQL original) y se re-parsea al usar la vista.
+    fn create_view(&mut self) -> Result<Stmt> {
+        self.expect_kw(Kw::View, "VIEW")?;
+        let if_not_exists = self.if_not_exists()?;
+        let name = self.ident("un nombre de vista")?;
+        self.expect_kw(Kw::As, "AS")?;
+        let start = self.pos(); // primer byte del SELECT
+        let _ = self.select()?; // valida que es un SELECT bien formado
+        let select_sql = self.src[start..self.pos()].trim().to_string();
+        Ok(Stmt::CreateView {
+            if_not_exists,
+            name,
+            select_sql,
+        })
+    }
+
+    /// `DROP` → tabla, índice o vista.
     fn drop(&mut self) -> Result<Stmt> {
         self.expect_kw(Kw::Drop, "DROP")?;
         if matches!(self.peek(), Some(Tok::Kw(Kw::Index))) {
             self.drop_index()
+        } else if matches!(self.peek(), Some(Tok::Kw(Kw::View))) {
+            self.expect_kw(Kw::View, "VIEW")?;
+            let if_exists = self.if_exists()?;
+            let name = self.ident("un nombre de vista")?;
+            Ok(Stmt::DropView { if_exists, name })
         } else {
             self.drop_table()
         }

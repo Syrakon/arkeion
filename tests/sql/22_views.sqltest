@@ -1,0 +1,73 @@
+-- CREATE VIEW: un SELECT con nombre, guardado como texto y materializado al
+-- consultarlo. Refleja los datos actuales. Una vista sobre otra funciona; los
+-- nombres no colisionan con tablas reales.
+
+> CREATE TABLE sales (id INTEGER PRIMARY KEY, region TEXT, amount INTEGER);
+ok
+
+> INSERT INTO sales (region, amount) VALUES ('n', 10), ('n', 20), ('s', 30), ('s', 5);
+affected 4
+
+-- Vista simple, consultada como una tabla.
+> CREATE VIEW big AS SELECT region, amount FROM sales WHERE amount >= 20;
+ok
+
+> SELECT region, amount FROM big ORDER BY amount;
+n|20
+s|30
+
+-- Vista con agregado.
+> CREATE VIEW totals AS SELECT region, sum(amount) AS s FROM sales GROUP BY region;
+ok
+
+> SELECT region, s FROM totals ORDER BY region;
+n|30
+s|35
+
+-- Vista sobre vista.
+> CREATE VIEW big_n AS SELECT amount FROM big WHERE region = 'n';
+ok
+
+> SELECT amount FROM big_n;
+20
+
+-- Vista en un JOIN con una tabla real (antes de tocar los datos).
+> SELECT s.region, t.s FROM sales s INNER JOIN totals t ON s.region = t.region WHERE s.id = 1;
+n|30
+
+-- WHERE sobre la vista.
+> SELECT amount FROM big WHERE amount > 25;
+30
+
+-- Refleja datos actuales: una fila nueva aparece en la vista.
+> INSERT INTO sales (region, amount) VALUES ('n', 50);
+affected 1
+
+> SELECT amount FROM big ORDER BY amount;
+20
+30
+50
+
+-- DROP VIEW.
+> DROP VIEW big_n;
+ok
+
+> SELECT amount FROM big_n;
+error tabla desconocida
+
+-- Sin colisión de nombres entre tablas y vistas.
+> CREATE TABLE big (x INTEGER);
+error ya existe una vista
+
+> CREATE VIEW sales AS SELECT 1;
+error ya existe una tabla
+
+-- IF NOT EXISTS / IF EXISTS.
+> CREATE VIEW big AS SELECT 1;
+error la vista ya existe
+
+> CREATE VIEW IF NOT EXISTS big AS SELECT 1;
+ok
+
+> DROP VIEW IF EXISTS nope;
+ok

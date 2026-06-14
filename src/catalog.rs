@@ -33,6 +33,7 @@ const CAT_TABLE: u8 = 0x01;
 const CAT_COUNTER: u8 = 0x02;
 const CAT_INDEX_COUNTER: u8 = 0x03;
 const CAT_INDEX_REF: u8 = 0x04;
+const CAT_VIEW: u8 = 0x05;
 
 /// v2: el esquema serializado incluye la lista de índices de la tabla.
 // v3 añade el orden lógico de columnas (reorden de presentación) al final del
@@ -457,6 +458,9 @@ pub fn create_table<S: NodeStore>(
     if get_table(s, root, &spec.name)?.is_some() {
         return Err(Error::Constraint("la tabla ya existe"));
     }
+    if get_view(s, root, &spec.name)?.is_some() {
+        return Err(Error::Constraint("ya existe una vista con ese nombre"));
+    }
 
     // Asignar table_id desde el contador global del catálogo.
     let table_id = match btree::get(s, root, &meta_key())? {
@@ -655,6 +659,71 @@ pub fn drop_table<S: NodeStore>(s: &mut S, root: PageId, name: &str) -> Result<(
     (root, _) = btree::delete(s, root, &counter_key(def.table_id))?;
     (root, _) = btree::delete(s, root, &table_key(name))?;
     Ok((root, true))
+}
+
+// --- vistas: SELECT con nombre guardado como texto en el catálogo ---
+
+/// `[0x00, 0x05, nombre]` → texto SQL del SELECT que define la vista.
+fn view_key(name: &str) -> Vec<u8> {
+    let mut k = Vec::with_capacity(2 + name.len());
+    k.extend_from_slice(&[KS_CATALOG, CAT_VIEW]);
+    k.extend_from_slice(name.as_bytes());
+    k
+}
+
+/// Crea una vista (su SELECT se guarda como **texto**, se re-parsea al usarla, como
+/// en SQLite). Falla si ya existe una tabla o una vista con ese nombre.
+pub fn create_view<S: NodeStore>(
+    s: &mut S,
+    root: PageId,
+    name: &str,
+    select_sql: &str,
+) -> Result<PageId> {
+    validate_name(name, "nombre de vista vacío o de más de 128 bytes")?;
+    if get_table(s, root, name)?.is_some() {
+        return Err(Error::Constraint("ya existe una tabla con ese nombre"));
+    }
+    if get_view(s, root, name)?.is_some() {
+        return Err(Error::Constraint("la vista ya existe"));
+    }
+    btree::insert(s, root, &view_key(name), select_sql.as_bytes())
+}
+
+/// Borra una vista. `false` si no existía.
+pub fn drop_view<S: NodeStore>(s: &mut S, root: PageId, name: &str) -> Result<(PageId, bool)> {
+    if get_view(s, root, name)?.is_none() {
+        return Ok((root, false));
+    }
+    let (root, _) = btree::delete(s, root, &view_key(name))?;
+    Ok((root, true))
+}
+
+/// El SELECT (texto) de una vista, o `None` si no existe.
+pub fn get_view<S: NodeSource>(src: &S, root: PageId, name: &str) -> Result<Option<String>> {
+    match btree::get(src, root, &view_key(name))? {
+        Some(bytes) => Ok(Some(
+            String::from_utf8(bytes).map_err(|_| Error::CorruptRecord("vista no UTF-8"))?,
+        )),
+        None => Ok(None),
+    }
+}
+
+/// Todas las vistas `(nombre, SELECT)`, en orden de nombre (para `.schema`).
+pub fn list_views<S: NodeSource>(src: &S, root: PageId) -> Result<Vec<(String, String)>> {
+    let prefix = [KS_CATALOG, CAT_VIEW];
+    let mut out = Vec::new();
+    for item in btree::scan_from(src, root, &prefix)? {
+        let (key, val) = item?;
+        if !key.starts_with(&prefix) {
+            break;
+        }
+        let name = std::str::from_utf8(&key[prefix.len()..])
+            .map_err(|_| Error::CorruptRecord("nombre de vista no UTF-8"))?
+            .to_owned();
+        let sql = String::from_utf8(val).map_err(|_| Error::CorruptRecord("vista no UTF-8"))?;
+        out.push((name, sql));
+    }
+    Ok(out)
 }
 
 // --- índices secundarios: creación, borrado, mantenimiento y consulta ---

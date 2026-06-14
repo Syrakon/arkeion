@@ -38,6 +38,9 @@ pub trait DataSource {
         lo: Option<(&Value, bool)>,
         hi: Option<(&Value, bool)>,
     ) -> Result<Vec<i64>>;
+    /// El SELECT (texto) de una vista con ese nombre, o `None`. Lo usa el overlay
+    /// que materializa las vistas.
+    fn view(&self, name: &str) -> Result<Option<String>>;
 }
 
 impl DataSource for Snapshot {
@@ -73,6 +76,10 @@ impl DataSource for Snapshot {
     ) -> Result<Vec<i64>> {
         Snapshot::index_range(self, idx, lo, hi)
     }
+
+    fn view(&self, name: &str) -> Result<Option<String>> {
+        Snapshot::view(self, name)
+    }
 }
 
 impl DataSource for WriteTx {
@@ -107,6 +114,10 @@ impl DataSource for WriteTx {
         hi: Option<(&Value, bool)>,
     ) -> Result<Vec<i64>> {
         WriteTx::index_range(self, idx, lo, hi)
+    }
+
+    fn view(&self, name: &str) -> Result<Option<String>> {
+        WriteTx::view(self, name)
     }
 }
 
@@ -275,6 +286,27 @@ pub fn run_execute(tx: &mut WriteTx, stmt: &Stmt, params: &[Value]) -> Result<us
             let dropped = tx.drop_table(name)?;
             if !dropped && !if_exists {
                 return Err(sql_err(format!("tabla desconocida: {name}")));
+            }
+            Ok(0)
+        }
+        Stmt::CreateView {
+            if_not_exists,
+            name,
+            select_sql,
+        } => {
+            if tx.view(name)?.is_some() {
+                if *if_not_exists {
+                    return Ok(0);
+                }
+                return Err(Error::Constraint("la vista ya existe"));
+            }
+            tx.create_view(name, select_sql)?;
+            Ok(0)
+        }
+        Stmt::DropView { if_exists, name } => {
+            let dropped = tx.drop_view(name)?;
+            if !dropped && !if_exists {
+                return Err(sql_err(format!("vista desconocida: {name}")));
             }
             Ok(0)
         }
@@ -705,6 +737,13 @@ fn run_select_no_from(stmt: &SelectStmt, params: &[Value]) -> Result<SelectOut> 
     Ok(SelectOut { columns, rows })
 }
 
+/// Punto de entrada de la API para SELECT: resuelve **vistas** envolviendo la
+/// fuente en un overlay que las materializa bajo demanda, y delega en `run_select`
+/// (que ya maneja CTEs/subconsultas/UNION contra ese mismo overlay).
+pub fn run_query(src: &impl DataSource, stmt: &SelectStmt, params: &[Value]) -> Result<SelectOut> {
+    run_select(&ViewSource::new(src), stmt, params)
+}
+
 pub fn run_select(src: &impl DataSource, stmt: &SelectStmt, params: &[Value]) -> Result<SelectOut> {
     // `WITH …`: materializa las CTEs y resuelve el resto contra un overlay que las
     // expone como tablas. (`&dyn DataSource` para no recursar tipos sin fin.)
@@ -988,6 +1027,137 @@ impl DataSource for CteSource<'_> {
         hi: Option<(&Value, bool)>,
     ) -> Result<Vec<i64>> {
         self.inner.index_range(table, idx, lo, hi)
+    }
+    fn view(&self, name: &str) -> Result<Option<String>> {
+        self.inner.view(name)
+    }
+}
+
+// --- vistas (`CREATE VIEW`): SELECT con nombre, materializado bajo demanda ---
+
+/// Una vista materializada y cacheada: `TableDef` sintética + sus filas.
+struct MatView {
+    def: TableDef,
+    rows: Vec<Vec<Value>>,
+}
+
+/// `DataSource` que resuelve **vistas**: si un nombre no es tabla base pero sí una
+/// vista (catálogo), parsea su SELECT, lo ejecuta contra sí mismo (así una vista
+/// sobre otra vista funciona) y lo cachea. Va envuelto sobre el snapshot/tx en la
+/// API, así que toda consulta lo ve. `&dyn` interior ⇒ sin recursión de tipos.
+struct ViewSource<'a> {
+    inner: &'a dyn DataSource,
+    /// Vistas ya materializadas, por nombre. `RefCell` porque `table()` (que toma
+    /// `&self`) puede tener que materializar.
+    cache: std::cell::RefCell<std::collections::HashMap<String, MatView>>,
+    /// Vistas en curso de materialización: guarda contra ciclos (`v` usa `v`).
+    resolving: std::cell::RefCell<std::collections::HashSet<String>>,
+    /// Contador para el `table_id` sintético (rango alto, disjunto de tablas reales
+    /// y de los de CTE).
+    next_id: std::cell::Cell<u32>,
+}
+
+impl<'a> ViewSource<'a> {
+    fn new(inner: &'a dyn DataSource) -> ViewSource<'a> {
+        ViewSource {
+            inner,
+            cache: std::cell::RefCell::new(std::collections::HashMap::new()),
+            resolving: std::cell::RefCell::new(std::collections::HashSet::new()),
+            next_id: std::cell::Cell::new(0xFFFF_0000),
+        }
+    }
+
+    /// Materializa una vista (parsea su SELECT, lo ejecuta, cachea) y devuelve su
+    /// `TableDef` sintética.
+    fn materialize(&self, name: &str, sql: &str) -> Result<TableDef> {
+        if !self.resolving.borrow_mut().insert(name.to_string()) {
+            return Err(sql_err(format!("vista recursiva: {name}")));
+        }
+        let stmt = match crate::sql::parse(sql) {
+            Ok(Stmt::Select(s)) => s,
+            Ok(_) => {
+                self.resolving.borrow_mut().remove(name);
+                return Err(sql_err(format!("la vista «{name}» no define un SELECT")));
+            }
+            Err(e) => {
+                self.resolving.borrow_mut().remove(name);
+                return Err(e);
+            }
+        };
+        let out = run_select(self, &stmt, &[]);
+        self.resolving.borrow_mut().remove(name);
+        let out = out?;
+        let id = self.next_id.get();
+        self.next_id.set(id - 1);
+        let def = synthetic_cte_def(name, &out.columns, 0);
+        // `synthetic_cte_def` usa `u32::MAX - idx`; aquí fijamos un id propio del
+        // rango de vistas para no chocar con CTEs.
+        let def = TableDef {
+            table_id: id,
+            ..def
+        };
+        self.cache.borrow_mut().insert(
+            name.to_string(),
+            MatView {
+                def: def.clone(),
+                rows: out.rows,
+            },
+        );
+        Ok(def)
+    }
+}
+
+impl DataSource for ViewSource<'_> {
+    fn table(&self, name: &str) -> Result<Option<TableDef>> {
+        // Tabla base primero (una tabla tapa a una vista homónima no debería pasar:
+        // el catálogo lo impide al crear, pero por si acaso).
+        if let Some(def) = self.inner.table(name)? {
+            return Ok(Some(def));
+        }
+        if let Some(v) = self.cache.borrow().get(name) {
+            return Ok(Some(v.def.clone()));
+        }
+        match self.inner.view(name)? {
+            Some(sql) => Ok(Some(self.materialize(name, &sql)?)),
+            None => Ok(None),
+        }
+    }
+    fn get_row(&self, table: &TableDef, rowid: i64) -> Result<Option<Vec<Value>>> {
+        if self
+            .cache
+            .borrow()
+            .values()
+            .any(|v| v.def.table_id == table.table_id)
+        {
+            return Ok(None); // las vistas no tienen alias de rowid
+        }
+        self.inner.get_row(table, rowid)
+    }
+    fn scan_rows(&self, table: &TableDef) -> Result<Vec<Vec<Value>>> {
+        if let Some(v) = self
+            .cache
+            .borrow()
+            .values()
+            .find(|v| v.def.table_id == table.table_id)
+        {
+            return Ok(v.rows.clone());
+        }
+        self.inner.scan_rows(table)
+    }
+    fn index_lookup(&self, table: &TableDef, idx: &IndexDef, values: &[Value]) -> Result<Vec<i64>> {
+        self.inner.index_lookup(table, idx, values)
+    }
+    fn index_range(
+        &self,
+        table: &TableDef,
+        idx: &IndexDef,
+        lo: Option<(&Value, bool)>,
+        hi: Option<(&Value, bool)>,
+    ) -> Result<Vec<i64>> {
+        self.inner.index_range(table, idx, lo, hi)
+    }
+    fn view(&self, name: &str) -> Result<Option<String>> {
+        self.inner.view(name)
     }
 }
 
@@ -1330,7 +1500,11 @@ pub fn stream_select(
     {
         return Ok(None);
     }
-    let def = lookup(src, from_ref)?;
+    // Si el FROM no es una tabla base (puede ser una vista, que `src` crudo no
+    // resuelve), se cae al camino normal (`run_query`, con overlay de vistas).
+    let Some(def) = src.table(&from_ref.name)? else {
+        return Ok(None);
+    };
     let qualifier = from_ref.qualifier();
     let mut columns = Vec::new();
     let mut cols = Vec::new();

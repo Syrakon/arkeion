@@ -1275,6 +1275,16 @@ impl Snapshot {
         catalog::list_tables(self, self.data_root)
     }
 
+    /// El SELECT (texto) de una vista, o `None`.
+    pub fn view(&self, name: &str) -> Result<Option<String>> {
+        catalog::get_view(self, self.data_root, name)
+    }
+
+    /// Todas las vistas `(nombre, SELECT)` (introspección).
+    pub fn views(&self) -> Result<Vec<(String, String)>> {
+        catalog::list_views(self, self.data_root)
+    }
+
     /// rowids cuyas columnas indexadas valen `values` (igualdad, una entrada por
     /// columna del índice), vía el índice.
     pub fn index_lookup(&self, idx: &IndexDef, values: &[Value]) -> Result<Vec<i64>> {
@@ -1467,6 +1477,24 @@ impl WriteTx {
         let (root, def) = catalog::create_table(&mut self.ts, self.data_root, spec)?;
         self.data_root = root;
         Ok(def)
+    }
+
+    /// Crea una vista (`CREATE VIEW`): guarda su SELECT como texto.
+    pub fn create_view(&mut self, name: &str, select_sql: &str) -> Result<()> {
+        self.data_root = catalog::create_view(&mut self.ts, self.data_root, name, select_sql)?;
+        Ok(())
+    }
+
+    /// Borra una vista. `false` si no existía.
+    pub fn drop_view(&mut self, name: &str) -> Result<bool> {
+        let (root, dropped) = catalog::drop_view(&mut self.ts, self.data_root, name)?;
+        self.data_root = root;
+        Ok(dropped)
+    }
+
+    /// El SELECT (texto) de una vista visible en la tx, o `None`.
+    pub fn view(&self, name: &str) -> Result<Option<String>> {
+        catalog::get_view(&self.ts, self.data_root, name)
     }
 
     /// Crea un índice secundario sobre `columns` (posiciones) de `table` (M10.5).

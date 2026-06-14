@@ -196,6 +196,13 @@ fn meta(db: &Database, conn: &arkeion::Connection, line: &str) -> Action {
                     .for_each(print_schema),
                 Err(e) => eprintln!("error: {e}"),
             }
+            match conn.views() {
+                Ok(vs) => vs
+                    .iter()
+                    .filter(|(name, _)| only.is_none_or(|n| n == name))
+                    .for_each(|(name, sql)| println!("CREATE VIEW {name} AS {sql};")),
+                Err(e) => eprintln!("error: {e}"),
+            }
         }
         ".version" | ".v" => println!("v{}", conn.version()),
         ".history" | ".log" => match db.history() {

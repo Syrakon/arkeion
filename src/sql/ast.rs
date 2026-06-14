@@ -18,6 +18,18 @@ pub enum Stmt {
         if_exists: bool,
         name: String,
     },
+    /// `CREATE VIEW [IF NOT EXISTS] nombre AS <select>`. El SELECT se guarda como
+    /// texto (`select_sql`) y se re-parsea al usar la vista.
+    CreateView {
+        if_not_exists: bool,
+        name: String,
+        select_sql: String,
+    },
+    /// `DROP VIEW [IF EXISTS] nombre`.
+    DropView {
+        if_exists: bool,
+        name: String,
+    },
     /// `CREATE [UNIQUE] INDEX [IF NOT EXISTS] nombre ON tabla (col, …)`.
     CreateIndex {
         if_not_exists: bool,

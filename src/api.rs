@@ -531,7 +531,7 @@ impl Connection {
             if let Some(plan) = exec::stream_select(snap, select, params)? {
                 return Rows::stream(snap.clone(), plan);
             }
-            exec::run_select(snap, select, params)?
+            exec::run_query(snap, select, params)?
         } else if let Some(clause) = &select.as_of {
             // AS OF lee la historia confirmada **de esta rama** (acotado a su
             // ascendencia); ignora una tx abierta (no se escribe en el pasado).
@@ -541,17 +541,17 @@ impl Connection {
             if let Some(plan) = exec::stream_select(&snap, select, params)? {
                 return Rows::stream(snap, plan);
             }
-            exec::run_select(&snap, select, params)?
+            exec::run_query(&snap, select, params)?
         } else {
             match self.open_tx.borrow().as_ref() {
                 // Dentro de BEGIN la fuente es la tx prestada: sin streaming.
-                Some(tx) => exec::run_select(tx, select, params)?,
+                Some(tx) => exec::run_query(tx, select, params)?,
                 None => {
                     let snap = self.store.snapshot_on(&self.branch)?;
                     if let Some(plan) = exec::stream_select(&snap, select, params)? {
                         return Rows::stream(snap, plan);
                     }
-                    exec::run_select(&snap, select, params)?
+                    exec::run_query(&snap, select, params)?
                 }
             }
         };
@@ -691,6 +691,15 @@ impl Connection {
             None => self.store.snapshot_on(&self.branch)?.tables(),
         }
     }
+
+    /// Vistas visibles `(nombre, SELECT)` (introspección; la usa el CLI en
+    /// `.schema`).
+    pub fn views(&self) -> Result<Vec<(String, String)>> {
+        match &self.pinned {
+            Some(snap) => snap.views(),
+            None => self.store.snapshot_on(&self.branch)?.views(),
+        }
+    }
 }
 
 /// Sentencia preparada por [`Connection::prepare`]. Respeta el modo de la
@@ -760,7 +769,7 @@ impl Transaction<'_> {
                  usa una consulta normal o Connection::snapshot",
             ));
         }
-        let out = exec::run_select(&*self.tx.borrow(), &select, params)?;
+        let out = exec::run_query(&*self.tx.borrow(), &select, params)?;
         Ok(Rows::buffered(out))
     }
 

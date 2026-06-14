@@ -1,0 +1,52 @@
+-- CASE: forma "buscada" (WHEN cond) y "simple" (CASE operand WHEN valor). Primera
+-- rama que cuadra gana; sin rama que cuadre → ELSE o NULL. NULL no cuadra con NULL.
+
+-- Buscada.
+> SELECT CASE WHEN 1 < 2 THEN 'si' ELSE 'no' END;
+si
+
+> SELECT CASE WHEN 1 > 2 THEN 'si' ELSE 'no' END;
+no
+
+> SELECT CASE WHEN 1 > 2 THEN 'a' WHEN 3 = 3 THEN 'b' ELSE 'c' END;
+b
+
+-- Sin ELSE y sin rama que cuadre → NULL.
+> SELECT CASE WHEN 0 = 1 THEN 'x' END;
+NULL
+
+-- Simple (operand = valor).
+> SELECT CASE 2 WHEN 1 THEN 'uno' WHEN 2 THEN 'dos' ELSE 'otro' END;
+dos
+
+> SELECT CASE 9 WHEN 1 THEN 'uno' ELSE 'otro' END;
+otro
+
+-- operand NULL no cuadra ni con NULL → ELSE.
+> SELECT CASE NULL WHEN NULL THEN 'a' ELSE 'b' END;
+b
+
+-- En proyección y sobre una tabla: clasificación por tramos.
+> CREATE TABLE g (id INTEGER PRIMARY KEY, score INTEGER);
+ok
+
+> INSERT INTO g (score) VALUES (95), (70), (40);
+affected 3
+
+> SELECT score, CASE WHEN score >= 90 THEN 'A' WHEN score >= 60 THEN 'B' ELSE 'F' END FROM g ORDER BY id;
+95|A
+70|B
+40|F
+
+-- En WHERE.
+> SELECT id FROM g WHERE CASE WHEN score >= 60 THEN 1 ELSE 0 END = 1 ORDER BY id;
+1
+2
+
+-- Anida funciones / CAST.
+> SELECT CASE WHEN length('abc') = 3 THEN upper('ok') ELSE 'no' END;
+OK
+
+-- Error: WHEN sin THEN.
+> SELECT CASE WHEN 1 = 1 END;
+error se esperaba THEN

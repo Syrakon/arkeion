@@ -210,6 +210,14 @@ pub enum Expr {
         expr: Box<Expr>,
         to: ColType,
     },
+    /// `CASE [operand] WHEN c THEN r … [ELSE e] END`. Sin `operand`: forma
+    /// "buscada" (cada `c` es una condición booleana). Con `operand`: forma
+    /// "simple" (compara `operand = c`). Sin rama que cuadre ⇒ `ELSE` o NULL.
+    Case {
+        operand: Option<Box<Expr>>,
+        whens: Vec<(Expr, Expr)>,
+        else_: Option<Box<Expr>>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -251,6 +259,15 @@ impl Expr {
             Expr::Function { args, .. } => args.iter().all(Expr::is_const),
             Expr::In { expr, list, .. } => expr.is_const() && list.iter().all(Expr::is_const),
             Expr::Cast { expr, .. } => expr.is_const(),
+            Expr::Case {
+                operand,
+                whens,
+                else_,
+            } => {
+                operand.as_ref().is_none_or(|o| o.is_const())
+                    && whens.iter().all(|(c, r)| c.is_const() && r.is_const())
+                    && else_.as_ref().is_none_or(|e| e.is_const())
+            }
         }
     }
 
@@ -268,6 +285,17 @@ impl Expr {
                 expr.contains_param() || list.iter().any(Expr::contains_param)
             }
             Expr::Cast { expr, .. } => expr.contains_param(),
+            Expr::Case {
+                operand,
+                whens,
+                else_,
+            } => {
+                operand.as_ref().is_some_and(|o| o.contains_param())
+                    || whens
+                        .iter()
+                        .any(|(c, r)| c.contains_param() || r.contains_param())
+                    || else_.as_ref().is_some_and(|e| e.contains_param())
+            }
         }
     }
 
@@ -284,6 +312,17 @@ impl Expr {
                 expr.has_aggregate() || list.iter().any(Expr::has_aggregate)
             }
             Expr::Cast { expr, .. } => expr.has_aggregate(),
+            Expr::Case {
+                operand,
+                whens,
+                else_,
+            } => {
+                operand.as_ref().is_some_and(|o| o.has_aggregate())
+                    || whens
+                        .iter()
+                        .any(|(c, r)| c.has_aggregate() || r.has_aggregate())
+                    || else_.as_ref().is_some_and(|e| e.has_aggregate())
+            }
         }
     }
 }

@@ -223,6 +223,22 @@ fn validate_columns(e: &Expr, schema: &QuerySchema) -> Result<()> {
             list.iter().try_for_each(|e| validate_columns(e, schema))
         }
         Expr::Cast { expr, .. } => validate_columns(expr, schema),
+        Expr::Case {
+            operand,
+            whens,
+            else_,
+        } => {
+            if let Some(o) = operand {
+                validate_columns(o, schema)?;
+            }
+            for (c, r) in whens {
+                validate_columns(c, schema)?;
+                validate_columns(r, schema)?;
+            }
+            else_
+                .as_deref()
+                .map_or(Ok(()), |e| validate_columns(e, schema))
+        }
     }
 }
 
@@ -1264,6 +1280,19 @@ fn col_outside_agg(e: &Expr) -> Option<&str> {
             col_outside_agg(expr).or_else(|| list.iter().find_map(col_outside_agg))
         }
         Expr::Cast { expr, .. } => col_outside_agg(expr),
+        Expr::Case {
+            operand,
+            whens,
+            else_,
+        } => operand
+            .as_deref()
+            .and_then(col_outside_agg)
+            .or_else(|| {
+                whens
+                    .iter()
+                    .find_map(|(c, r)| col_outside_agg(c).or_else(|| col_outside_agg(r)))
+            })
+            .or_else(|| else_.as_deref().and_then(col_outside_agg)),
     }
 }
 
@@ -1301,6 +1330,22 @@ fn collect_columns(e: &Expr, skip_agg: bool, out: &mut Vec<ColRef>) {
             list.iter().for_each(|e| collect_columns(e, skip_agg, out));
         }
         Expr::Cast { expr, .. } => collect_columns(expr, skip_agg, out),
+        Expr::Case {
+            operand,
+            whens,
+            else_,
+        } => {
+            if let Some(o) = operand {
+                collect_columns(o, skip_agg, out);
+            }
+            for (c, r) in whens {
+                collect_columns(c, skip_agg, out);
+                collect_columns(r, skip_agg, out);
+            }
+            if let Some(e) = else_ {
+                collect_columns(e, skip_agg, out);
+            }
+        }
     }
 }
 
@@ -1505,6 +1550,29 @@ fn fold_aggregates(
         Expr::Cast { expr, to } => Expr::Cast {
             expr: Box::new(fold_aggregates(expr, schema, rows, params)?),
             to: *to,
+        },
+        Expr::Case {
+            operand,
+            whens,
+            else_,
+        } => Expr::Case {
+            operand: match operand {
+                Some(o) => Some(Box::new(fold_aggregates(o, schema, rows, params)?)),
+                None => None,
+            },
+            whens: whens
+                .iter()
+                .map(|(c, r)| {
+                    Ok((
+                        fold_aggregates(c, schema, rows, params)?,
+                        fold_aggregates(r, schema, rows, params)?,
+                    ))
+                })
+                .collect::<Result<_>>()?,
+            else_: match else_ {
+                Some(e) => Some(Box::new(fold_aggregates(e, schema, rows, params)?)),
+                None => None,
+            },
         },
     })
 }
@@ -1751,6 +1819,38 @@ fn eval(e: &Expr, row: Option<(&QuerySchema, &[Value])>, params: &[Value]) -> Re
             })
         }
         Expr::Cast { expr, to } => cast_value(eval(expr, row, params)?, *to),
+        Expr::Case {
+            operand,
+            whens,
+            else_,
+        } => {
+            // Forma simple: el `operand` se evalúa una vez y se compara con cada
+            // `WHEN`. Forma buscada (sin operand): cada `WHEN` es una condición.
+            let op_val = match operand {
+                Some(o) => Some(eval(o, row, params)?),
+                None => None,
+            };
+            for (cond, res) in whens {
+                let hit = match &op_val {
+                    // simple: operand = cond (NULL en cualquiera ⇒ no cuadra)
+                    Some(ov) => {
+                        matches!(
+                            cmp_values(ov, &eval(cond, row, params)?)?,
+                            Some(Ordering::Equal)
+                        )
+                    }
+                    // buscada: cond booleana (NULL/false ⇒ se salta)
+                    None => truthy(eval(cond, row, params)?)?,
+                };
+                if hit {
+                    return eval(res, row, params);
+                }
+            }
+            match else_ {
+                Some(e) => eval(e, row, params),
+                None => Ok(Value::Null),
+            }
+        }
     }
 }
 

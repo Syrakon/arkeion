@@ -753,6 +753,36 @@ impl Parser {
         self.primary()
     }
 
+    /// `CASE [operand] WHEN c THEN r (WHEN c THEN r)* [ELSE e] END` (ya se consumió
+    /// `CASE`). Sin `operand` (lo siguiente es `WHEN`) es la forma buscada.
+    fn case_expr(&mut self) -> Result<Expr> {
+        let operand = if matches!(self.peek(), Some(Tok::Kw(Kw::When))) {
+            None
+        } else {
+            Some(Box::new(self.expr()?))
+        };
+        let mut whens = Vec::new();
+        while self.eat_kw(Kw::When) {
+            let cond = self.expr()?;
+            self.expect_kw(Kw::Then, "THEN")?;
+            whens.push((cond, self.expr()?));
+        }
+        if whens.is_empty() {
+            return Err(err_at(self.pos(), "CASE necesita al menos un WHEN … THEN"));
+        }
+        let else_ = if self.eat_kw(Kw::Else) {
+            Some(Box::new(self.expr()?))
+        } else {
+            None
+        };
+        self.expect_kw(Kw::End, "END")?;
+        Ok(Expr::Case {
+            operand,
+            whens,
+            else_,
+        })
+    }
+
     fn primary(&mut self) -> Result<Expr> {
         let pos = self.pos();
         match self.next() {
@@ -774,6 +804,7 @@ impl Parser {
                     to,
                 })
             }
+            Some(Tok::Kw(Kw::Case)) => self.case_expr(),
             Some(Tok::Param(n)) => {
                 if !self.param_names.is_empty() {
                     return Err(err_at(pos, MIX_PARAMS));

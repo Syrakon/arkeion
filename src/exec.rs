@@ -7,7 +7,10 @@
 
 use std::cmp::Ordering;
 
-use crate::catalog::{ColType, ColumnDef, ColumnSpec, IndexDef, TableDef, TableSpec};
+use crate::catalog::{
+    self, ColType, ColumnDef, ColumnSpec, IndexDef, TableDef, TableSpec, TriggerDef, TriggerEvent,
+    TriggerTiming,
+};
 use crate::error::{Error, Result};
 use crate::record::Value;
 use crate::sql::ast::{
@@ -310,6 +313,48 @@ pub fn run_execute(tx: &mut WriteTx, stmt: &Stmt, params: &[Value]) -> Result<us
             }
             Ok(0)
         }
+        Stmt::CreateTrigger {
+            if_not_exists,
+            name,
+            timing,
+            event,
+            table,
+            body_sql,
+        } => {
+            if tx.trigger(name)?.is_some() {
+                if *if_not_exists {
+                    return Ok(0);
+                }
+                return Err(Error::Constraint("el trigger ya existe"));
+            }
+            // Valida el cuerpo (DML) por adelantado: re-parsea y exige INSERT/
+            // UPDATE/DELETE.
+            for s in &crate::sql::parser::parse_many(body_sql)? {
+                if !matches!(
+                    s,
+                    Stmt::Insert { .. } | Stmt::Update { .. } | Stmt::Delete { .. }
+                ) {
+                    return Err(sql_err(
+                        "el cuerpo de un trigger solo admite INSERT/UPDATE/DELETE",
+                    ));
+                }
+            }
+            tx.create_trigger(&catalog::TriggerDef {
+                name: name.clone(),
+                timing: *timing,
+                event: *event,
+                table: table.clone(),
+                body: body_sql.clone(),
+            })?;
+            Ok(0)
+        }
+        Stmt::DropTrigger { if_exists, name } => {
+            let dropped = tx.drop_trigger(name)?;
+            if !dropped && !if_exists {
+                return Err(sql_err(format!("trigger desconocido: {name}")));
+            }
+            Ok(0)
+        }
         Stmt::CreateIndex {
             if_not_exists,
             unique,
@@ -352,12 +397,23 @@ pub fn run_execute(tx: &mut WriteTx, stmt: &Stmt, params: &[Value]) -> Result<us
             let def = tx
                 .table_cached(table)?
                 .ok_or_else(|| sql_err(format!("tabla desconocida: {table}")))?;
+            let before = tx.triggers_for(&def.name, TriggerEvent::Insert, TriggerTiming::Before)?;
+            let after = tx.triggers_for(&def.name, TriggerEvent::Insert, TriggerTiming::After)?;
             // Buffer prestado de la tx: ni un `Vec` de valores por fila. Si una
             // fila falla, el `?` lo pierde — camino frío, el próximo take asigna.
             let mut values = tx.take_values_buf();
             for row in rows {
                 insert_values_into(&def, columns.as_deref(), row, params, &mut values)?;
-                tx.insert_row(&def, &values)?;
+                fire(tx, &def, &before, None, Some(&values))?; // BEFORE INSERT
+                let rowid = tx.insert_row(&def, &values)?;
+                if !after.is_empty() {
+                    // NEW con el rowid ya asignado.
+                    let mut new_after = values.clone();
+                    if let Some(i) = def.rowid_alias {
+                        new_after[i] = Value::Integer(rowid);
+                    }
+                    fire(tx, &def, &after, None, Some(&new_after))?; // AFTER INSERT
+                }
             }
             tx.put_values_buf(values);
             Ok(rows.len())
@@ -528,10 +584,12 @@ fn run_update(
         no_aggregates(cond, "WHERE")?;
         validate_columns(cond, &schema)?;
     }
+    let before = tx.triggers_for(&def.name, TriggerEvent::Update, TriggerTiming::Before)?;
+    let after = tx.triggers_for(&def.name, TriggerEvent::Update, TriggerTiming::After)?;
 
     // Materializar primero (point lookup por PK o full scan): el scan toma
     // prestada la tx, que luego necesitamos en exclusiva para escribir.
-    let mut updates: Vec<(i64, Vec<Value>)> = Vec::new();
+    let mut updates: Vec<(i64, Vec<Value>, Vec<Value>)> = Vec::new(); // rowid, OLD, NEW
     for (rowid, row) in candidate_rows(tx, &def, &schema, where_clause, params)? {
         if let Some(cond) = where_clause
             && !truthy(eval(cond, Some((&schema, &row)), params)?)?
@@ -543,11 +601,13 @@ fn run_update(
         for (&i, (_, expr)) in set_idx.iter().zip(sets) {
             new_row[i] = eval(expr, Some((&schema, &row)), params)?;
         }
-        updates.push((rowid, new_row));
+        updates.push((rowid, row, new_row));
     }
     let n = updates.len();
-    for (rowid, values) in updates {
-        tx.update_row(&def, rowid, &values)?;
+    for (rowid, old_row, new_row) in updates {
+        fire(tx, &def, &before, Some(&old_row), Some(&new_row))?;
+        tx.update_row(&def, rowid, &new_row)?;
+        fire(tx, &def, &after, Some(&old_row), Some(&new_row))?;
     }
     Ok(n)
 }
@@ -566,19 +626,195 @@ fn run_delete(
         no_aggregates(cond, "WHERE")?;
         validate_columns(cond, &schema)?;
     }
-    let mut doomed = Vec::new();
+    let before = tx.triggers_for(&def.name, TriggerEvent::Delete, TriggerTiming::Before)?;
+    let after = tx.triggers_for(&def.name, TriggerEvent::Delete, TriggerTiming::After)?;
+    let mut doomed: Vec<(i64, Vec<Value>)> = Vec::new(); // rowid, OLD
     for (rowid, row) in candidate_rows(tx, &def, &schema, where_clause, params)? {
         if let Some(cond) = where_clause
             && !truthy(eval(cond, Some((&schema, &row)), params)?)?
         {
             continue;
         }
-        doomed.push(rowid);
+        doomed.push((rowid, row));
     }
-    for rowid in &doomed {
-        tx.delete_row(&def, *rowid)?;
+    let n = doomed.len();
+    for (rowid, old_row) in doomed {
+        fire(tx, &def, &before, Some(&old_row), None)?;
+        tx.delete_row(&def, rowid)?;
+        fire(tx, &def, &after, Some(&old_row), None)?;
     }
-    Ok(doomed.len())
+    Ok(n)
+}
+
+// --- triggers: disparo row-level con sustitución de OLD/NEW ---
+
+/// Sustituye `OLD.col`/`NEW.col` por el valor de la fila (cuerpo de trigger). Lo
+/// demás queda igual: columnas sin calificar y otras tablas se resuelven normal al
+/// ejecutar la sentencia.
+fn subst_expr(
+    e: &Expr,
+    table: &TableDef,
+    old: Option<&[Value]>,
+    new: Option<&[Value]>,
+) -> Result<Expr> {
+    let r = |x: &Expr| subst_expr(x, table, old, new);
+    let b = |x: &Expr| r(x).map(Box::new);
+    let opt =
+        |x: &Option<Box<Expr>>| -> Result<Option<Box<Expr>>> { x.as_deref().map(b).transpose() };
+    Ok(match e {
+        Expr::Column {
+            table: Some(q),
+            name,
+        } if q.eq_ignore_ascii_case("OLD") || q.eq_ignore_ascii_case("NEW") => {
+            let is_new = q.eq_ignore_ascii_case("NEW");
+            let vals = if is_new { new } else { old }.ok_or_else(|| {
+                sql_err(format!(
+                    "{} no está disponible en este trigger",
+                    if is_new { "NEW" } else { "OLD" }
+                ))
+            })?;
+            let i = table
+                .columns
+                .iter()
+                .position(|c| c.name == *name)
+                .ok_or_else(|| sql_err(format!("columna desconocida: {q}.{name}")))?;
+            Expr::Literal(vals[i].clone())
+        }
+        Expr::Literal(_) | Expr::Column { .. } | Expr::Param(_) => e.clone(),
+        Expr::Unary(op, x) => Expr::Unary(*op, b(x)?),
+        Expr::Binary(a, op, c) => Expr::Binary(b(a)?, *op, b(c)?),
+        Expr::IsNull { expr, negated } => Expr::IsNull {
+            expr: b(expr)?,
+            negated: *negated,
+        },
+        Expr::Like {
+            expr,
+            pattern,
+            negated,
+        } => Expr::Like {
+            expr: b(expr)?,
+            pattern: b(pattern)?,
+            negated: *negated,
+        },
+        Expr::Aggregate {
+            func,
+            arg,
+            distinct,
+            sep,
+        } => Expr::Aggregate {
+            func: *func,
+            arg: opt(arg)?,
+            distinct: *distinct,
+            sep: opt(sep)?,
+        },
+        Expr::Function { name, args } => Expr::Function {
+            name: name.clone(),
+            args: args.iter().map(r).collect::<Result<_>>()?,
+        },
+        Expr::In {
+            expr,
+            list,
+            negated,
+        } => Expr::In {
+            expr: b(expr)?,
+            list: list.iter().map(r).collect::<Result<_>>()?,
+            negated: *negated,
+        },
+        Expr::Cast { expr, to } => Expr::Cast {
+            expr: b(expr)?,
+            to: *to,
+        },
+        Expr::Case {
+            operand,
+            whens,
+            else_,
+        } => Expr::Case {
+            operand: opt(operand)?,
+            whens: whens
+                .iter()
+                .map(|(c, rr)| Ok((r(c)?, r(rr)?)))
+                .collect::<Result<_>>()?,
+            else_: opt(else_)?,
+        },
+        Expr::ScalarSubquery(_) | Expr::Exists(_) | Expr::InSubquery { .. } => e.clone(),
+    })
+}
+
+/// Sustituye `OLD`/`NEW` en una sentencia DML del cuerpo de un trigger.
+fn subst_stmt(
+    stmt: &Stmt,
+    table: &TableDef,
+    old: Option<&[Value]>,
+    new: Option<&[Value]>,
+) -> Result<Stmt> {
+    let r = |e: &Expr| subst_expr(e, table, old, new);
+    Ok(match stmt {
+        Stmt::Insert {
+            table: t,
+            columns,
+            rows,
+        } => Stmt::Insert {
+            table: t.clone(),
+            columns: columns.clone(),
+            rows: rows
+                .iter()
+                .map(|row| row.iter().map(&r).collect::<Result<Vec<_>>>())
+                .collect::<Result<Vec<_>>>()?,
+        },
+        Stmt::Update {
+            table: t,
+            sets,
+            where_clause,
+        } => Stmt::Update {
+            table: t.clone(),
+            sets: sets
+                .iter()
+                .map(|(c, e)| Ok((c.clone(), r(e)?)))
+                .collect::<Result<_>>()?,
+            where_clause: where_clause.as_ref().map(&r).transpose()?,
+        },
+        Stmt::Delete {
+            table: t,
+            where_clause,
+        } => Stmt::Delete {
+            table: t.clone(),
+            where_clause: where_clause.as_ref().map(&r).transpose()?,
+        },
+        other => other.clone(),
+    })
+}
+
+/// Dispara `triggers` (mismo evento+momento) para una fila, con guarda de recursión.
+fn fire(
+    tx: &mut WriteTx,
+    table: &TableDef,
+    triggers: &[TriggerDef],
+    old: Option<&[Value]>,
+    new: Option<&[Value]>,
+) -> Result<()> {
+    if triggers.is_empty() {
+        return Ok(());
+    }
+    tx.enter_trigger()?;
+    let r = fire_inner(tx, table, triggers, old, new);
+    tx.exit_trigger();
+    r
+}
+
+fn fire_inner(
+    tx: &mut WriteTx,
+    table: &TableDef,
+    triggers: &[TriggerDef],
+    old: Option<&[Value]>,
+    new: Option<&[Value]>,
+) -> Result<()> {
+    for trig in triggers {
+        for stmt in crate::sql::parser::parse_many(&trig.body)? {
+            let sub = subst_stmt(&stmt, table, old, new)?;
+            run_execute(tx, &sub, &[])?;
+        }
+    }
+    Ok(())
 }
 
 fn table_spec(name: &str, columns: &[ColumnAst]) -> Result<TableSpec> {

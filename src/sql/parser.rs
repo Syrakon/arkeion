@@ -10,7 +10,7 @@
 //! primary := literal | columna | tabla.columna | func(args) | agregado(expr|*) | ?N | ( expr )
 //! ```
 
-use crate::catalog::{ColType, ColumnPos, FkAction};
+use crate::catalog::{ColType, ColumnPos, FkAction, TriggerEvent, TriggerTiming};
 use crate::error::{Error, Result};
 use crate::record::Value;
 use crate::sql::ast::*;
@@ -43,6 +43,26 @@ pub fn parse_full(sql: &str) -> Result<(Stmt, Vec<String>)> {
         return Err(err_at(s.pos, "se esperaba el final de la sentencia"));
     }
     Ok((stmt, p.param_names))
+}
+
+/// Parsea una secuencia de sentencias separadas por `;` (el cuerpo de un trigger).
+pub fn parse_many(sql: &str) -> Result<Vec<Stmt>> {
+    let toks = lex(sql)?;
+    let mut p = Parser {
+        src: sql,
+        toks,
+        i: 0,
+        end: sql.len(),
+        param_names: Vec::new(),
+        positional_seen: false,
+        depth: 0,
+    };
+    let mut stmts = Vec::new();
+    while p.peek().is_some() {
+        stmts.push(p.statement()?);
+        p.eat(&Tok::Semi);
+    }
+    Ok(stmts)
 }
 
 fn err_at(pos: usize, msg: impl Into<String>) -> Error {
@@ -178,9 +198,61 @@ impl<'a> Parser<'a> {
             self.create_index()
         } else if matches!(self.peek(), Some(Tok::Kw(Kw::View))) {
             self.create_view()
+        } else if matches!(self.peek(), Some(Tok::Kw(Kw::Trigger))) {
+            self.create_trigger()
         } else {
             self.create_table()
         }
+    }
+
+    /// `CREATE TRIGGER [IF NOT EXISTS] nombre {BEFORE|AFTER} {INSERT|UPDATE|DELETE}
+    /// ON tabla [FOR EACH ROW] BEGIN <dml>; … END`. El cuerpo se guarda como texto.
+    fn create_trigger(&mut self) -> Result<Stmt> {
+        self.expect_kw(Kw::Trigger, "TRIGGER")?;
+        let if_not_exists = self.if_not_exists()?;
+        let name = self.ident("un nombre de trigger")?;
+        let timing = if self.eat_kw(Kw::Before) {
+            TriggerTiming::Before
+        } else if self.eat_kw(Kw::After) {
+            TriggerTiming::After
+        } else {
+            return Err(err_at(self.pos(), "se esperaba BEFORE o AFTER"));
+        };
+        let event = if self.eat_kw(Kw::Insert) {
+            TriggerEvent::Insert
+        } else if self.eat_kw(Kw::Update) {
+            TriggerEvent::Update
+        } else if self.eat_kw(Kw::Delete) {
+            TriggerEvent::Delete
+        } else {
+            return Err(err_at(self.pos(), "se esperaba INSERT, UPDATE o DELETE"));
+        };
+        self.expect_kw(Kw::On, "ON")?;
+        let table = self.ident("una tabla")?;
+        if self.eat_kw(Kw::For) {
+            // FOR EACH ROW (solo soportamos row-level; opcional).
+            self.expect_kw(Kw::Each, "EACH")?;
+            self.expect_kw(Kw::Row, "ROW")?;
+        }
+        self.expect_kw(Kw::Begin, "BEGIN")?;
+        // Cuerpo: sentencias hasta END. Se parsean para validar y localizar el END
+        // (un CASE…END interno lo consume `statement`, no este bucle); se guarda el
+        // texto para re-parsearlo al disparar.
+        let start = self.pos();
+        while !matches!(self.peek(), Some(Tok::Kw(Kw::End)) | None) {
+            let _ = self.statement()?;
+            self.eat(&Tok::Semi);
+        }
+        let body_sql = self.src[start..self.pos()].trim().to_string();
+        self.expect_kw(Kw::End, "END")?;
+        Ok(Stmt::CreateTrigger {
+            if_not_exists,
+            name,
+            timing,
+            event,
+            table,
+            body_sql,
+        })
     }
 
     /// `CREATE VIEW [IF NOT EXISTS] nombre AS <select>` — el SELECT se guarda como
@@ -210,6 +282,11 @@ impl<'a> Parser<'a> {
             let if_exists = self.if_exists()?;
             let name = self.ident("un nombre de vista")?;
             Ok(Stmt::DropView { if_exists, name })
+        } else if matches!(self.peek(), Some(Tok::Kw(Kw::Trigger))) {
+            self.expect_kw(Kw::Trigger, "TRIGGER")?;
+            let if_exists = self.if_exists()?;
+            let name = self.ident("un nombre de trigger")?;
+            Ok(Stmt::DropTrigger { if_exists, name })
         } else {
             self.drop_table()
         }

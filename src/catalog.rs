@@ -34,6 +34,7 @@ const CAT_COUNTER: u8 = 0x02;
 const CAT_INDEX_COUNTER: u8 = 0x03;
 const CAT_INDEX_REF: u8 = 0x04;
 const CAT_VIEW: u8 = 0x05;
+const CAT_TRIGGER: u8 = 0x06;
 
 /// v2: el esquema serializado incluye la lista de índices de la tabla.
 // v3 añade el orden lógico de columnas (reorden de presentación) al final del
@@ -112,6 +113,67 @@ pub struct ForeignKey {
     /// Tabla padre (la columna referenciada es su PK).
     pub parent: String,
     pub on_delete: FkAction,
+}
+
+/// Momento de disparo de un trigger.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TriggerTiming {
+    Before,
+    After,
+}
+
+/// Evento que dispara un trigger.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TriggerEvent {
+    Insert,
+    Update,
+    Delete,
+}
+
+impl TriggerTiming {
+    fn as_u8(self) -> u8 {
+        match self {
+            TriggerTiming::Before => 0,
+            TriggerTiming::After => 1,
+        }
+    }
+    fn from_u8(b: u8) -> Option<TriggerTiming> {
+        match b {
+            0 => Some(TriggerTiming::Before),
+            1 => Some(TriggerTiming::After),
+            _ => None,
+        }
+    }
+}
+
+impl TriggerEvent {
+    fn as_u8(self) -> u8 {
+        match self {
+            TriggerEvent::Insert => 0,
+            TriggerEvent::Update => 1,
+            TriggerEvent::Delete => 2,
+        }
+    }
+    fn from_u8(b: u8) -> Option<TriggerEvent> {
+        match b {
+            0 => Some(TriggerEvent::Insert),
+            1 => Some(TriggerEvent::Update),
+            2 => Some(TriggerEvent::Delete),
+            _ => None,
+        }
+    }
+}
+
+/// Trigger **row-level**: dispara su cuerpo (DML) por cada fila afectada del evento.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TriggerDef {
+    pub name: String,
+    pub timing: TriggerTiming,
+    pub event: TriggerEvent,
+    pub table: String,
+    /// Cuerpo `BEGIN … END` como texto; se re-parsea al disparar (con `OLD`/`NEW`
+    /// sustituidos por los valores de la fila).
+    pub body: String,
 }
 
 /// Definición de columna tal y como la pide el llamador.
@@ -828,6 +890,90 @@ pub fn list_views<S: NodeSource>(src: &S, root: PageId) -> Result<Vec<(String, S
             .to_owned();
         let sql = String::from_utf8(val).map_err(|_| Error::CorruptRecord("vista no UTF-8"))?;
         out.push((name, sql));
+    }
+    Ok(out)
+}
+
+// --- triggers: cuerpo (DML) disparado por fila en INSERT/UPDATE/DELETE ---
+
+fn trigger_key(name: &str) -> Vec<u8> {
+    let mut k = Vec::with_capacity(2 + name.len());
+    k.extend_from_slice(&[KS_CATALOG, CAT_TRIGGER]);
+    k.extend_from_slice(name.as_bytes());
+    k
+}
+
+/// `[timing u8][event u8][tabla_len varint][tabla][cuerpo]` (el nombre va en la clave).
+fn encode_trigger(t: &TriggerDef) -> Vec<u8> {
+    let mut out = Vec::with_capacity(8 + t.table.len() + t.body.len());
+    out.push(t.timing.as_u8());
+    out.push(t.event.as_u8());
+    put_varint(&mut out, t.table.len() as u64);
+    out.extend_from_slice(t.table.as_bytes());
+    out.extend_from_slice(t.body.as_bytes());
+    out
+}
+
+fn decode_trigger(name: &str, buf: &[u8]) -> Result<TriggerDef> {
+    let bad = || Error::CorruptRecord("trigger mal formado");
+    let timing = TriggerTiming::from_u8(*buf.first().ok_or_else(bad)?).ok_or_else(bad)?;
+    let event = TriggerEvent::from_u8(*buf.get(1).ok_or_else(bad)?).ok_or_else(bad)?;
+    let mut pos = 2usize;
+    let tlen = take_varint(buf, &mut pos).ok_or_else(bad)? as usize;
+    let table =
+        String::from_utf8(buf.get(pos..pos + tlen).ok_or_else(bad)?.to_vec()).map_err(|_| bad())?;
+    pos += tlen;
+    let body = String::from_utf8(buf.get(pos..).ok_or_else(bad)?.to_vec()).map_err(|_| bad())?;
+    Ok(TriggerDef {
+        name: name.to_owned(),
+        timing,
+        event,
+        table,
+        body,
+    })
+}
+
+/// Crea un trigger. Falla si ya existe uno con ese nombre o si la tabla destino
+/// no existe.
+pub fn create_trigger<S: NodeStore>(s: &mut S, root: PageId, t: &TriggerDef) -> Result<PageId> {
+    validate_name(&t.name, "nombre de trigger vacío o de más de 128 bytes")?;
+    if get_trigger(s, root, &t.name)?.is_some() {
+        return Err(Error::Constraint("el trigger ya existe"));
+    }
+    if get_table(s, root, &t.table)?.is_none() {
+        return Err(Error::Constraint("la tabla del trigger no existe"));
+    }
+    btree::insert(s, root, &trigger_key(&t.name), &encode_trigger(t))
+}
+
+/// Borra un trigger. `false` si no existía.
+pub fn drop_trigger<S: NodeStore>(s: &mut S, root: PageId, name: &str) -> Result<(PageId, bool)> {
+    if get_trigger(s, root, name)?.is_none() {
+        return Ok((root, false));
+    }
+    let (root, _) = btree::delete(s, root, &trigger_key(name))?;
+    Ok((root, true))
+}
+
+pub fn get_trigger<S: NodeSource>(src: &S, root: PageId, name: &str) -> Result<Option<TriggerDef>> {
+    match btree::get(src, root, &trigger_key(name))? {
+        Some(bytes) => Ok(Some(decode_trigger(name, &bytes)?)),
+        None => Ok(None),
+    }
+}
+
+/// Todos los triggers, en orden de nombre.
+pub fn list_triggers<S: NodeSource>(src: &S, root: PageId) -> Result<Vec<TriggerDef>> {
+    let prefix = [KS_CATALOG, CAT_TRIGGER];
+    let mut out = Vec::new();
+    for item in btree::scan_from(src, root, &prefix)? {
+        let (key, val) = item?;
+        if !key.starts_with(&prefix) {
+            break;
+        }
+        let name = std::str::from_utf8(&key[prefix.len()..])
+            .map_err(|_| Error::CorruptRecord("nombre de trigger no UTF-8"))?;
+        out.push(decode_trigger(name, &val)?);
     }
     Ok(out)
 }

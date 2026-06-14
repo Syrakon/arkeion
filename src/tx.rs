@@ -334,6 +334,7 @@ impl Store {
             enc_buf: Vec::new(),
             values_buf: Vec::new(),
             schema_cache: HashMap::new(),
+            trigger_depth: 0,
         })
     }
 
@@ -1285,6 +1286,11 @@ impl Snapshot {
         catalog::list_views(self, self.data_root)
     }
 
+    /// Todos los triggers (introspección).
+    pub fn triggers(&self) -> Result<Vec<catalog::TriggerDef>> {
+        catalog::list_triggers(self, self.data_root)
+    }
+
     /// rowids cuyas columnas indexadas valen `values` (igualdad, una entrada por
     /// columna del índice), vía el índice.
     pub fn index_lookup(&self, idx: &IndexDef, values: &[Value]) -> Result<Vec<i64>> {
@@ -1439,6 +1445,9 @@ pub struct WriteTx {
     /// `Arc`: entregar el def cacheado es un bump de refcount, no un clone profundo
     /// de columnas e índices por sentencia (M10-perf, fase 2).
     schema_cache: HashMap<String, Arc<TableDef>>,
+    /// Profundidad de triggers en curso (un trigger puede disparar otra escritura
+    /// que dispare más triggers): guarda contra recursión infinita.
+    trigger_depth: usize,
 }
 
 impl Drop for WriteTx {
@@ -1495,6 +1504,52 @@ impl WriteTx {
     /// El SELECT (texto) de una vista visible en la tx, o `None`.
     pub fn view(&self, name: &str) -> Result<Option<String>> {
         catalog::get_view(&self.ts, self.data_root, name)
+    }
+
+    /// Crea un trigger.
+    pub fn create_trigger(&mut self, t: &catalog::TriggerDef) -> Result<()> {
+        self.data_root = catalog::create_trigger(&mut self.ts, self.data_root, t)?;
+        Ok(())
+    }
+
+    /// Borra un trigger. `false` si no existía.
+    pub fn drop_trigger(&mut self, name: &str) -> Result<bool> {
+        let (root, dropped) = catalog::drop_trigger(&mut self.ts, self.data_root, name)?;
+        self.data_root = root;
+        Ok(dropped)
+    }
+
+    pub fn trigger(&self, name: &str) -> Result<Option<catalog::TriggerDef>> {
+        catalog::get_trigger(&self.ts, self.data_root, name)
+    }
+
+    /// Triggers que casan con `(tabla, evento, momento)`, para disparar.
+    pub fn triggers_for(
+        &self,
+        table: &str,
+        event: catalog::TriggerEvent,
+        timing: catalog::TriggerTiming,
+    ) -> Result<Vec<catalog::TriggerDef>> {
+        Ok(catalog::list_triggers(&self.ts, self.data_root)?
+            .into_iter()
+            .filter(|t| t.table == table && t.event == event && t.timing == timing)
+            .collect())
+    }
+
+    /// Entra en el cuerpo de un trigger (sube la profundidad y la acota).
+    pub fn enter_trigger(&mut self) -> Result<()> {
+        const MAX: usize = 32;
+        if self.trigger_depth >= MAX {
+            return Err(Error::Constraint(
+                "recursión de triggers demasiado profunda",
+            ));
+        }
+        self.trigger_depth += 1;
+        Ok(())
+    }
+
+    pub fn exit_trigger(&mut self) {
+        self.trigger_depth -= 1;
     }
 
     /// Crea un índice secundario sobre `columns` (posiciones) de `table` (M10.5).

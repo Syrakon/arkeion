@@ -1,0 +1,40 @@
+-- Predicate pushdown en JOINs (optimización determinista): filtrar cada tabla por
+-- los conjuntos del WHERE que solo la referencian, antes del nested-loop. NO cambia
+-- los resultados. Seguro en la FROM y en lados de INNER JOIN; el lado derecho de un
+-- LEFT JOIN NO se empuja (rompería el anti-join `IS NULL`).
+
+> CREATE TABLE dept (id INTEGER PRIMARY KEY, name TEXT, region TEXT);
+ok
+
+> CREATE TABLE emp (id INTEGER PRIMARY KEY, dept_id INTEGER, salary INTEGER);
+ok
+
+> INSERT INTO dept (name, region) VALUES ('eng', 'n'), ('sales', 's'), ('hr', 'n'), ('legal', 'n');
+affected 4
+
+> INSERT INTO emp (dept_id, salary) VALUES (1, 100), (1, 120), (2, 80), (3, 50);
+affected 4
+
+-- INNER JOIN con filtros en ambas tablas (se empujan las dos).
+> SELECT e.salary FROM emp e INNER JOIN dept d ON e.dept_id = d.id WHERE d.region = 'n' AND e.salary >= 100 ORDER BY e.salary;
+100
+120
+
+-- LEFT JOIN, filtro en la tabla FROM (izquierda): se empuja, seguro.
+> SELECT d.name FROM dept d LEFT JOIN emp e ON e.dept_id = d.id WHERE d.region = 'n' ORDER BY d.name;
+eng
+eng
+hr
+legal
+
+-- LEFT JOIN anti-join: `WHERE e.id IS NULL` busca dept sin empleados. Si se
+-- empujara al lado derecho, vaciaría emp y devolvería TODOS los dept (bug). Aquí
+-- debe devolver solo el dept sin empleados.
+> SELECT d.name FROM dept d LEFT JOIN emp e ON e.dept_id = d.id WHERE e.id IS NULL;
+legal
+
+-- LEFT JOIN, filtro en el lado derecho (no IS NULL): el WHERE post-join da el
+-- resultado correcto sin empujar.
+> SELECT d.name FROM dept d LEFT JOIN emp e ON e.dept_id = d.id WHERE e.salary >= 100 ORDER BY d.name;
+eng
+eng

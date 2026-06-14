@@ -1032,10 +1032,49 @@ pub fn run_select(src: &impl DataSource, stmt: &SelectStmt, params: &[Value]) ->
         src.scan_rows(&from_def)?
     };
 
+    // Pushdown determinista: empuja los conjuntos del WHERE que referencian una
+    // sola tabla (calificada) a su scan, antes del nested-loop — reduce las
+    // entradas del join. El WHERE completo se re-aplica después (corrección).
+    // Seguro: FROM (siempre preservada) y lados de INNER JOIN; nunca el lado
+    // derecho de un LEFT JOIN.
+    let pushdown: Vec<(Expr, Option<String>)> = if !stmt.joins.is_empty() {
+        stmt.where_clause
+            .as_ref()
+            .map(|w| {
+                let mut split = Vec::new();
+                split_and(w, &mut split);
+                split
+                    .into_iter()
+                    .map(|c| {
+                        let q = conjunct_qualifier(&c);
+                        (c, q)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    if !pushdown.is_empty() {
+        rows = prefilter(rows, &from_def, from_ref.qualifier(), &pushdown, params)?;
+    }
+
     // Joins nested-loop, materializando de izquierda a derecha.
     for join in &stmt.joins {
         let right_def = lookup(src, &join.table)?;
         let right_rows = src.scan_rows(&right_def)?;
+        // Pushdown solo a INNER (el lado derecho de un LEFT no se puede pre-filtrar).
+        let right_rows = if join.kind == JoinKind::Inner && !pushdown.is_empty() {
+            prefilter(
+                right_rows,
+                &right_def,
+                join.table.qualifier(),
+                &pushdown,
+                params,
+            )?
+        } else {
+            right_rows
+        };
         schema.push(join.table.qualifier(), right_def)?;
         no_aggregates(&join.on, "ON")?;
         validate_columns(&join.on, &schema)?;
@@ -1211,6 +1250,108 @@ pub fn run_select(src: &impl DataSource, stmt: &SelectStmt, params: &[Value]) ->
 fn lookup(src: &impl DataSource, table: &TableRef) -> Result<TableDef> {
     src.table(&table.name)?
         .ok_or_else(|| sql_err(format!("tabla desconocida: {}", table.name)))
+}
+
+// --- pushdown determinista de predicados a las tablas del JOIN ---
+
+/// Separa una conjunción `a AND b AND c` en sus conjuntos.
+fn split_and(e: &Expr, out: &mut Vec<Expr>) {
+    if let Expr::Binary(a, BinOp::And, b) = e {
+        split_and(a, out);
+        split_and(b, out);
+    } else {
+        out.push(e.clone());
+    }
+}
+
+/// Si un conjunto referencia columnas de **una sola** tabla, todas **calificadas**
+/// con el mismo qualifier, lo devuelve; si no (sin columnas, sin calificar, varias
+/// tablas, o agregado/subconsulta), `None` — y entonces no se empuja.
+fn conjunct_qualifier(e: &Expr) -> Option<String> {
+    fn walk(e: &Expr, out: &mut Vec<String>, ok: &mut bool) {
+        match e {
+            Expr::Column { table: Some(q), .. } => out.push(q.clone()),
+            Expr::Column { table: None, .. } => *ok = false,
+            Expr::Literal(_) | Expr::Param(_) => {}
+            Expr::Unary(_, x) | Expr::Cast { expr: x, .. } | Expr::IsNull { expr: x, .. } => {
+                walk(x, out, ok)
+            }
+            Expr::Binary(a, _, b) => {
+                walk(a, out, ok);
+                walk(b, out, ok);
+            }
+            Expr::Like { expr, pattern, .. } => {
+                walk(expr, out, ok);
+                walk(pattern, out, ok);
+            }
+            Expr::Function { args, .. } => args.iter().for_each(|a| walk(a, out, ok)),
+            Expr::In { expr, list, .. } => {
+                walk(expr, out, ok);
+                list.iter().for_each(|x| walk(x, out, ok));
+            }
+            Expr::Case {
+                operand,
+                whens,
+                else_,
+            } => {
+                if let Some(o) = operand {
+                    walk(o, out, ok);
+                }
+                whens.iter().for_each(|(c, r)| {
+                    walk(c, out, ok);
+                    walk(r, out, ok);
+                });
+                if let Some(x) = else_ {
+                    walk(x, out, ok);
+                }
+            }
+            // Agregados/subconsultas: no se empujan.
+            _ => *ok = false,
+        }
+    }
+    let mut quals = Vec::new();
+    let mut ok = true;
+    walk(e, &mut quals, &mut ok);
+    let first = quals.first()?.clone();
+    if ok && quals.iter().all(|q| *q == first) {
+        Some(first)
+    } else {
+        None
+    }
+}
+
+/// Filtra `rows` de la tabla `def` (qualifier `q`) por los conjuntos del pushdown
+/// que le corresponden. El conjunto se evalúa contra un esquema de una sola tabla.
+fn prefilter(
+    rows: Vec<Vec<Value>>,
+    def: &TableDef,
+    q: &str,
+    pushdown: &[(Expr, Option<String>)],
+    params: &[Value],
+) -> Result<Vec<Vec<Value>>> {
+    let mine: Vec<&Expr> = pushdown
+        .iter()
+        .filter(|(_, qual)| qual.as_deref() == Some(q))
+        .map(|(e, _)| e)
+        .collect();
+    if mine.is_empty() {
+        return Ok(rows);
+    }
+    let schema = QuerySchema::single(q, def.clone());
+    let mut kept = Vec::with_capacity(rows.len());
+    for row in rows {
+        let mut pass = true;
+        for c in &mine {
+            if !truthy(eval(c, Some((&schema, &row)), params)?)? {
+                pass = false;
+                break;
+            }
+        }
+        if pass {
+            kept.push(row);
+        }
+    }
+    Ok(kept)
 }
 
 // --- CTEs (`WITH`): tablas con nombre materializadas, expuestas vía overlay ---

@@ -1,0 +1,39 @@
+-- GROUP_CONCAT(x [, sep]): concatena los valores TEXT del grupo (separador por
+-- defecto ','), en el orden del scan. Grupo vacío → NULL. DISTINCT deduplica.
+
+> CREATE TABLE gc (id INTEGER PRIMARY KEY, team TEXT, name TEXT);
+ok
+
+> INSERT INTO gc (team, name) VALUES ('A', 'ada'), ('B', 'bob'), ('A', 'al'), ('A', 'ann');
+affected 4
+
+-- Sin GROUP BY: junta toda la columna.
+> SELECT GROUP_CONCAT(name) FROM gc;
+ada,bob,al,ann
+
+-- Separador personalizado.
+> SELECT GROUP_CONCAT(name, ' | ') FROM gc;
+ada | bob | al | ann
+
+-- Con GROUP BY: un concat por grupo.
+> SELECT team, GROUP_CONCAT(name) FROM gc GROUP BY team ORDER BY team;
+A|ada,al,ann
+B|bob
+
+-- DISTINCT dentro de GROUP_CONCAT.
+> CREATE TABLE gd (id INTEGER PRIMARY KEY, tag TEXT);
+ok
+
+> INSERT INTO gd (tag) VALUES ('x'), ('y'), ('x'), ('x');
+affected 4
+
+> SELECT GROUP_CONCAT(DISTINCT tag) FROM gd;
+x,y
+
+-- Grupo vacío → NULL.
+> SELECT GROUP_CONCAT(name) FROM gc WHERE team = 'Z';
+NULL
+
+-- Requiere TEXT (usa CAST para otros tipos).
+> SELECT GROUP_CONCAT(id) FROM gc;
+error requiere TEXT

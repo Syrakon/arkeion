@@ -870,6 +870,7 @@ impl Parser {
                         "AVG" => Some(AggFunc::Avg),
                         "MIN" => Some(AggFunc::Min),
                         "MAX" => Some(AggFunc::Max),
+                        "GROUP_CONCAT" => Some(AggFunc::GroupConcat),
                         _ => None,
                     };
                     if let Some(func) = agg {
@@ -885,11 +886,18 @@ impl Parser {
                         } else {
                             Some(Box::new(self.expr()?))
                         };
+                        // GROUP_CONCAT(x, sep): separador opcional como 2º argumento.
+                        let sep = if func == AggFunc::GroupConcat && self.eat(&Tok::Comma) {
+                            Some(Box::new(self.expr()?))
+                        } else {
+                            None
+                        };
                         self.expect(&Tok::RParen, "')'")?;
                         return Ok(Expr::Aggregate {
                             func,
                             arg,
                             distinct,
+                            sep,
                         });
                     }
                     // Función escalar built-in: `nombre(arg, …)` (el nombre se

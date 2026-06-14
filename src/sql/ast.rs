@@ -165,6 +165,9 @@ pub enum AggFunc {
     Avg,
     Min,
     Max,
+    /// `GROUP_CONCAT(x [, sep])`: concatena los valores TEXT del grupo con un
+    /// separador (por defecto `,`).
+    GroupConcat,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -188,10 +191,12 @@ pub enum Expr {
         negated: bool,
     },
     /// `arg = None` solo para `COUNT(*)`. `distinct` para `COUNT(DISTINCT x)` etc.
+    /// `sep` solo lo usa `GROUP_CONCAT(x, sep)` (separador constante).
     Aggregate {
         func: AggFunc,
         arg: Option<Box<Expr>>,
         distinct: bool,
+        sep: Option<Box<Expr>>,
     },
     /// Llamada a una función **escalar** built-in: `nombre(arg, …)` (no agregado).
     /// El nombre se resuelve en exec (insensible a mayúsculas); aridad y tipos se

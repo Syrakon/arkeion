@@ -1529,10 +1529,12 @@ fn fold_aggregates(
             func,
             arg,
             distinct,
+            sep,
         } => Expr::Literal(compute_aggregate(
             *func,
             arg.as_deref(),
             *distinct,
+            sep.as_deref(),
             schema,
             rows,
             params,
@@ -1614,6 +1616,7 @@ fn compute_aggregate(
     func: AggFunc,
     arg: Option<&Expr>,
     distinct: bool,
+    sep: Option<&Expr>,
     schema: &QuerySchema,
     rows: &[Vec<Value>],
     params: &[Value],
@@ -1643,6 +1646,39 @@ fn compute_aggregate(
             }
         }
         values = seen;
+    }
+    // GROUP_CONCAT no encaja en el plegado numérico: junta los TEXT con el
+    // separador (constante, por defecto ","). Grupo vacío → NULL (como SQLite).
+    if func == AggFunc::GroupConcat {
+        if values.is_empty() {
+            return Ok(Value::Null);
+        }
+        let sep_str = match sep {
+            None => ",".to_string(),
+            Some(e) => match eval_const(e, params)? {
+                Value::Text(s) => s,
+                Value::Null => ",".to_string(),
+                v => {
+                    return Err(sql_err(format!(
+                        "GROUP_CONCAT: el separador debe ser TEXT, no {}",
+                        v.type_name()
+                    )));
+                }
+            },
+        };
+        let mut parts = Vec::with_capacity(values.len());
+        for v in values {
+            match v {
+                Value::Text(s) => parts.push(s),
+                v => {
+                    return Err(sql_err(format!(
+                        "GROUP_CONCAT requiere TEXT, no {} (usa CAST)",
+                        v.type_name()
+                    )));
+                }
+            }
+        }
+        return Ok(Value::Text(parts.join(&sep_str)));
     }
     let mut count: i64 = 0;
     let mut sum_i: i64 = 0;
@@ -1699,6 +1735,7 @@ fn compute_aggregate(
                     },
                 });
             }
+            AggFunc::GroupConcat => unreachable!("GROUP_CONCAT se resuelve antes del bucle"),
         }
     }
     Ok(match func {
@@ -1709,6 +1746,7 @@ fn compute_aggregate(
         AggFunc::Avg if count == 0 => Value::Null,
         AggFunc::Avg => Value::Real(sum_f / count as f64),
         AggFunc::Min | AggFunc::Max => best.unwrap_or(Value::Null),
+        AggFunc::GroupConcat => unreachable!("GROUP_CONCAT se resuelve antes del bucle"),
     })
 }
 
@@ -2514,7 +2552,7 @@ mod tests {
             vec![Value::Integer(30)],
         ];
         let agg = |func: AggFunc, arg: Option<Expr>| {
-            compute_aggregate(func, arg.as_ref(), false, &schema, &rows, &[]).unwrap()
+            compute_aggregate(func, arg.as_ref(), false, None, &schema, &rows, &[]).unwrap()
         };
         let col = Expr::Column {
             table: None,
@@ -2535,6 +2573,7 @@ mod tests {
                 name: "v".into(),
             }),
             false,
+            None,
             &schema,
             &[],
             &[],

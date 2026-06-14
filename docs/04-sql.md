@@ -36,11 +36,14 @@ UPDATE tabla SET col = expr [, …] [WHERE expr];
 DELETE FROM tabla [WHERE expr];
 
 -- Consulta
-SELECT lista | *                            -- FROM opcional: sin él, evalúa
+[WITH cte AS (SELECT …) [, …]]              -- CTEs (tablas con nombre, no recursivas)
+SELECT [DISTINCT] lista | *                  -- FROM opcional: sin él, evalúa
   [FROM tabla                               --   expresiones constantes (SELECT 1+1)
   [INNER|LEFT JOIN tabla2 ON expr]]         -- M4, nested-loop
   [WHERE expr]
-  [ORDER BY col [ASC|DESC] [, …]]
+  [GROUP BY e1, … [HAVING cond]]
+  [UNION [ALL] SELECT …]                    -- une (deduplica) / conserva duplicados
+  [ORDER BY col [ASC|DESC] [, …]]           -- en UNION, por columna de salida
   [LIMIT n [OFFSET m]]
   [AS OF VERSION n | AS OF TIMESTAMP 'rfc3339'];   -- extensión Arkeion
 
@@ -57,7 +60,31 @@ por nombre, los índices y el `rowid_alias` son independientes del orden lógico
 modelo de `attlognum` que Postgres planeó y nunca envió; aquí sale gratis porque el
 catálogo ya es versionado. (DROP/RENAME COLUMN siguen fuera de v1.)
 
-Agregados (M4): `COUNT(*)`, `COUNT(col)`, `SUM`, `AVG`, `MIN`, `MAX`.
+Agregados: `COUNT(*)`, `COUNT(col)`, `SUM`, `AVG`, `MIN`, `MAX`, `GROUP_CONCAT(x[, sep])`.
+Admiten `DISTINCT` (`COUNT(DISTINCT x)`, `SUM(DISTINCT x)`, …). `SELECT DISTINCT`
+deduplica las filas ya proyectadas.
+
+**Funciones escalares** (insensibles a mayúsculas; NULL propaga salvo donde se diga):
+- Texto: `UPPER`, `LOWER`, `LENGTH`/`CHAR_LENGTH`, `TRIM`/`LTRIM`/`RTRIM`,
+  `SUBSTR`/`SUBSTRING`, `REPLACE`, `INSTR`, `REVERSE`, `HEX`.
+- Numéricas: `ABS`, `ROUND`, `CEIL`/`CEILING`, `FLOOR`, `SQRT`, `POW`/`POWER`, `MOD`,
+  `SIGN`, `RANDOM` (no determinista).
+- Condicionales/NULL: `COALESCE`, `IFNULL`, `NULLIF`, `TYPEOF`.
+- Fecha/hora: `NOW`, `DATE`, `TIME`, `DATETIME`, `STRFTIME(fmt, ms)`. El entero de
+  tiempo es **epoch en milisegundos** UTC (igual que los timestamps de auditoría),
+  no el día juliano de SQLite.
+
+**Operadores/expresiones**: `||` (concat de texto), `CAST(x AS tipo)` (válvula del
+tipado estricto), `CASE WHEN … THEN … [ELSE …] END` (buscada y simple),
+`x [NOT] BETWEEN a AND b`.
+
+**Subconsultas** (no correlacionadas): escalar `(SELECT …)`, `x [NOT] IN (SELECT …)`,
+`[NOT] EXISTS (SELECT …)`. Se ejecutan una vez y se sustituyen por su valor antes de
+evaluar la consulta exterior; una subconsulta escalar con >1 fila es error, con 0 → NULL.
+
+**CTEs** (`WITH n AS (SELECT …)`): tablas con nombre materializadas, visibles en el
+SELECT que sigue; cada una ve las anteriores y tapa a una tabla real homónima. No
+recursivas.
 
 `GROUP BY` / `HAVING` (post-M9): `SELECT … GROUP BY e1, e2 [HAVING cond]` agrupa por el
 valor de las expresiones (normalmente columnas) y emite una fila por grupo, plegando los
@@ -127,8 +154,11 @@ SELECT * FROM facturas AS OF TIMESTAMP '2026-05-01T00:00:00Z';
 
 | Excluido | Cuándo |
 |---|---|
-| Subconsultas, CTEs, `UNION` | v1.x |
-| Índices secundarios (`CREATE INDEX`) | v1.1 — espacio de claves `0x02` ya reservado en el formato |
+| Subconsultas **correlacionadas** (las no correlacionadas sí: escalar/`IN`/`EXISTS`) | v1.x |
+| CTEs **recursivas** (las no recursivas, `WITH`, sí) | v1.x |
+| Derivadas en `FROM` (`FROM (SELECT …)`) | v1.x |
+| `INTERSECT` / `EXCEPT` (`UNION [ALL]` sí) | v1.x |
+| Índices secundarios (`CREATE INDEX`) | hecho (v1.1) — espacio de claves `0x02` ya reservado en el formato |
 | `ALTER TABLE` salvo `ADD COLUMN` / `MOVE COLUMN` / `REORDER COLUMNS` (DROP/RENAME COLUMN) | v1.x |
 | Optimizador de queries | fuera de alcance declarado de v1 |
 | Triggers, vistas, FK enforcement | sin fecha |

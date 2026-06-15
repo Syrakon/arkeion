@@ -35,6 +35,7 @@ fn pedidos_spec() -> TableSpec {
             col("urgente", ColType::Boolean),
             col("firma", ColType::Blob),
         ],
+        foreign_keys: Vec::new(),
     }
 }
 
@@ -121,6 +122,7 @@ fn thousand_rows_two_tables_persist() {
         .create_table(&TableSpec {
             name: "clientes".into(),
             columns: vec![col("nombre", ColType::Text), col("saldo", ColType::Real)],
+            foreign_keys: Vec::new(),
         })
         .unwrap();
 

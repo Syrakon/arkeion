@@ -1405,6 +1405,32 @@ impl NodeStore for TxStore {
 
 // --- transacción de escritura ---
 
+/// Índice `UNIQUE` del padre que cubre exactamente (como conjunto) las columnas
+/// referenciadas por una FK no-PK. `create_table` ya garantiza que existe.
+fn covering_unique_index<'a>(parent: &'a TableDef, parent_cols: &[usize]) -> Option<&'a IndexDef> {
+    parent.indexes.iter().find(|ix| {
+        ix.unique
+            && ix.columns.len() == parent_cols.len()
+            && parent_cols.iter().all(|p| ix.columns.contains(p))
+    })
+}
+
+/// Clave de búsqueda para `index_scan_eq`: los valores hijos en el ORDEN de las
+/// columnas del índice del padre. `fk.columns[k]` referencia a `fk.parent_columns[k]`.
+fn fk_lookup_key(fk: &catalog::ForeignKey, idx: &IndexDef, child_row: &[Value]) -> Vec<Value> {
+    idx.columns
+        .iter()
+        .map(|ic| {
+            let k = fk
+                .parent_columns
+                .iter()
+                .position(|p| p == ic)
+                .expect("el índice cubre las columnas de la FK");
+            child_row[fk.columns[k]].clone()
+        })
+        .collect()
+}
+
 /// Soltarla sin `commit` es un rollback: el estado en memoria se descarta y
 /// el archivo no se ha tocado más allá de su EOF lógico.
 pub struct WriteTx {
@@ -1761,11 +1787,22 @@ impl WriteTx {
         Ok(n)
     }
 
-    /// Sobrescribe una fila. `false` si el rowid no existe.
+    /// Sobrescribe una fila. `false` si el rowid no existe. Si `table` es padre de
+    /// alguna FK y la actualización cambia las columnas referenciadas, se aplica
+    /// `ON UPDATE` a las filas hijas: RESTRICT (comprobado **antes** de escribir),
+    /// y CASCADE / SET NULL **después** (para que el padre ya tenga el valor nuevo
+    /// cuando el hijo revalide su propia FK).
     pub fn update_row(&mut self, table: &TableDef, rowid: i64, values: &[Value]) -> Result<bool> {
         self.fk_check_parents_exist(table, values)?;
+        let old = self.get_row(table, rowid)?;
+        if let Some(old) = &old {
+            self.fk_handle_parent_update(table, rowid, old, values, true)?; // RESTRICT pre-escritura
+        }
         let (root, ok) = catalog::update_row(&mut self.ts, self.data_root, table, rowid, values)?;
         self.data_root = root;
+        if ok && let Some(old) = &old {
+            self.fk_handle_parent_update(table, rowid, old, values, false)?; // cascada post-escritura
+        }
         Ok(ok)
     }
 
@@ -1782,23 +1819,46 @@ impl WriteTx {
         Ok(existed)
     }
 
-    /// INSERT/UPDATE: por cada FK de `table`, su valor (si no es NULL) debe existir
-    /// como PK en la tabla padre.
+    /// INSERT/UPDATE: por cada FK de `table`, su(s) valor(es) (si ninguno es NULL)
+    /// deben existir en el padre. Referencia por PK → `get_row` por rowid;
+    /// referencia a columnas con índice UNIQUE → búsqueda por ese índice.
     fn fk_check_parents_exist(&self, table: &TableDef, values: &[Value]) -> Result<()> {
         for fk in &table.foreign_keys {
-            let child_val = match values.get(fk.column) {
-                Some(Value::Null) | None => continue, // FK NULL: permitido
-                Some(Value::Integer(n)) => *n,
-                Some(_) => {
-                    return Err(Error::Constraint(
-                        "una columna FK debe ser INTEGER (referencia a la PK del padre)",
-                    ));
+            // Valores hijos; si alguno es NULL no se comprueba (MATCH SIMPLE).
+            let mut child_vals = Vec::with_capacity(fk.columns.len());
+            let mut any_null = false;
+            for &c in &fk.columns {
+                match values.get(c) {
+                    Some(Value::Null) | None => {
+                        any_null = true;
+                        break;
+                    }
+                    Some(v) => child_vals.push(v.clone()),
                 }
-            };
+            }
+            if any_null {
+                continue;
+            }
             let parent = self
                 .table(&fk.parent)?
                 .ok_or(Error::Constraint("tabla padre de FK desconocida"))?;
-            if self.get_row(&parent, child_val)?.is_none() {
+            let exists = if fk.parent_columns.is_empty() {
+                // Referencia la PK: el valor debe ser INTEGER y existir por rowid.
+                match &child_vals[0] {
+                    Value::Integer(n) => self.get_row(&parent, *n)?.is_some(),
+                    _ => {
+                        return Err(Error::Constraint("una columna FK a la PK debe ser INTEGER"));
+                    }
+                }
+            } else {
+                let idx = covering_unique_index(&parent, &fk.parent_columns).ok_or(
+                    Error::Constraint("la FK referencia columnas sin índice UNIQUE"),
+                )?;
+                !self
+                    .index_lookup(idx, &fk_lookup_key(fk, idx, values))?
+                    .is_empty()
+            };
+            if !exists {
                 return Err(Error::Constraint(
                     "violación de clave foránea: la fila padre no existe",
                 ));
@@ -1807,40 +1867,67 @@ impl WriteTx {
         Ok(())
     }
 
-    /// DELETE del padre: aplica la acción de cada FK que apunte a `parent` para las
-    /// filas hijas que referencian `rowid`.
-    fn fk_handle_parent_delete(&mut self, parent: &TableDef, rowid: i64) -> Result<()> {
-        // Tablas (def, columna FK, acción) con una FK que referencia a `parent`.
-        let refs: Vec<(TableDef, usize, catalog::FkAction)> =
-            catalog::list_tables(&self.ts, self.data_root)?
-                .into_iter()
-                .flat_map(|t| {
-                    t.foreign_keys
+    /// Tablas (def hija, fk) con una FK que referencia a `parent_name`.
+    fn fk_referencing(&self, parent_name: &str) -> Result<Vec<(TableDef, catalog::ForeignKey)>> {
+        let mut out = Vec::new();
+        for t in catalog::list_tables(&self.ts, self.data_root)? {
+            for fk in &t.foreign_keys {
+                if fk.parent == parent_name {
+                    out.push((t.clone(), fk.clone()));
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Filas hijas `(rowid, valores)` de `child` cuyas columnas `fk.columns` igualan
+    /// `ref_vals` (todas). Si algún valor de referencia es NULL, no hay match.
+    fn fk_children_matching(
+        &self,
+        child: &TableDef,
+        fk: &catalog::ForeignKey,
+        ref_vals: &[Value],
+    ) -> Result<Vec<(i64, Vec<Value>)>> {
+        if ref_vals.iter().any(|v| matches!(v, Value::Null)) {
+            return Ok(Vec::new());
+        }
+        self.scan_table(child)?
+            .filter_map(|r| match r {
+                Ok((id, vals)) => {
+                    let m = fk
+                        .columns
                         .iter()
-                        .filter(|fk| fk.parent == parent.name)
-                        .map(|fk| (t.clone(), fk.column, fk.on_delete))
-                        .collect::<Vec<_>>()
-                })
-                .collect();
-        for (child, fk_col, action) in refs {
-            // Filas hijas con child[fk_col] == rowid (materializadas: luego se muta).
-            let hits: Vec<(i64, Vec<Value>)> = self
-                .scan_table(&child)?
-                .filter_map(|r| match r {
-                    Ok((id, vals)) => match vals.get(fk_col) {
-                        Some(Value::Integer(n)) if *n == rowid => Some(Ok((id, vals))),
-                        _ => None,
-                    },
-                    Err(e) => Some(Err(e)),
-                })
-                .collect::<Result<_>>()?;
+                        .zip(ref_vals)
+                        .all(|(&c, rv)| vals.get(c) == Some(rv));
+                    m.then_some(Ok((id, vals)))
+                }
+                Err(e) => Some(Err(e)),
+            })
+            .collect()
+    }
+
+    /// DELETE del padre: aplica `ON DELETE` de cada FK que apunte a `parent` para
+    /// las filas hijas que referencian la fila borrada.
+    fn fk_handle_parent_delete(&mut self, parent: &TableDef, rowid: i64) -> Result<()> {
+        let parent_row = self.get_row(parent, rowid)?;
+        for (child, fk) in self.fk_referencing(&parent.name)? {
+            // Valores referenciados de la fila padre (por rowid o por columnas).
+            let ref_vals: Vec<Value> = if fk.parent_columns.is_empty() {
+                vec![Value::Integer(rowid)]
+            } else {
+                match &parent_row {
+                    Some(pr) => fk.parent_columns.iter().map(|&p| pr[p].clone()).collect(),
+                    None => continue,
+                }
+            };
+            let hits = self.fk_children_matching(&child, &fk, &ref_vals)?;
             if hits.is_empty() {
                 continue;
             }
-            match action {
+            match fk.on_delete {
                 catalog::FkAction::Restrict => {
                     return Err(Error::Constraint(
-                        "violación de clave foránea: hay filas hijas (RESTRICT)",
+                        "violación de clave foránea: hay filas hijas (ON DELETE RESTRICT)",
                     ));
                 }
                 catalog::FkAction::Cascade => {
@@ -1850,7 +1937,65 @@ impl WriteTx {
                 }
                 catalog::FkAction::SetNull => {
                     for (id, mut vals) in hits {
-                        vals[fk_col] = Value::Null;
+                        for &c in &fk.columns {
+                            vals[c] = Value::Null;
+                        }
+                        self.update_row(&child, id, &vals)?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// UPDATE del padre: si la actualización cambia las columnas referenciadas por
+    /// alguna FK, aplica `ON UPDATE`. Con `restrict_only` solo comprueba RESTRICT
+    /// (antes de escribir el padre); si no, aplica CASCADE / SET NULL (después).
+    fn fk_handle_parent_update(
+        &mut self,
+        parent: &TableDef,
+        rowid: i64,
+        old: &[Value],
+        new: &[Value],
+        restrict_only: bool,
+    ) -> Result<()> {
+        for (child, fk) in self.fk_referencing(&parent.name)? {
+            let refs = |row: &[Value]| -> Vec<Value> {
+                if fk.parent_columns.is_empty() {
+                    vec![Value::Integer(rowid)] // la PK (rowid) no cambia en un UPDATE
+                } else {
+                    fk.parent_columns.iter().map(|&p| row[p].clone()).collect()
+                }
+            };
+            let old_ref = refs(old);
+            let new_ref = refs(new);
+            if old_ref == new_ref {
+                continue; // las columnas referenciadas no cambian
+            }
+            let hits = self.fk_children_matching(&child, &fk, &old_ref)?;
+            if hits.is_empty() {
+                continue;
+            }
+            match fk.on_update {
+                catalog::FkAction::Restrict => {
+                    return Err(Error::Constraint(
+                        "violación de clave foránea: hay filas hijas (ON UPDATE RESTRICT)",
+                    ));
+                }
+                _ if restrict_only => continue, // las cascadas se aplican tras escribir el padre
+                catalog::FkAction::Cascade => {
+                    for (id, mut vals) in hits {
+                        for (k, &c) in fk.columns.iter().enumerate() {
+                            vals[c] = new_ref[k].clone();
+                        }
+                        self.update_row(&child, id, &vals)?;
+                    }
+                }
+                catalog::FkAction::SetNull => {
+                    for (id, mut vals) in hits {
+                        for &c in &fk.columns {
+                            vals[c] = Value::Null;
+                        }
                         self.update_row(&child, id, &vals)?;
                     }
                 }
@@ -2971,6 +3116,7 @@ mod tests {
                     references: None,
                 },
             ],
+            foreign_keys: Vec::new(),
         };
         let def = {
             let mut tx = store.begin().unwrap();

@@ -282,6 +282,7 @@ pub fn run_execute(tx: &mut WriteTx, stmt: &Stmt, params: &[Value]) -> Result<us
             if_not_exists,
             name,
             columns,
+            foreign_keys,
         } => {
             if tx.table(name)?.is_some() {
                 if *if_not_exists {
@@ -289,7 +290,7 @@ pub fn run_execute(tx: &mut WriteTx, stmt: &Stmt, params: &[Value]) -> Result<us
                 }
                 return Err(Error::Constraint("la tabla ya existe"));
             }
-            tx.create_table(&table_spec(name, columns)?)?;
+            tx.create_table(&table_spec(name, columns, foreign_keys)?)?;
             Ok(0)
         }
         Stmt::DropTable { if_exists, name } => {
@@ -833,7 +834,11 @@ fn fire_inner(
     Ok(())
 }
 
-fn table_spec(name: &str, columns: &[ColumnAst]) -> Result<TableSpec> {
+fn table_spec(
+    name: &str,
+    columns: &[ColumnAst],
+    foreign_keys: &[catalog::ForeignKeySpec],
+) -> Result<TableSpec> {
     let mut specs = Vec::with_capacity(columns.len());
     for col in columns {
         let default = match &col.default {
@@ -860,6 +865,7 @@ fn table_spec(name: &str, columns: &[ColumnAst]) -> Result<TableSpec> {
     Ok(TableSpec {
         name: name.to_owned(),
         columns: specs,
+        foreign_keys: foreign_keys.to_vec(),
     })
 }
 

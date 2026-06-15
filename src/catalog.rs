@@ -42,7 +42,7 @@ const CAT_TRIGGER: u8 = 0x06;
 // v4 añade las claves foráneas al final del registro de esquema; v2/v3 (sin
 // ellas) se leen con `foreign_keys` vacío. v5 añade el flag `dropped` por columna
 // (DROP COLUMN lógico); v<5 lo lee como `false`.
-const SCHEMA_VERSION: u8 = 5;
+const SCHEMA_VERSION: u8 = 6;
 const NO_ALIAS: u8 = 0xFF;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -106,14 +106,23 @@ impl FkAction {
     }
 }
 
-/// Clave foránea (v1: una columna → la **PK** de la tabla padre).
+/// Clave foránea. Una o más columnas hijas → una o más columnas del padre.
+/// `parent_columns` vacío significa «la PK (rowid) del padre» (referencia por
+/// rowid, el caso por defecto y el único de v4/v5); si no está vacío, referencia
+/// esas columnas físicas del padre, que deben estar cubiertas por un índice
+/// `UNIQUE` (o ser la PK). La aridad de `columns` y `parent_columns` coincide
+/// (salvo el caso PK-por-rowid, en que `parent_columns` va vacío y `columns`
+/// tiene una sola entrada).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ForeignKey {
-    /// Posición física de la columna hija en `TableDef.columns`.
-    pub column: usize,
-    /// Tabla padre (la columna referenciada es su PK).
+    /// Posiciones físicas de las columnas hijas en `TableDef.columns`.
+    pub columns: Vec<usize>,
+    /// Tabla padre.
     pub parent: String,
+    /// Posiciones físicas referenciadas en el padre; vacío = la PK (rowid).
+    pub parent_columns: Vec<usize>,
     pub on_delete: FkAction,
+    pub on_update: FkAction,
 }
 
 /// Momento de disparo de un trigger.
@@ -185,15 +194,40 @@ pub struct ColumnSpec {
     pub not_null: bool,
     pub primary_key: bool,
     pub default: Option<Value>,
-    /// `REFERENCES padre [ON DELETE acción]` (la columna referenciada es la PK del
-    /// padre).
-    pub references: Option<(String, FkAction)>,
+    /// `REFERENCES padre [(col)] [ON DELETE acción] [ON UPDATE acción]` declarado a
+    /// nivel de columna. `parent_column` `None` = la PK del padre.
+    pub references: Option<ColumnFk>,
+}
+
+/// Clave foránea de una sola columna declarada en línea con la columna hija.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ColumnFk {
+    pub parent: String,
+    /// Columna del padre; `None` = su PK (rowid).
+    pub parent_column: Option<String>,
+    pub on_delete: FkAction,
+    pub on_update: FkAction,
+}
+
+/// Clave foránea declarada a nivel de tabla:
+/// `FOREIGN KEY (c…) REFERENCES padre (p…) [ON DELETE …] [ON UPDATE …]`. Permite
+/// claves **compuestas** (varias columnas).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ForeignKeySpec {
+    pub columns: Vec<String>,
+    pub parent: String,
+    /// Columnas del padre; vacío = su PK (rowid).
+    pub parent_columns: Vec<String>,
+    pub on_delete: FkAction,
+    pub on_update: FkAction,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct TableSpec {
     pub name: String,
     pub columns: Vec<ColumnSpec>,
+    /// FKs a nivel de tabla (compuestas). Las de columna van en `ColumnSpec`.
+    pub foreign_keys: Vec<ForeignKeySpec>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -401,14 +435,23 @@ fn encode_def(def: &TableDef) -> Vec<u8> {
             put_varint(&mut out, p as u64);
         }
     }
-    // Claves foráneas (v4): cuenta, y por cada una columna hija, acción y nombre
-    // del padre.
+    // Claves foráneas (v6): cuenta, y por cada una: columnas hijas, acciones
+    // ON DELETE / ON UPDATE, nombre del padre y columnas del padre (vacío = PK).
+    // El formato v4/v5 (una sola columna → PK) lo lee `decode_def` por su rama.
     put_varint(&mut out, def.foreign_keys.len() as u64);
     for fk in &def.foreign_keys {
-        put_varint(&mut out, fk.column as u64);
+        put_varint(&mut out, fk.columns.len() as u64);
+        for &c in &fk.columns {
+            put_varint(&mut out, c as u64);
+        }
         out.push(fk.on_delete.as_u8());
+        out.push(fk.on_update.as_u8());
         put_varint(&mut out, fk.parent.len() as u64);
         out.extend_from_slice(fk.parent.as_bytes());
+        put_varint(&mut out, fk.parent_columns.len() as u64);
+        for &p in &fk.parent_columns {
+            put_varint(&mut out, p as u64);
+        }
     }
     out
 }
@@ -438,7 +481,7 @@ fn decode_def(name: &str, buf: &[u8]) -> Result<TableDef> {
     };
 
     let version = *take(&mut pos, 1)?.first().expect("len 1");
-    if !(2..=5).contains(&version) {
+    if !(2..=6).contains(&version) {
         return Err(bad("versión de esquema desconocida"));
     }
     let table_id = u32::from_le_bytes(
@@ -529,25 +572,61 @@ fn decode_def(name: &str, buf: &[u8]) -> Result<TableDef> {
         (0..columns.len()).collect()
     };
 
-    // Claves foráneas (v4). v2/v3 no las llevan ⇒ vacío.
+    // Claves foráneas. v2/v3 no las llevan ⇒ vacío. v4/v5: formato antiguo (una
+    // columna → PK del padre, solo ON DELETE). v6+: compuestas, ON DELETE/UPDATE y
+    // columnas explícitas del padre.
     let mut foreign_keys = Vec::new();
     if version >= 4 {
         let nfk = take_varint(buf, &mut pos).ok_or(bad("esquema truncado"))? as usize;
         for _ in 0..nfk {
-            let column = take_varint(buf, &mut pos).ok_or(bad("esquema truncado"))? as usize;
-            if column >= columns.len() {
-                return Err(bad("columna de FK fuera de rango"));
+            if version <= 5 {
+                let column = take_varint(buf, &mut pos).ok_or(bad("esquema truncado"))? as usize;
+                if column >= columns.len() {
+                    return Err(bad("columna de FK fuera de rango"));
+                }
+                let on_delete = FkAction::from_u8(*take(&mut pos, 1)?.first().expect("len 1"))
+                    .ok_or(bad("acción de FK desconocida"))?;
+                let plen = take_varint(buf, &mut pos).ok_or(bad("esquema truncado"))? as usize;
+                let parent = String::from_utf8(take(&mut pos, plen)?.to_vec())
+                    .map_err(|_| bad("nombre de padre de FK no UTF-8"))?;
+                foreign_keys.push(ForeignKey {
+                    columns: vec![column],
+                    parent,
+                    parent_columns: Vec::new(), // = PK por rowid
+                    on_delete,
+                    on_update: FkAction::Restrict,
+                });
+            } else {
+                let ncols = take_varint(buf, &mut pos).ok_or(bad("esquema truncado"))? as usize;
+                let mut cols = Vec::with_capacity(ncols);
+                for _ in 0..ncols {
+                    let c = take_varint(buf, &mut pos).ok_or(bad("esquema truncado"))? as usize;
+                    if c >= columns.len() {
+                        return Err(bad("columna de FK fuera de rango"));
+                    }
+                    cols.push(c);
+                }
+                let on_delete = FkAction::from_u8(*take(&mut pos, 1)?.first().expect("len 1"))
+                    .ok_or(bad("acción de FK desconocida"))?;
+                let on_update = FkAction::from_u8(*take(&mut pos, 1)?.first().expect("len 1"))
+                    .ok_or(bad("acción de FK desconocida"))?;
+                let plen = take_varint(buf, &mut pos).ok_or(bad("esquema truncado"))? as usize;
+                let parent = String::from_utf8(take(&mut pos, plen)?.to_vec())
+                    .map_err(|_| bad("nombre de padre de FK no UTF-8"))?;
+                let nparent = take_varint(buf, &mut pos).ok_or(bad("esquema truncado"))? as usize;
+                let mut parent_columns = Vec::with_capacity(nparent);
+                for _ in 0..nparent {
+                    parent_columns
+                        .push(take_varint(buf, &mut pos).ok_or(bad("esquema truncado"))? as usize);
+                }
+                foreign_keys.push(ForeignKey {
+                    columns: cols,
+                    parent,
+                    parent_columns,
+                    on_delete,
+                    on_update,
+                });
             }
-            let on_delete = FkAction::from_u8(*take(&mut pos, 1)?.first().expect("len 1"))
-                .ok_or(bad("acción de FK desconocida"))?;
-            let plen = take_varint(buf, &mut pos).ok_or(bad("esquema truncado"))? as usize;
-            let parent = String::from_utf8(take(&mut pos, plen)?.to_vec())
-                .map_err(|_| bad("nombre de padre de FK no UTF-8"))?;
-            foreign_keys.push(ForeignKey {
-                column,
-                parent,
-                on_delete,
-            });
         }
     }
 
@@ -577,6 +656,127 @@ fn validate_name(name: &str, what: &'static str) -> Result<()> {
         return Err(Error::InvalidInput(what));
     }
     Ok(())
+}
+
+/// Normaliza las FKs declaradas (en columna y a nivel de tabla) a `ForeignKey`
+/// con posiciones físicas. Valida: las columnas hijas existen; el padre existe;
+/// las columnas del padre son su PK (⇒ `parent_columns` vacío, referencia por
+/// rowid) o están cubiertas por un índice `UNIQUE`; la aridad coincide.
+fn resolve_foreign_keys<S: NodeSource>(
+    s: &S,
+    root: PageId,
+    spec: &TableSpec,
+    rowid_alias: Option<usize>,
+) -> Result<Vec<ForeignKey>> {
+    // FKs de columna + de tabla, todas en términos de NOMBRES.
+    struct Pending {
+        columns: Vec<String>,
+        parent: String,
+        parent_columns: Vec<String>,
+        on_delete: FkAction,
+        on_update: FkAction,
+    }
+    let mut pending: Vec<Pending> = Vec::new();
+    for col in &spec.columns {
+        if let Some(r) = &col.references {
+            pending.push(Pending {
+                columns: vec![col.name.clone()],
+                parent: r.parent.clone(),
+                parent_columns: r.parent_column.clone().into_iter().collect(),
+                on_delete: r.on_delete,
+                on_update: r.on_update,
+            });
+        }
+    }
+    for fk in &spec.foreign_keys {
+        pending.push(Pending {
+            columns: fk.columns.clone(),
+            parent: fk.parent.clone(),
+            parent_columns: fk.parent_columns.clone(),
+            on_delete: fk.on_delete,
+            on_update: fk.on_update,
+        });
+    }
+
+    let child_pos = |name: &str| spec.columns.iter().position(|c| c.name == name);
+    let mut out = Vec::with_capacity(pending.len());
+    for pf in &pending {
+        let mut columns = Vec::with_capacity(pf.columns.len());
+        for cn in &pf.columns {
+            columns.push(child_pos(cn).ok_or(Error::Constraint("columna hija de FK desconocida"))?);
+        }
+        // El padre (auto-referencia usa las columnas en construcción; sus índices
+        // aún no existen ⇒ solo se puede auto-referenciar la PK).
+        let (parent_names, parent_rowid, parent_indexes): (
+            Vec<String>,
+            Option<usize>,
+            Vec<IndexDef>,
+        ) = if pf.parent == spec.name {
+            (
+                spec.columns.iter().map(|c| c.name.clone()).collect(),
+                rowid_alias,
+                Vec::new(),
+            )
+        } else {
+            match get_table(s, root, &pf.parent)? {
+                Some(p) => (
+                    p.columns.iter().map(|c| c.name.clone()).collect(),
+                    p.rowid_alias,
+                    p.indexes.clone(),
+                ),
+                None => return Err(Error::Constraint("tabla padre de FK desconocida")),
+            }
+        };
+        let mut parent_positions = Vec::with_capacity(pf.parent_columns.len());
+        for pn in &pf.parent_columns {
+            parent_positions.push(
+                parent_names
+                    .iter()
+                    .position(|n| n == pn)
+                    .ok_or(Error::Constraint("columna del padre de FK desconocida"))?,
+            );
+        }
+        // Referencia por rowid (PK): columnas del padre vacías, o exactamente la PK.
+        let is_pk_ref = parent_positions.is_empty()
+            || (parent_positions.len() == 1 && Some(parent_positions[0]) == parent_rowid);
+        if is_pk_ref {
+            if columns.len() != 1 {
+                return Err(Error::Constraint(
+                    "una FK a la PK referencia una sola columna",
+                ));
+            }
+            if parent_rowid.is_none() {
+                return Err(Error::Constraint(
+                    "la tabla padre de una FK necesita PRIMARY KEY",
+                ));
+            }
+            parent_positions.clear(); // = PK por rowid
+        } else {
+            if columns.len() != parent_positions.len() {
+                return Err(Error::Constraint(
+                    "la FK y las columnas del padre tienen distinta aridad",
+                ));
+            }
+            let covered = parent_indexes.iter().any(|ix| {
+                ix.unique
+                    && ix.columns.len() == parent_positions.len()
+                    && parent_positions.iter().all(|p| ix.columns.contains(p))
+            });
+            if !covered {
+                return Err(Error::Constraint(
+                    "las columnas referenciadas por una FK deben ser PRIMARY KEY o tener un índice UNIQUE",
+                ));
+            }
+        }
+        out.push(ForeignKey {
+            columns,
+            parent: pf.parent.clone(),
+            parent_columns: parent_positions,
+            on_delete: pf.on_delete,
+            on_update: pf.on_update,
+        });
+    }
+    Ok(out)
 }
 
 pub fn create_table<S: NodeStore>(
@@ -624,31 +824,10 @@ pub fn create_table<S: NodeStore>(
     };
     let mut root = btree::insert(s, root, &meta_key(), &(table_id + 1).to_le_bytes())?;
 
-    // Claves foráneas: el padre debe existir y tener PRIMARY KEY (v1 referencia
-    // siempre a la PK). Se permite auto-referencia (padre = esta tabla).
-    let mut foreign_keys = Vec::new();
-    for (i, col) in spec.columns.iter().enumerate() {
-        if let Some((parent, on_delete)) = &col.references {
-            let parent_has_pk = if parent == &spec.name {
-                rowid_alias.is_some()
-            } else {
-                match get_table(s, root, parent)? {
-                    Some(p) => p.rowid_alias.is_some(),
-                    None => return Err(Error::Constraint("tabla padre de FK desconocida")),
-                }
-            };
-            if !parent_has_pk {
-                return Err(Error::Constraint(
-                    "la tabla padre de una FK necesita PRIMARY KEY",
-                ));
-            }
-            foreign_keys.push(ForeignKey {
-                column: i,
-                parent: parent.clone(),
-                on_delete: *on_delete,
-            });
-        }
-    }
+    // Claves foráneas (columna + tabla, posiblemente compuestas). El padre debe
+    // existir; las columnas referenciadas deben ser su PK o tener un índice UNIQUE.
+    // Se permite auto-referencia (padre = esta tabla) a su PK.
+    let foreign_keys = resolve_foreign_keys(s, root, spec, rowid_alias)?;
 
     let def = TableDef {
         name: spec.name.clone(),
@@ -847,7 +1026,7 @@ pub fn drop_column<S: NodeStore>(
             "la columna está en un índice (haz DROP INDEX primero)",
         ));
     }
-    if def.foreign_keys.iter().any(|fk| fk.column == phys) {
+    if def.foreign_keys.iter().any(|fk| fk.columns.contains(&phys)) {
         return Err(Error::Constraint("la columna tiene una clave foránea"));
     }
     // La columna se queda en `logical_order` (sigue siendo permutación de
@@ -1910,6 +2089,7 @@ mod tests {
                 col("pagada", ColType::Boolean),
                 col("adjunto", ColType::Blob),
             ],
+            foreign_keys: Vec::new(),
         }
     }
 
@@ -1928,6 +2108,7 @@ mod tests {
         let spec2 = TableSpec {
             name: "clientes".into(),
             columns: vec![col("n", ColType::Text)],
+            foreign_keys: Vec::new(),
         };
         let (_, def2) = create_table(&mut s, root, &spec2).unwrap();
         assert_eq!(def2.table_id, 2);
@@ -1940,6 +2121,7 @@ mod tests {
         let dup = TableSpec {
             name: "t".into(),
             columns: vec![col("a", ColType::Text), col("a", ColType::Real)],
+            foreign_keys: Vec::new(),
         };
         assert!(matches!(
             create_table(&mut s, NO_ROOT, &dup),
@@ -1952,6 +2134,7 @@ mod tests {
                 primary_key: true,
                 ..col("k", ColType::Text)
             }],
+            foreign_keys: Vec::new(),
         };
         assert!(matches!(
             create_table(&mut s, NO_ROOT, &bad_pk),
@@ -1964,12 +2147,14 @@ mod tests {
             &TableSpec {
                 name: "t".into(),
                 columns: vec![col("a", ColType::Text)],
+                foreign_keys: Vec::new(),
             },
         )
         .unwrap();
         let again = TableSpec {
             name: "t".into(),
             columns: vec![col("b", ColType::Text)],
+            foreign_keys: Vec::new(),
         };
         assert!(matches!(
             create_table(&mut s, root, &again),
@@ -2063,6 +2248,7 @@ mod tests {
         let spec2 = TableSpec {
             name: "clientes".into(),
             columns: vec![col("nombre", ColType::Text)],
+            foreign_keys: Vec::new(),
         };
         let (mut root, t2) = create_table(&mut s, root, &spec2).unwrap();
 
@@ -2158,6 +2344,52 @@ mod tests {
         assert!(decoded.columns[2].dropped);
         assert_eq!(decoded.logical_order, dropped.logical_order); // intacto (5 entradas)
         assert_eq!(decoded, dropped);
+
+        // v6: round-trip de una FK **compuesta** con ON DELETE/UPDATE y columnas
+        // explícitas del padre.
+        let mut withfk = def.clone();
+        withfk.foreign_keys = vec![ForeignKey {
+            columns: vec![1, 3],
+            parent: "otra".into(),
+            parent_columns: vec![0, 2],
+            on_delete: FkAction::Cascade,
+            on_update: FkAction::SetNull,
+        }];
+        let decoded = decode_def("facturas", &encode_def(&withfk)).unwrap();
+        assert_eq!(decoded.foreign_keys, withfk.foreign_keys);
+
+        // Retrocompat: una FK **v4** (una columna → PK, solo ON DELETE) hecha a
+        // mano decodifica como `columns=[c]`, `parent_columns=[]` (rowid) y
+        // `on_update=Restrict`.
+        let v4 = [
+            4u8, // versión
+            1,
+            0,
+            0,
+            0,        // table_id = 1 (LE)
+            NO_ALIAS, // sin PK
+            1,        // ncols = 1
+            1,
+            b'x', // nombre "x"
+            ColType::Integer as u8,
+            0, // not_null = false
+            0, // default: ninguno
+            0, // nidx = 0
+            0, // orden lógico (v>=3): marcador 0 = identidad
+            1, // nfk = 1
+            0, // columna hija = 0
+            1, // on_delete = Cascade
+            1,
+            b'p', // padre "p" (len 1)
+        ];
+        let from_v4 = decode_def("t", &v4).unwrap();
+        assert_eq!(from_v4.foreign_keys.len(), 1);
+        let fk = &from_v4.foreign_keys[0];
+        assert_eq!(fk.columns, vec![0]);
+        assert_eq!(fk.parent, "p");
+        assert!(fk.parent_columns.is_empty()); // referencia la PK por rowid
+        assert_eq!(fk.on_delete, FkAction::Cascade);
+        assert_eq!(fk.on_update, FkAction::Restrict); // ausente en v4 ⇒ por defecto
     }
 
     #[test]

@@ -10,7 +10,9 @@
 //! primary := literal | columna | tabla.columna | func(args) | agregado(expr|*) | ?N | ( expr )
 //! ```
 
-use crate::catalog::{ColType, ColumnPos, FkAction, TriggerEvent, TriggerTiming};
+use crate::catalog::{
+    ColType, ColumnFk, ColumnPos, FkAction, ForeignKeySpec, TriggerEvent, TriggerTiming,
+};
 use crate::error::{Error, Result};
 use crate::record::Value;
 use crate::sql::ast::*;
@@ -318,8 +320,15 @@ impl<'a> Parser<'a> {
         let name = self.ident("un nombre de tabla")?;
         self.expect(&Tok::LParen, "'('")?;
         let mut columns = Vec::new();
+        let mut foreign_keys = Vec::new();
         loop {
-            columns.push(self.column_def()?);
+            // Una FK a nivel de tabla (`FOREIGN KEY …`, posiblemente compuesta) o
+            // una definición de columna; van mezcladas separadas por comas.
+            if self.peek() == Some(&Tok::Kw(Kw::Foreign)) {
+                foreign_keys.push(self.table_fk()?);
+            } else {
+                columns.push(self.column_def()?);
+            }
             if !self.eat(&Tok::Comma) {
                 break;
             }
@@ -329,6 +338,37 @@ impl<'a> Parser<'a> {
             if_not_exists,
             name,
             columns,
+            foreign_keys,
+        })
+    }
+
+    /// `FOREIGN KEY (c…) REFERENCES padre [(p…)] [ON DELETE acc] [ON UPDATE acc]`.
+    fn table_fk(&mut self) -> Result<ForeignKeySpec> {
+        self.expect_kw(Kw::Foreign, "FOREIGN")?;
+        self.expect_kw(Kw::Key, "KEY")?;
+        self.expect(&Tok::LParen, "'('")?;
+        let mut columns = vec![self.ident("una columna")?];
+        while self.eat(&Tok::Comma) {
+            columns.push(self.ident("una columna")?);
+        }
+        self.expect(&Tok::RParen, "')'")?;
+        self.expect_kw(Kw::References, "REFERENCES")?;
+        let parent = self.ident("una tabla padre")?;
+        let mut parent_columns = Vec::new();
+        if self.eat(&Tok::LParen) {
+            parent_columns.push(self.ident("una columna del padre")?);
+            while self.eat(&Tok::Comma) {
+                parent_columns.push(self.ident("una columna del padre")?);
+            }
+            self.expect(&Tok::RParen, "')'")?;
+        }
+        let (on_delete, on_update) = self.fk_actions()?;
+        Ok(ForeignKeySpec {
+            columns,
+            parent,
+            parent_columns,
+            on_delete,
+            on_update,
         })
     }
 
@@ -468,33 +508,64 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Tras `REFERENCES`: `padre [(col)] [ON DELETE {RESTRICT|CASCADE|SET NULL}]`.
-    /// La columna referenciada (si se da) se ignora: v1 referencia siempre la PK.
-    fn fk_reference(&mut self) -> Result<(String, FkAction)> {
+    /// Tras `REFERENCES` (en línea con la columna): `padre [(col)] [ON DELETE acc]
+    /// [ON UPDATE acc]`. Si se da una columna del padre, se conserva (referencia
+    /// no-PK); si no, se referencia la PK del padre.
+    fn fk_reference(&mut self) -> Result<ColumnFk> {
         let parent = self.ident("una tabla padre")?;
-        if self.eat(&Tok::LParen) {
-            let _ = self.ident("una columna del padre")?;
+        let parent_column = if self.eat(&Tok::LParen) {
+            let c = self.ident("una columna del padre")?;
             self.expect(&Tok::RParen, "')'")?;
-        }
+            Some(c)
+        } else {
+            None
+        };
+        let (on_delete, on_update) = self.fk_actions()?;
+        Ok(ColumnFk {
+            parent,
+            parent_column,
+            on_delete,
+            on_update,
+        })
+    }
+
+    /// `[ON DELETE acc] [ON UPDATE acc]` en cualquier orden; ausente ⇒ RESTRICT.
+    fn fk_actions(&mut self) -> Result<(FkAction, FkAction)> {
         let mut on_delete = FkAction::Restrict;
-        // ON DELETE acción (ON UPDATE no se soporta en v1).
-        if self.peek() == Some(&Tok::Kw(Kw::On)) && self.peek2() == Some(&Tok::Kw(Kw::Delete)) {
-            self.i += 2;
-            on_delete = if self.eat_kw(Kw::Cascade) {
-                FkAction::Cascade
-            } else if self.eat_kw(Kw::Restrict) {
-                FkAction::Restrict
-            } else if self.eat_kw(Kw::Set) {
-                self.expect_kw(Kw::Null, "NULL")?;
-                FkAction::SetNull
+        let mut on_update = FkAction::Restrict;
+        while self.peek() == Some(&Tok::Kw(Kw::On)) {
+            self.expect_kw(Kw::On, "ON")?;
+            let is_delete = if self.eat_kw(Kw::Delete) {
+                true
+            } else if self.eat_kw(Kw::Update) {
+                false
             } else {
-                return Err(err_at(
-                    self.pos(),
-                    "se esperaba CASCADE, RESTRICT o SET NULL",
-                ));
+                return Err(err_at(self.pos(), "se esperaba DELETE o UPDATE tras ON"));
             };
+            let action = self.fk_action()?;
+            if is_delete {
+                on_delete = action;
+            } else {
+                on_update = action;
+            }
         }
-        Ok((parent, on_delete))
+        Ok((on_delete, on_update))
+    }
+
+    fn fk_action(&mut self) -> Result<FkAction> {
+        if self.eat_kw(Kw::Cascade) {
+            Ok(FkAction::Cascade)
+        } else if self.eat_kw(Kw::Restrict) {
+            Ok(FkAction::Restrict)
+        } else if self.eat_kw(Kw::Set) {
+            self.expect_kw(Kw::Null, "NULL")?;
+            Ok(FkAction::SetNull)
+        } else {
+            Err(err_at(
+                self.pos(),
+                "se esperaba CASCADE, RESTRICT o SET NULL",
+            ))
+        }
     }
 
     /// Tras consumir `DROP`: `TABLE [IF EXISTS] nombre`.
@@ -1444,6 +1515,7 @@ mod tests {
             if_not_exists,
             name,
             columns,
+            foreign_keys,
         } = stmt
         else {
             panic!()
@@ -1457,6 +1529,7 @@ mod tests {
             Some(Expr::Literal(Value::Text("borrador".into())))
         );
         assert_eq!(columns[2].col_type, ColType::Real);
+        assert!(foreign_keys.is_empty());
     }
 
     #[test]

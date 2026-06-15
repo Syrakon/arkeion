@@ -1,0 +1,121 @@
+-- FKs avanzadas: referencia a columnas NO-PK (con índice UNIQUE), claves
+-- COMPUESTAS (`FOREIGN KEY (a,b) REFERENCES padre (x,y)`) y `ON UPDATE`.
+
+-- --- Referencia a columna no-PK + ON UPDATE/DELETE CASCADE ---
+> CREATE TABLE country (id INTEGER PRIMARY KEY, code TEXT);
+ok
+
+> CREATE UNIQUE INDEX ux_country_code ON country (code);
+ok
+
+> INSERT INTO country (code) VALUES ('es'), ('fr');
+affected 2
+
+> CREATE TABLE city (id INTEGER PRIMARY KEY, name TEXT, ccode TEXT REFERENCES country(code) ON UPDATE CASCADE ON DELETE CASCADE);
+ok
+
+> INSERT INTO city (name, ccode) VALUES ('madrid', 'es'), ('paris', 'fr');
+affected 2
+
+-- Código inexistente → error (se busca por el índice UNIQUE del padre).
+> INSERT INTO city (name, ccode) VALUES ('berlin', 'de');
+error clave foránea
+
+-- ON UPDATE CASCADE: cambiar country.code propaga a las ciudades hijas.
+> UPDATE country SET code = 'esp' WHERE id = 1;
+affected 1
+
+> SELECT name, ccode FROM city ORDER BY name;
+madrid|esp
+paris|fr
+
+-- ON DELETE CASCADE por una columna no-PK.
+> DELETE FROM country WHERE code = 'fr';
+affected 1
+
+> SELECT name FROM city ORDER BY name;
+madrid
+
+-- --- Clave COMPUESTA a un índice UNIQUE de dos columnas ---
+> CREATE TABLE warehouse (id INTEGER PRIMARY KEY, region TEXT, code TEXT);
+ok
+
+> CREATE UNIQUE INDEX ux_wh ON warehouse (region, code);
+ok
+
+> INSERT INTO warehouse (region, code) VALUES ('n', 'a'), ('s', 'b');
+affected 2
+
+> CREATE TABLE stock (id INTEGER PRIMARY KEY, region TEXT, code TEXT, qty INTEGER, FOREIGN KEY (region, code) REFERENCES warehouse (region, code) ON DELETE CASCADE);
+ok
+
+> INSERT INTO stock (region, code, qty) VALUES ('n', 'a', 10), ('s', 'b', 20);
+affected 2
+
+-- Par (region, code) inexistente → error (casa por las DOS columnas).
+> INSERT INTO stock (region, code, qty) VALUES ('n', 'b', 5);
+error clave foránea
+
+-- Borra un almacén → CASCADE a su stock por el par completo.
+> DELETE FROM warehouse WHERE region = 'n';
+affected 1
+
+> SELECT region, code, qty FROM stock ORDER BY region;
+s|b|20
+
+-- --- ON UPDATE RESTRICT (por defecto) y SET NULL ---
+> CREATE TABLE acct (id INTEGER PRIMARY KEY, num TEXT);
+ok
+
+> CREATE UNIQUE INDEX ux_acct ON acct (num);
+ok
+
+> INSERT INTO acct (num) VALUES ('A1');
+affected 1
+
+> CREATE TABLE txn (id INTEGER PRIMARY KEY, acct_num TEXT REFERENCES acct(num));
+ok
+
+> INSERT INTO txn (acct_num) VALUES ('A1');
+affected 1
+
+-- Cambiar la columna referenciada con hijos (RESTRICT) → error, ANTES de escribir.
+> UPDATE acct SET num = 'A2' WHERE id = 1;
+error ON UPDATE RESTRICT
+
+-- La fila padre sigue intacta (el UPDATE no llegó a aplicarse).
+> SELECT num FROM acct;
+A1
+
+> CREATE TABLE acct2 (id INTEGER PRIMARY KEY, num TEXT);
+ok
+
+> CREATE UNIQUE INDEX ux_acct2 ON acct2 (num);
+ok
+
+> INSERT INTO acct2 (num) VALUES ('B1');
+affected 1
+
+> CREATE TABLE txn2 (id INTEGER PRIMARY KEY, acct_num TEXT REFERENCES acct2(num) ON UPDATE SET NULL);
+ok
+
+> INSERT INTO txn2 (acct_num) VALUES ('B1');
+affected 1
+
+> UPDATE acct2 SET num = 'B2' WHERE id = 1;
+affected 1
+
+> SELECT acct_num FROM txn2;
+NULL
+
+-- --- Validaciones de DDL ---
+-- Referenciar una columna sin índice UNIQUE (ni PK) → error al crear la tabla.
+> CREATE TABLE plain (id INTEGER PRIMARY KEY, tag TEXT);
+ok
+
+> CREATE TABLE refplain (id INTEGER PRIMARY KEY, tag TEXT REFERENCES plain(tag));
+error UNIQUE
+
+-- Aridad distinta entre la FK y las columnas del padre.
+> CREATE TABLE bad3 (a TEXT, b TEXT, FOREIGN KEY (a, b) REFERENCES warehouse (region));
+error aridad

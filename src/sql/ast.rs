@@ -1,6 +1,6 @@
 //! AST del subconjunto SQL v1 (docs/04-sql.md).
 
-use crate::catalog::{ColType, ColumnPos, FkAction, TriggerEvent, TriggerTiming};
+use crate::catalog::{ColType, ColumnFk, ColumnPos, ForeignKeySpec, TriggerEvent, TriggerTiming};
 use crate::record::Value;
 
 // `Select` es bastante más grande que el resto de variantes, pero `Stmt` es un
@@ -13,6 +13,9 @@ pub enum Stmt {
         if_not_exists: bool,
         name: String,
         columns: Vec<ColumnAst>,
+        /// FKs a nivel de tabla: `FOREIGN KEY (c…) REFERENCES padre (p…) …`
+        /// (compuestas). Las de columna van en `ColumnAst.references`.
+        foreign_keys: Vec<ForeignKeySpec>,
     },
     DropTable {
         if_exists: bool,
@@ -115,9 +118,9 @@ pub struct ColumnAst {
     pub primary_key: bool,
     /// Debe evaluar a constante sin parámetros (se valida en exec).
     pub default: Option<Expr>,
-    /// `REFERENCES padre [ON DELETE acción]` (la columna referenciada es la PK
-    /// del padre).
-    pub references: Option<(String, FkAction)>,
+    /// `REFERENCES padre [(col)] [ON DELETE acción] [ON UPDATE acción]` en línea
+    /// con la columna. `parent_column` `None` = la PK del padre.
+    pub references: Option<ColumnFk>,
 }
 
 /// Tabla con alias opcional: `facturas f` o `facturas AS f`.

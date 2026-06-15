@@ -18,6 +18,12 @@ pub enum Stmt {
         /// FKs a nivel de tabla: `FOREIGN KEY (c…) REFERENCES padre (p…) …`
         /// (compuestas). Las de columna van en `ColumnAst.references`.
         foreign_keys: Vec<ForeignKeySpec>,
+        /// `UNIQUE (c…)` a nivel de tabla (composables); cada uno crea un índice
+        /// `UNIQUE`. Los de columna van en `ColumnAst.unique`.
+        uniques: Vec<Vec<String>>,
+        /// `CHECK (expr)` a nivel de tabla (texto del predicado). Los de columna van
+        /// en `ColumnAst.check`.
+        checks: Vec<String>,
     },
     DropTable {
         if_exists: bool,
@@ -160,6 +166,10 @@ pub struct ColumnAst {
     /// `REFERENCES padre [(col)] [ON DELETE acción] [ON UPDATE acción]` en línea
     /// con la columna. `parent_column` `None` = la PK del padre.
     pub references: Option<ColumnFk>,
+    /// `UNIQUE` en línea: crea un índice `UNIQUE` sobre esta columna.
+    pub unique: bool,
+    /// `CHECK (expr)` en línea: texto del predicado (se valida por fila).
+    pub check: Option<String>,
 }
 
 /// Tabla con alias opcional: `facturas f` o `facturas AS f`.

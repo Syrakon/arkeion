@@ -19,6 +19,8 @@ fn col(name: &str, t: ColType) -> ColumnSpec {
         primary_key: false,
         default: None,
         references: None,
+        unique: false,
+        check: None,
     }
 }
 
@@ -36,6 +38,8 @@ fn pedidos_spec() -> TableSpec {
             col("firma", ColType::Blob),
         ],
         foreign_keys: Vec::new(),
+        uniques: Vec::new(),
+        checks: Vec::new(),
     }
 }
 
@@ -123,6 +127,8 @@ fn thousand_rows_two_tables_persist() {
             name: "clientes".into(),
             columns: vec![col("nombre", ColType::Text), col("saldo", ColType::Real)],
             foreign_keys: Vec::new(),
+            uniques: Vec::new(),
+            checks: Vec::new(),
         })
         .unwrap();
 

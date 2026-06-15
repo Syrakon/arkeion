@@ -42,7 +42,7 @@ const CAT_TRIGGER: u8 = 0x06;
 // v4 añade las claves foráneas al final del registro de esquema; v2/v3 (sin
 // ellas) se leen con `foreign_keys` vacío. v5 añade el flag `dropped` por columna
 // (DROP COLUMN lógico); v<5 lo lee como `false`.
-const SCHEMA_VERSION: u8 = 6;
+const SCHEMA_VERSION: u8 = 7;
 const NO_ALIAS: u8 = 0xFF;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -230,6 +230,10 @@ pub struct ColumnSpec {
     /// `REFERENCES padre [(col)] [ON DELETE acción] [ON UPDATE acción]` declarado a
     /// nivel de columna. `parent_column` `None` = la PK del padre.
     pub references: Option<ColumnFk>,
+    /// `UNIQUE` en línea: se crea un índice UNIQUE sobre esta columna.
+    pub unique: bool,
+    /// `CHECK (expr)` en línea (texto del predicado).
+    pub check: Option<String>,
 }
 
 /// Clave foránea de una sola columna declarada en línea con la columna hija.
@@ -261,6 +265,10 @@ pub struct TableSpec {
     pub columns: Vec<ColumnSpec>,
     /// FKs a nivel de tabla (compuestas). Las de columna van en `ColumnSpec`.
     pub foreign_keys: Vec<ForeignKeySpec>,
+    /// `UNIQUE (c…)` a nivel de tabla (por nombres de columna); cada uno → índice UNIQUE.
+    pub uniques: Vec<Vec<String>>,
+    /// `CHECK (expr)` a nivel de tabla (texto). Los de columna van en `ColumnSpec.check`.
+    pub checks: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -309,6 +317,10 @@ pub struct TableDef {
     /// Claves foráneas de esta tabla (v4 del esquema). Se comprueban en cada
     /// INSERT/UPDATE (el padre debe existir) y el DELETE del padre las respeta.
     pub foreign_keys: Vec<ForeignKey>,
+    /// Predicados `CHECK (expr)` como texto (v7 del esquema), de columna y de tabla.
+    /// Se re-parsean y evalúan por fila en cada INSERT/UPDATE; falla si alguno da
+    /// FALSE (NULL/TRUE pasan, semántica SQL).
+    pub checks: Vec<String>,
 }
 
 /// Posición destino de `ALTER TABLE … MOVE COLUMN` (reorden lógico).
@@ -486,6 +498,12 @@ fn encode_def(def: &TableDef) -> Vec<u8> {
             put_varint(&mut out, p as u64);
         }
     }
+    // Predicados CHECK (v7): cuenta y texto de cada uno. v2..v6 no los llevan.
+    put_varint(&mut out, def.checks.len() as u64);
+    for c in &def.checks {
+        put_varint(&mut out, c.len() as u64);
+        out.extend_from_slice(c.as_bytes());
+    }
     out
 }
 
@@ -514,7 +532,7 @@ fn decode_def(name: &str, buf: &[u8]) -> Result<TableDef> {
     };
 
     let version = *take(&mut pos, 1)?.first().expect("len 1");
-    if !(2..=6).contains(&version) {
+    if !(2..=7).contains(&version) {
         return Err(bad("versión de esquema desconocida"));
     }
     let table_id = u32::from_le_bytes(
@@ -663,6 +681,19 @@ fn decode_def(name: &str, buf: &[u8]) -> Result<TableDef> {
         }
     }
 
+    // Predicados CHECK (v7). v2..v6 no los llevan ⇒ vacío.
+    let mut checks = Vec::new();
+    if version >= 7 {
+        let nck = take_varint(buf, &mut pos).ok_or(bad("esquema truncado"))? as usize;
+        for _ in 0..nck {
+            let clen = take_varint(buf, &mut pos).ok_or(bad("esquema truncado"))? as usize;
+            checks.push(
+                String::from_utf8(take(&mut pos, clen)?.to_vec())
+                    .map_err(|_| bad("texto de CHECK no UTF-8"))?,
+            );
+        }
+    }
+
     if pos != buf.len() {
         return Err(bad("bytes sobrantes tras el esquema"));
     }
@@ -679,6 +710,7 @@ fn decode_def(name: &str, buf: &[u8]) -> Result<TableDef> {
         indexes,
         logical_order,
         foreign_keys,
+        checks,
     })
 }
 
@@ -862,6 +894,14 @@ pub fn create_table<S: NodeStore>(
     // Se permite auto-referencia (padre = esta tabla) a su PK.
     let foreign_keys = resolve_foreign_keys(s, root, spec, rowid_alias)?;
 
+    // Predicados CHECK: texto de columna + texto de tabla.
+    let mut checks: Vec<String> = spec
+        .columns
+        .iter()
+        .filter_map(|c| c.check.clone())
+        .collect();
+    checks.extend(spec.checks.iter().cloned());
+
     let def = TableDef {
         name: spec.name.clone(),
         table_id,
@@ -881,8 +921,39 @@ pub fn create_table<S: NodeStore>(
         indexes: Vec::new(),
         logical_order: (0..spec.columns.len()).collect(),
         foreign_keys,
+        checks,
     };
     root = btree::insert(s, root, &table_key(&spec.name), &encode_def(&def))?;
+
+    // Restricciones UNIQUE (columna + tabla) → un índice UNIQUE por cada una. Se
+    // crean tras escribir la tabla (`create_index` la relee). El nombre se autogenera.
+    let mut unique_cols: Vec<Vec<String>> = spec
+        .columns
+        .iter()
+        .filter(|c| c.unique)
+        .map(|c| vec![c.name.clone()])
+        .collect();
+    unique_cols.extend(spec.uniques.iter().cloned());
+    let mut def = def;
+    for (i, cols) in unique_cols.iter().enumerate() {
+        let positions: Vec<usize> = cols
+            .iter()
+            .map(|name| {
+                def.columns
+                    .iter()
+                    .position(|c| &c.name == name)
+                    .ok_or(Error::Constraint("columna UNIQUE desconocida"))
+            })
+            .collect::<Result<_>>()?;
+        // `UNIQUE` sobre la PK es redundante (el rowid ya es único); se omite.
+        if positions.len() == 1 && Some(positions[0]) == def.rowid_alias {
+            continue;
+        }
+        let ix_name = format!("uq_{}_{}", spec.name, i);
+        root = create_index(s, root, &spec.name, &ix_name, &positions, true)?;
+        // Releer la def para que el llamador reciba los índices ya añadidos.
+        def = get_table(s, root, &spec.name)?.ok_or(Error::CorruptRecord("tabla recién creada"))?;
+    }
     Ok((root, def))
 }
 
@@ -2136,6 +2207,8 @@ mod tests {
             primary_key: false,
             default: None,
             references: None,
+            unique: false,
+            check: None,
         }
     }
 
@@ -2157,6 +2230,8 @@ mod tests {
                 col("adjunto", ColType::Blob),
             ],
             foreign_keys: Vec::new(),
+            uniques: Vec::new(),
+            checks: Vec::new(),
         }
     }
 
@@ -2176,6 +2251,8 @@ mod tests {
             name: "clientes".into(),
             columns: vec![col("n", ColType::Text)],
             foreign_keys: Vec::new(),
+            uniques: Vec::new(),
+            checks: Vec::new(),
         };
         let (_, def2) = create_table(&mut s, root, &spec2).unwrap();
         assert_eq!(def2.table_id, 2);
@@ -2189,6 +2266,8 @@ mod tests {
             name: "t".into(),
             columns: vec![col("a", ColType::Text), col("a", ColType::Real)],
             foreign_keys: Vec::new(),
+            uniques: Vec::new(),
+            checks: Vec::new(),
         };
         assert!(matches!(
             create_table(&mut s, NO_ROOT, &dup),
@@ -2202,6 +2281,8 @@ mod tests {
                 ..col("k", ColType::Text)
             }],
             foreign_keys: Vec::new(),
+            uniques: Vec::new(),
+            checks: Vec::new(),
         };
         assert!(matches!(
             create_table(&mut s, NO_ROOT, &bad_pk),
@@ -2215,6 +2296,8 @@ mod tests {
                 name: "t".into(),
                 columns: vec![col("a", ColType::Text)],
                 foreign_keys: Vec::new(),
+                uniques: Vec::new(),
+                checks: Vec::new(),
             },
         )
         .unwrap();
@@ -2222,6 +2305,8 @@ mod tests {
             name: "t".into(),
             columns: vec![col("b", ColType::Text)],
             foreign_keys: Vec::new(),
+            uniques: Vec::new(),
+            checks: Vec::new(),
         };
         assert!(matches!(
             create_table(&mut s, root, &again),
@@ -2316,6 +2401,8 @@ mod tests {
             name: "clientes".into(),
             columns: vec![col("nombre", ColType::Text)],
             foreign_keys: Vec::new(),
+            uniques: Vec::new(),
+            checks: Vec::new(),
         };
         let (mut root, t2) = create_table(&mut s, root, &spec2).unwrap();
 

@@ -335,13 +335,28 @@ impl<'a> Parser<'a> {
         self.expect(&Tok::LParen, "'('")?;
         let mut columns = Vec::new();
         let mut foreign_keys = Vec::new();
+        let mut uniques = Vec::new();
+        let mut checks = Vec::new();
         loop {
-            // Una FK a nivel de tabla (`FOREIGN KEY …`, posiblemente compuesta) o
-            // una definición de columna; van mezcladas separadas por comas.
-            if self.peek() == Some(&Tok::Kw(Kw::Foreign)) {
-                foreign_keys.push(self.table_fk()?);
-            } else {
-                columns.push(self.column_def()?);
+            // Restricciones a nivel de tabla (`FOREIGN KEY …`, `UNIQUE (…)`,
+            // `CHECK (…)`) o una definición de columna; van mezcladas con comas.
+            match self.peek() {
+                Some(Tok::Kw(Kw::Foreign)) => foreign_keys.push(self.table_fk()?),
+                Some(Tok::Kw(Kw::Unique)) => {
+                    self.i += 1;
+                    self.expect(&Tok::LParen, "'('")?;
+                    let mut cols = vec![self.ident("una columna")?];
+                    while self.eat(&Tok::Comma) {
+                        cols.push(self.ident("una columna")?);
+                    }
+                    self.expect(&Tok::RParen, "')'")?;
+                    uniques.push(cols);
+                }
+                Some(Tok::Kw(Kw::Check)) => {
+                    self.i += 1;
+                    checks.push(self.check_clause()?);
+                }
+                _ => columns.push(self.column_def()?),
             }
             if !self.eat(&Tok::Comma) {
                 break;
@@ -353,6 +368,8 @@ impl<'a> Parser<'a> {
             name,
             columns,
             foreign_keys,
+            uniques,
+            checks,
         })
     }
 
@@ -504,6 +521,8 @@ impl<'a> Parser<'a> {
             primary_key: false,
             default: None,
             references: None,
+            unique: false,
+            check: None,
         };
         loop {
             if self.eat_kw(Kw::Primary) {
@@ -516,10 +535,25 @@ impl<'a> Parser<'a> {
                 col.default = Some(self.expr()?);
             } else if self.eat_kw(Kw::References) {
                 col.references = Some(self.fk_reference()?);
+            } else if self.eat_kw(Kw::Unique) {
+                col.unique = true;
+            } else if self.eat_kw(Kw::Check) {
+                col.check = Some(self.check_clause()?);
             } else {
                 return Ok(col);
             }
         }
+    }
+
+    /// Tras `CHECK`: `(expr)` — captura el texto del predicado (se re-parsea y evalúa
+    /// por fila en INSERT/UPDATE).
+    fn check_clause(&mut self) -> Result<String> {
+        self.expect(&Tok::LParen, "'(' tras CHECK")?;
+        let start = self.pos();
+        let _ = self.expr()?; // valida que es una expresión bien formada
+        let text = self.src[start..self.pos()].trim().to_string();
+        self.expect(&Tok::RParen, "')'")?;
+        Ok(text)
     }
 
     /// Tras `REFERENCES` (en línea con la columna): `padre [(col)] [ON DELETE acc]
@@ -1753,6 +1787,7 @@ mod tests {
             name,
             columns,
             foreign_keys,
+            ..
         } = stmt
         else {
             panic!()

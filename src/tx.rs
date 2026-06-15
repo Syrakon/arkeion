@@ -3106,6 +3106,8 @@ mod tests {
                     primary_key: true,
                     default: None,
                     references: None,
+                    unique: false,
+                    check: None,
                 },
                 ColumnSpec {
                     name: "n".into(),
@@ -3114,9 +3116,13 @@ mod tests {
                     primary_key: false,
                     default: None,
                     references: None,
+                    unique: false,
+                    check: None,
                 },
             ],
             foreign_keys: Vec::new(),
+            uniques: Vec::new(),
+            checks: Vec::new(),
         };
         let def = {
             let mut tx = store.begin().unwrap();

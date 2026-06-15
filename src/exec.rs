@@ -298,6 +298,8 @@ pub fn run_execute(tx: &mut WriteTx, stmt: &Stmt, params: &[Value]) -> Result<us
             name,
             columns,
             foreign_keys,
+            uniques,
+            checks,
         } => {
             if tx.table(name)?.is_some() {
                 if *if_not_exists {
@@ -305,7 +307,7 @@ pub fn run_execute(tx: &mut WriteTx, stmt: &Stmt, params: &[Value]) -> Result<us
                 }
                 return Err(Error::Constraint("la tabla ya existe"));
             }
-            tx.create_table(&table_spec(name, columns, foreign_keys)?)?;
+            tx.create_table(&table_spec(name, columns, foreign_keys, uniques, checks)?)?;
             Ok(0)
         }
         Stmt::DropTable { if_exists, name } => {
@@ -644,6 +646,36 @@ fn candidate_rows(
     Ok(all)
 }
 
+/// Re-parsea los predicados `CHECK` de una tabla (guardados como texto) a `Expr`,
+/// una vez por sentencia. Cada texto se envuelve en `SELECT <expr>` y se extrae.
+fn parse_checks(def: &TableDef) -> Result<Vec<Expr>> {
+    def.checks
+        .iter()
+        .map(|text| {
+            let Stmt::Select(mut s) = crate::sql::parse(&format!("SELECT {text}"))? else {
+                return Err(sql_err("CHECK debe ser una expresión"));
+            };
+            match s.projection.drain(..).next() {
+                Some(SelectItem::Expr { expr, .. }) => Ok(expr),
+                _ => Err(sql_err("CHECK debe ser una expresión")),
+            }
+        })
+        .collect()
+}
+
+/// Comprueba los `CHECK` (ya parseados) contra una fila. Falla si alguno evalúa a
+/// **FALSE**; NULL/TRUE pasan (semántica SQL).
+fn check_row(checks: &[Expr], schema: &QuerySchema, row: &[Value], params: &[Value]) -> Result<()> {
+    for expr in checks {
+        validate_columns(expr, schema)?;
+        let v = eval(expr, Some((schema, row)), params)?;
+        if !matches!(v, Value::Null) && !truthy(v)? {
+            return Err(Error::Constraint("violación de restricción CHECK"));
+        }
+    }
+    Ok(())
+}
+
 fn run_insert(
     tx: &mut WriteTx,
     table: &str,
@@ -700,6 +732,9 @@ fn run_insert(
     } else {
         Vec::new()
     });
+    // Predicados CHECK (parseados una vez; evaluados por fila antes de escribir).
+    let checks = parse_checks(&def)?;
+    let check_schema = QuerySchema::single(table, (*def).clone());
     fire(tx, &def, &before_stmt, None, None)?; // BEFORE … FOR EACH STATEMENT
     // La fila NEW (con el rowid asignado) solo se necesita para AFTER INSERT o RETURNING.
     let want_new = !ins_after_row.is_empty() || returning.is_some();
@@ -726,6 +761,7 @@ fn run_insert(
                         where_clause.as_ref(),
                         &values,
                         params,
+                        &checks,
                         &upd_before_row,
                         &upd_after_row,
                     )? {
@@ -738,6 +774,7 @@ fn run_insert(
                 }
             }
         }
+        check_row(&checks, &check_schema, &values, params)?; // CHECK antes de insertar
         fire(tx, &def, &ins_before_row, None, Some(&values))?; // BEFORE INSERT
         let rowid = tx.insert_row(&def, &values)?;
         if want_new {
@@ -799,6 +836,7 @@ fn upsert_update(
     where_clause: Option<&Expr>,
     proposed: &[Value],
     params: &[Value],
+    checks: &[Expr],
     before_row: &[TriggerDef],
     after_row: &[TriggerDef],
 ) -> Result<Option<Vec<Value>>> {
@@ -828,6 +866,7 @@ fn upsert_update(
         validate_columns(&e, &schema)?;
         new_row[i] = eval(&e, Some((&schema, &existing)), params)?;
     }
+    check_row(checks, &schema, &new_row, params)?; // CHECK sobre la fila actualizada
     fire(tx, def, before_row, Some(&existing), Some(&new_row))?;
     tx.update_row(def, rid, &new_row)?;
     fire(tx, def, after_row, Some(&existing), Some(&new_row))?;
@@ -896,9 +935,11 @@ fn run_update(
         updates.push((rowid, row, new_row));
     }
     let n = updates.len();
+    let checks = parse_checks(&def)?;
     let mut returned = Vec::new(); // filas NEW para RETURNING
     fire(tx, &def, &before_stmt, None, None)?; // BEFORE … FOR EACH STATEMENT
     for (rowid, old_row, new_row) in updates {
+        check_row(&checks, &schema, &new_row, params)?; // CHECK sobre la fila NEW
         fire(tx, &def, &before_row, Some(&old_row), Some(&new_row))?;
         tx.update_row(&def, rowid, &new_row)?;
         if returning.is_some() {
@@ -1382,6 +1423,8 @@ fn table_spec(
     name: &str,
     columns: &[ColumnAst],
     foreign_keys: &[catalog::ForeignKeySpec],
+    uniques: &[Vec<String>],
+    checks: &[String],
 ) -> Result<TableSpec> {
     let mut specs = Vec::with_capacity(columns.len());
     for col in columns {
@@ -1404,12 +1447,16 @@ fn table_spec(
             primary_key: col.primary_key,
             default,
             references: col.references.clone(),
+            unique: col.unique,
+            check: col.check.clone(),
         });
     }
     Ok(TableSpec {
         name: name.to_owned(),
         columns: specs,
         foreign_keys: foreign_keys.to_vec(),
+        uniques: uniques.to_vec(),
+        checks: checks.to_vec(),
     })
 }
 
@@ -2169,6 +2216,7 @@ fn synthetic_cte_def(name: &str, columns: &[String], idx: usize) -> TableDef {
         indexes: Vec::new(),
         logical_order: (0..n).collect(),
         foreign_keys: Vec::new(),
+        checks: Vec::new(),
     }
 }
 
@@ -5744,6 +5792,7 @@ mod tests {
             indexes: Vec::new(),
             logical_order: vec![0],
             foreign_keys: Vec::new(),
+            checks: Vec::new(),
         };
         let schema = QuerySchema::single("t", def);
         let rows: Vec<Vec<Value>> = vec![
@@ -5799,6 +5848,7 @@ mod tests {
             indexes: Vec::new(),
             logical_order: vec![0],
             foreign_keys: Vec::new(),
+            checks: Vec::new(),
         };
         let mut schema = QuerySchema::single("a", table("a"));
         schema.push("b", table("b")).unwrap();

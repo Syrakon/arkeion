@@ -1,0 +1,60 @@
+-- Restricciones CHECK (de columna y de tabla) y UNIQUE (en línea y de tabla).
+
+-- CHECK de columna (balance >= 0) y de tabla (kind ∈ {a, b}).
+> CREATE TABLE acct (id INTEGER PRIMARY KEY, balance INTEGER CHECK (balance >= 0), kind TEXT, CHECK (kind IN ('a', 'b')));
+ok
+
+> INSERT INTO acct (balance, kind) VALUES (100, 'a');
+affected 1
+
+-- Viola el CHECK de columna.
+> INSERT INTO acct (balance, kind) VALUES (-5, 'a');
+error CHECK
+
+-- Viola el CHECK de tabla.
+> INSERT INTO acct (balance, kind) VALUES (50, 'z');
+error CHECK
+
+-- Un UPDATE que violaría el CHECK también falla.
+> UPDATE acct SET balance = -1 WHERE id = 1;
+error CHECK
+
+> UPDATE acct SET balance = 200 WHERE id = 1;
+affected 1
+
+> SELECT balance FROM acct;
+200
+
+-- NULL pasa el CHECK (solo FALSE viola, semántica SQL): balance ausente = NULL.
+> INSERT INTO acct (kind) VALUES ('b');
+affected 1
+
+-- UNIQUE en línea de columna.
+> CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT UNIQUE);
+ok
+
+> INSERT INTO users (email) VALUES ('a@x.com');
+affected 1
+
+> INSERT INTO users (email) VALUES ('a@x.com');
+error UNIQUE
+
+> INSERT INTO users (email) VALUES ('b@x.com');
+affected 1
+
+-- El UNIQUE en línea crea un índice real: ON CONFLICT lo detecta.
+> INSERT INTO users (email) VALUES ('a@x.com') ON CONFLICT DO NOTHING;
+affected 0
+
+-- UNIQUE de tabla (compuesto).
+> CREATE TABLE seats (id INTEGER PRIMARY KEY, x INTEGER, y INTEGER, UNIQUE (x, y));
+ok
+
+> INSERT INTO seats (x, y) VALUES (1, 1), (1, 2);
+affected 2
+
+> INSERT INTO seats (x, y) VALUES (1, 1);
+error UNIQUE
+
+> INSERT INTO seats (x, y) VALUES (2, 1);
+affected 1

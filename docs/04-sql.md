@@ -24,8 +24,9 @@ se **aceptan sintácticamente** y quedan registradas en el esquema, pero no se a
 
 ```sql
 -- DDL
-CREATE TABLE [IF NOT EXISTS] tabla (col TIPO [restricciones], …);
-  -- restricciones: PRIMARY KEY | NOT NULL | DEFAULT v | REFERENCES padre [ON DELETE acción]
+CREATE TABLE [IF NOT EXISTS] tabla (col TIPO [restricciones], …[, restricción_tabla…]);
+  -- de columna: PRIMARY KEY | NOT NULL | DEFAULT v | UNIQUE | CHECK (expr) | REFERENCES padre […]
+  -- de tabla:   UNIQUE (c…) | CHECK (expr) | FOREIGN KEY (c…) REFERENCES padre (p…) […]
 DROP TABLE [IF EXISTS] tabla;
 ALTER TABLE tabla ADD [COLUMN] col TIPO [DEFAULT v] [NOT NULL];  -- al final; no reescribe filas
 ALTER TABLE tabla MOVE COLUMN col {FIRST | BEFORE x | AFTER x};  -- reorden lógico (presentación)
@@ -39,7 +40,7 @@ CREATE TRIGGER [IF NOT EXISTS] t {BEFORE|AFTER} {INSERT|UPDATE|DELETE} ON tabla
 DROP TRIGGER [IF EXISTS] t;
 
 -- DML
-INSERT INTO tabla [(cols)] VALUES (expr, …)[, …]
+INSERT INTO tabla [(cols)] {VALUES (expr, …)[, …] | SELECT …}
   [ON CONFLICT [(cols)] DO {NOTHING | UPDATE SET col = expr [, …] [WHERE expr]}]
   [RETURNING lista | *];
 UPDATE tabla SET col = expr [, …] [WHERE expr] [RETURNING lista | *];
@@ -141,6 +142,12 @@ deben ser la **PK** del padre (referencia por rowid) o estar cubiertas por un í
 `UNIQUE`. Se comprueban en INSERT/UPDATE (el padre debe existir; FK `NULL` permitido);
 el DELETE/UPDATE del padre aplica la acción (RESTRICT por defecto: en `ON UPDATE` se
 comprueba antes de escribir, y CASCADE/SET NULL después). Auto-referencia (árboles) ok.
+
+**`UNIQUE`** (`col … UNIQUE` o `UNIQUE (c…)` de tabla, compuesta) crea un índice
+`UNIQUE` (sobre la PK es redundante y se omite). **`CHECK (expr)`** (de columna o de
+tabla) es un predicado que se evalúa por fila en INSERT/UPDATE; la fila se rechaza solo
+si el predicado da **FALSE** (NULL/TRUE pasan, semántica SQL). El texto del CHECK se
+guarda en el catálogo (esquema **v7**) y se re-parsea al comprobar.
 
 **Triggers** (`CREATE TRIGGER … {BEFORE|AFTER|INSTEAD OF} {INSERT|UPDATE|DELETE} ON t
 [FOR EACH {ROW|STATEMENT}] BEGIN … END`). El cuerpo son sentencias `INSERT`/`UPDATE`/

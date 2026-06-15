@@ -14,7 +14,8 @@ use crate::catalog::{
 use crate::error::{Error, Result};
 use crate::record::Value;
 use crate::sql::ast::{
-    AggFunc, BinOp, ColumnAst, Expr, JoinKind, SelectItem, SelectStmt, SetOp, Stmt, TableRef, UnOp,
+    AggFunc, BinOp, ColumnAst, Cte, Expr, JoinKind, SelectItem, SelectStmt, SetOp, Stmt, TableRef,
+    UnOp,
 };
 use crate::tx::{Snapshot, WriteTx};
 
@@ -1602,17 +1603,100 @@ fn run_with_ctes(src: &dyn DataSource, stmt: &SelectStmt, params: &[Value]) -> R
         ctes: Vec::new(),
     };
     for (i, cte) in stmt.with.iter().enumerate() {
-        let out = run_select(&overlay, &cte.query, params)?;
-        let def = synthetic_cte_def(&cte.name, &out.columns, i);
-        overlay.ctes.push(CteEntry {
-            name: cte.name.clone(),
-            def,
-            rows: out.rows,
-        });
+        if cte_is_recursive(cte) {
+            materialize_recursive(&mut overlay, cte, i, params)?;
+        } else {
+            let out = run_select(&overlay, &cte.query, params)?;
+            let def = synthetic_cte_def(&cte.name, &out.columns, i);
+            overlay.ctes.push(CteEntry {
+                name: cte.name.clone(),
+                def,
+                rows: out.rows,
+            });
+        }
     }
     let mut main = stmt.clone();
     main.with = Vec::new();
     run_select(&overlay, &main, params)
+}
+
+/// `true` si el cuerpo de la CTE se referencia a sí mismo (en una FROM/JOIN de la
+/// query o de sus núcleos compuestos) ⇒ recursiva.
+fn cte_is_recursive(cte: &Cte) -> bool {
+    fn refs(stmt: &SelectStmt, name: &str) -> bool {
+        let hit = |t: &TableRef| t.subquery.is_none() && t.name == name;
+        stmt.from.as_ref().is_some_and(hit)
+            || stmt.joins.iter().any(|j| hit(&j.table))
+            || stmt.compound.iter().any(|c| refs(&c.select, name))
+    }
+    refs(&cte.query, &cte.name)
+}
+
+/// Materializa una CTE recursiva por **punto fijo**: ejecuta la semilla, y luego
+/// repite el término recursivo (que ve la CTE = las filas del paso anterior) hasta
+/// que no salen filas nuevas. Forma soportada (v1): `semilla UNION [ALL] término`.
+fn materialize_recursive(
+    overlay: &mut CteSource,
+    cte: &Cte,
+    idx: usize,
+    params: &[Value],
+) -> Result<()> {
+    if cte.query.compound.len() != 1 {
+        return Err(sql_err(
+            "CTE recursiva: usa exactamente «semilla UNION [ALL] término»",
+        ));
+    }
+    let union_all = matches!(cte.query.compound[0].op, SetOp::UnionAll);
+    let recursive = cte.query.compound[0].select.clone();
+    // Semilla = el cuerpo sin el término recursivo y sin ORDER BY/LIMIT (esos van
+    // al SELECT externo, no a la recursión).
+    let mut seed_stmt = cte.query.clone();
+    seed_stmt.compound = Vec::new();
+    seed_stmt.order_by = Vec::new();
+    seed_stmt.limit = None;
+    seed_stmt.offset = None;
+
+    let seed = run_select(&*overlay, &seed_stmt, params)?;
+    let ncols = seed.columns.len();
+    let def = synthetic_cte_def(&cte.name, &seed.columns, idx);
+    let mut all_rows = seed.rows.clone();
+    overlay.ctes.push(CteEntry {
+        name: cte.name.clone(),
+        def,
+        rows: seed.rows,
+    });
+    let entry = overlay.ctes.len() - 1;
+    let mut working = all_rows.clone();
+
+    const MAX_ROWS: usize = 1_000_000; // guarda contra recursión sin caso base
+    loop {
+        overlay.ctes[entry].rows = working; // el término ve la CTE = el paso anterior
+        let step = run_select(&*overlay, &recursive, params)?;
+        if step.columns.len() != ncols {
+            return Err(sql_err(
+                "CTE recursiva: el término tiene distinto número de columnas que la semilla",
+            ));
+        }
+        let mut fresh = step.rows;
+        if !union_all {
+            fresh = dedup_preserving(fresh)
+                .into_iter()
+                .filter(|r| !all_rows.contains(r))
+                .collect();
+        }
+        if fresh.is_empty() {
+            break;
+        }
+        all_rows.extend(fresh.clone());
+        if all_rows.len() > MAX_ROWS {
+            return Err(sql_err(
+                "CTE recursiva: demasiadas filas (¿recursión sin caso base?)",
+            ));
+        }
+        working = fresh;
+    }
+    overlay.ctes[entry].rows = all_rows; // la CTE final = todo lo acumulado
+    Ok(())
 }
 
 // --- tablas derivadas: `FROM (SELECT …) AS x` (CTE anónima) ---

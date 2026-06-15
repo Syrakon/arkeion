@@ -659,6 +659,7 @@ impl<'a> Parser<'a> {
     /// una ve las anteriores). Se adjuntan al SELECT que las sigue.
     fn with_ctes(&mut self) -> Result<Vec<Cte>> {
         self.expect_kw(Kw::With, "WITH")?;
+        let _ = self.eat_kw(Kw::Recursive); // opcional; la recursión se detecta en exec
         let mut ctes = Vec::new();
         loop {
             let name = self.ident("un nombre de CTE")?;

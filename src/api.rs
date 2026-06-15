@@ -514,7 +514,7 @@ impl Connection {
                 Some(tx) => exec::run_execute(tx, stmt, params),
                 // Autocommit: o toda la sentencia, o nada.
                 None => {
-                    let mut tx = self.store.begin_on(&self.branch)?;
+                    let mut tx = self.store.begin_on_blocking(&self.branch)?;
                     let n = exec::run_execute(&mut tx, stmt, params)?;
                     tx.commit()?;
                     Ok(n)
@@ -617,7 +617,7 @@ impl Connection {
         let out = match self.open_tx.borrow_mut().as_mut() {
             Some(tx) => exec::run_returning(tx, stmt, params)?,
             None => {
-                let mut tx = self.store.begin_on(&self.branch)?;
+                let mut tx = self.store.begin_on_blocking(&self.branch)?;
                 let out = exec::run_returning(&mut tx, stmt, params)?;
                 tx.commit()?;
                 out
@@ -678,7 +678,7 @@ impl Connection {
                 "bulk_insert requiere autocommit: dentro de BEGIN usa INSERT",
             ));
         }
-        let mut tx = self.store.begin_on(&self.branch)?;
+        let mut tx = self.store.begin_on_blocking(&self.branch)?;
         let n = tx.insert_rows(table, rows)?;
         tx.commit()?;
         Ok(n)

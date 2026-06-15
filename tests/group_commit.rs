@@ -81,6 +81,29 @@ fn concurrent_durable_commits_all_persist_and_survive_reopen() {
     assert_eq!(audit.head, (total + 1) as u64);
 }
 
+/// El autocommit hace cola (bloquea) por el escritor, pero una transacción
+/// **explícita** conserva la semántica `Busy` (no bloquea): retiene el escritor un
+/// tiempo indefinido y no debe colgar a otros. Determinista: con una tx abierta el
+/// escritor está retenido.
+#[test]
+fn explicit_begin_still_returns_busy_while_a_transaction_holds_the_writer() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open(dir.path().join("busy.arkeion"), Options::default()).unwrap();
+    let a = db.connect().unwrap();
+    a.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)", &[])
+        .unwrap();
+
+    let tx = a.begin().unwrap(); // retiene el escritor único hasta commit/rollback
+
+    // Otra conexión: un BEGIN explícito NO bloquea, devuelve Busy de inmediato.
+    let b = db.connect().unwrap();
+    assert!(matches!(b.begin().err(), Some(Error::Busy)));
+
+    // Al soltar la tx, el escritor queda libre y ya se puede abrir otra.
+    drop(tx);
+    assert!(b.begin().is_ok());
+}
+
 fn first_i64(conn: &arkeion::Connection, sql: &str) -> i64 {
     match conn.query(sql, &[]).unwrap().next().unwrap().unwrap().get(0) {
         Ok(v) => v,

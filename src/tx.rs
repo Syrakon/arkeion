@@ -11,9 +11,8 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
 
@@ -146,6 +145,67 @@ pub struct VacuumReport {
 /// a ver un pager y un head descasados (un `data_root` de un archivo leído del
 /// otro). Los snapshots ya en vuelo siguen siendo dueños de su `Arc<Pager>`
 /// anterior, así que leen su archivo (el inodo viejo) hasta soltarse.
+/// Compuerta del **escritor único**: solo una transacción de escritura a la vez.
+/// El autocommit la adquiere **bloqueando** ([`acquire`](WriterGate::acquire) — cola:
+/// bajo contención los escritores esperan su turno en vez de girar reintentando
+/// `Busy`); las transacciones explícitas y las ops de mantenimiento usan
+/// [`try_acquire`](WriterGate::try_acquire) (no bloqueante → `Busy`), porque retienen
+/// el escritor un tiempo indefinido y no deben colgar a otros. Con group commit el
+/// turno dura microsegundos (el commit suelta el escritor antes del fsync).
+/// Tope de espera del autocommit por el escritor: normalmente el turno se sirve en
+/// microsegundos (la write-phase suelta el escritor antes del fsync); este tope solo
+/// salta ante un escritor atascado o una tx explícita retenida sin fin, devolviendo
+/// `Busy` en vez de colgar para siempre (como `busy_timeout` de SQLite).
+const WRITER_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(30);
+
+struct WriterGate {
+    held: Mutex<bool>,
+    cv: Condvar,
+}
+
+impl WriterGate {
+    fn new() -> WriterGate {
+        WriterGate {
+            held: Mutex::new(false),
+            cv: Condvar::new(),
+        }
+    }
+
+    /// Bloquea (encola) hasta adquirir el escritor o agotar `timeout`. `true` si lo
+    /// adquirió; `false` si expiró el tope (válvula de seguridad contra un escritor
+    /// atascado o una tx explícita retenida sin fin → el llamador recibe `Busy`).
+    fn acquire_timeout(&self, timeout: Duration) -> bool {
+        let held = self.held.lock().expect("compuerta del escritor envenenada");
+        let (mut held, _) = self
+            .cv
+            .wait_timeout_while(held, timeout, |h| *h)
+            .expect("compuerta del escritor envenenada");
+        if *held {
+            return false; // sigue ocupado tras el tope
+        }
+        *held = true;
+        true
+    }
+
+    /// No bloqueante: `true` si lo adquirió, `false` si estaba ocupado.
+    fn try_acquire(&self) -> bool {
+        let mut held = self.held.lock().expect("compuerta del escritor envenenada");
+        if *held {
+            false
+        } else {
+            *held = true;
+            true
+        }
+    }
+
+    /// Libera el escritor y despierta a un esperante (si lo hay).
+    fn release(&self) {
+        let mut held = self.held.lock().expect("compuerta del escritor envenenada");
+        *held = false;
+        self.cv.notify_one();
+    }
+}
+
 /// **Group commit** (líder-seguidor): agrupa los `fdatasync` de commits
 /// concurrentes en uno solo, sin debilitar la durabilidad. El commit que llega
 /// cuando no hay sello en curso se vuelve **líder** y lanza su fsync de inmediato
@@ -247,7 +307,7 @@ struct DbState {
 #[derive(Clone)]
 pub struct Store {
     state: Arc<Mutex<DbState>>,
-    writer: Arc<AtomicBool>,
+    writer: Arc<WriterGate>,
     /// Ruta del archivo: la necesita `vacuum` para el archivo temporal y el
     /// rename atómico (M9).
     path: PathBuf,
@@ -343,7 +403,7 @@ impl Store {
                 sync_group: Arc::new(SyncGroup::new(head.clone())),
                 head,
             })),
-            writer: Arc::new(AtomicBool::new(false)),
+            writer: Arc::new(WriterGate::new()),
             path: path.to_owned(),
             cache_pages,
         }
@@ -395,9 +455,27 @@ impl Store {
     /// curso (R3: no se bloquea, se informa); `BranchNotFound` si la rama no
     /// existe. Se libera al hacer commit o al soltarla (rollback).
     pub fn begin_on(&self, branch: &str) -> Result<WriteTx> {
-        if self.writer.swap(true, Ordering::Acquire) {
+        if !self.writer.try_acquire() {
             return Err(Error::Busy);
         }
+        self.build_writetx(branch)
+    }
+
+    /// Como [`begin_on`](Store::begin_on) pero **bloquea** (encola) hasta adquirir
+    /// el escritor único en vez de devolver `Busy`. Lo usa el **autocommit**: bajo
+    /// contención los escritores esperan su turno (la write-phase dura microsegundos
+    /// porque el commit suelta el escritor antes del fsync, ver group commit) en vez
+    /// de girar reintentando. Las transacciones explícitas siguen en `begin_on` (no
+    /// bloqueante): retienen el escritor un tiempo indefinido y no deben colgar a otros.
+    pub fn begin_on_blocking(&self, branch: &str) -> Result<WriteTx> {
+        if !self.writer.acquire_timeout(WRITER_ACQUIRE_TIMEOUT) {
+            return Err(Error::Busy);
+        }
+        self.build_writetx(branch)
+    }
+
+    /// Construye la `WriteTx` con el escritor **ya adquirido**; lo libera si falla.
+    fn build_writetx(&self, branch: &str) -> Result<WriteTx> {
         let (pager, sync_group, global) = {
             let st = self.lock();
             (st.pager.clone(), st.sync_group.clone(), st.head.clone())
@@ -405,7 +483,7 @@ impl Store {
         let bh = match resolve_branch_head(&pager, &global, branch) {
             Ok(bh) => bh,
             Err(e) => {
-                self.writer.store(false, Ordering::Release); // liberar el escritor
+                self.writer.release(); // liberar el escritor
                 return Err(e);
             }
         };
@@ -444,11 +522,11 @@ impl Store {
                 "nombre de rama vacío o de más de 64 bytes",
             ));
         }
-        if self.writer.swap(true, Ordering::Acquire) {
+        if !self.writer.try_acquire() {
             return Err(Error::Busy);
         }
         let result = self.create_branch_locked(name, from);
-        self.writer.store(false, Ordering::Release);
+        self.writer.release();
         result
     }
 
@@ -494,11 +572,11 @@ impl Store {
         if name == MAIN_BRANCH {
             return Err(Error::InvalidInput("no se puede borrar la rama principal"));
         }
-        if self.writer.swap(true, Ordering::Acquire) {
+        if !self.writer.try_acquire() {
             return Err(Error::Busy);
         }
         let result = self.drop_branch_locked(name);
-        self.writer.store(false, Ordering::Release);
+        self.writer.release();
         result
     }
 
@@ -623,11 +701,11 @@ impl Store {
     /// exactamente el diff y nada más (nuevo commit en `into`).
     pub fn merge(&self, from: &str, into: &str, policy: MergePolicy) -> Result<MergeReport> {
         let MergePolicy::FailOnConflict = policy; // v1: única política
-        if self.writer.swap(true, Ordering::Acquire) {
+        if !self.writer.try_acquire() {
             return Err(Error::Busy);
         }
         let result = self.merge_locked(from, into);
-        self.writer.store(false, Ordering::Release);
+        self.writer.release();
         result
     }
 
@@ -878,11 +956,11 @@ impl Store {
 
     fn run_vacuum(&self, retention: Retention, rekey: Rekey<'_>) -> Result<VacuumReport> {
         // `vacuum` es un escritor: `Busy` si hay una tx (u otro vacuum) en curso.
-        if self.writer.swap(true, Ordering::Acquire) {
+        if !self.writer.try_acquire() {
             return Err(Error::Busy);
         }
         let result = self.vacuum_locked(retention, rekey);
-        self.writer.store(false, Ordering::Release);
+        self.writer.release();
         result
     }
 
@@ -1537,7 +1615,7 @@ pub struct WriteTx {
     /// escritor único (este `writer`) impide que `vacuum` sustituya el pager
     /// mientras la tx vive, así que `pager` y `state.pager` coinciden al commit.
     state: Arc<Mutex<DbState>>,
-    writer: Arc<AtomicBool>,
+    writer: Arc<WriterGate>,
     /// Coordinador de group commit de la generación de pager en que empezó esta tx
     /// (ver [`SyncGroup`]). El commit suelta el escritor tras escribir y sella aquí,
     /// agrupando su fsync con otros committers concurrentes.
@@ -1613,7 +1691,7 @@ impl Drop for WriteTx {
         // retener el escritor durante el fsync agrupado; entonces `writer_released`
         // está puesto y aquí NO se vuelve a soltar (otro committer podría tenerlo).
         if !self.writer_released {
-            self.writer.store(false, Ordering::Release);
+            self.writer.release();
         }
     }
 }
@@ -2261,7 +2339,7 @@ impl WriteTx {
         // Suelta el escritor ANTES de sellar: así otro committer puede escribir sus
         // páginas mientras nuestro fsync está en vuelo, y un único fsync los cubre a
         // todos (group commit). El `Drop` ya no lo soltará.
-        self.writer.store(false, Ordering::Release);
+        self.writer.release();
         self.writer_released = true;
 
         // --- durability-phase (escritor ya libre) ---

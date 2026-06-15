@@ -211,6 +211,13 @@ assert!(db.verify()?.chain_ok);
 
 - `Database: Send + Sync` y barato de clonar; `Connection` por hilo (no `Sync`; `Send` sí).
 - Lecturas jamás bloquean ni son bloqueadas por la escritura en curso.
+- **Escritor único.** Las escrituras se serializan. El **autocommit** (`execute`/
+  `bulk_insert` fuera de transacción) **hace cola**: bajo contención espera su turno
+  (el turno dura microsegundos —el commit suelta el escritor antes del fsync, ver
+  *group commit*— y los fsync concurrentes se agrupan) y solo devuelve `Busy` si el
+  escritor sigue retenido tras un tope de seguridad. Una **transacción explícita**
+  (`begin()` / `BEGIN`) sí devuelve `Busy` de inmediato si hay otra escritura en
+  curso: retiene el escritor un tiempo indefinido y no debe colgar a otros.
 - `snapshot()` y las conexiones de rama comparten la misma caché de páginas del `Database`.
 - Toda lectura valida integridad (tag); `Corrupt`/`ChainBroken`/`WrongKey` son errores tipados,
   nunca datos silenciosamente malos.

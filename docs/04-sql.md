@@ -30,6 +30,8 @@ DROP TABLE [IF EXISTS] tabla;
 ALTER TABLE tabla ADD [COLUMN] col TIPO [DEFAULT v] [NOT NULL];  -- al final; no reescribe filas
 ALTER TABLE tabla MOVE COLUMN col {FIRST | BEFORE x | AFTER x};  -- reorden lógico (presentación)
 ALTER TABLE tabla REORDER COLUMNS (col, …);                     -- fija el orden lógico completo
+ALTER TABLE tabla RENAME [COLUMN] old TO new;                   -- solo metadato (nombre)
+ALTER TABLE tabla DROP [COLUMN] col;                            -- DROP lógico (tombstone), no reescribe filas
 CREATE VIEW [IF NOT EXISTS] vista AS <select>;                  -- SELECT con nombre (no recursiva)
 DROP VIEW [IF EXISTS] vista;
 CREATE TRIGGER [IF NOT EXISTS] t {BEFORE|AFTER} {INSERT|UPDATE|DELETE} ON tabla
@@ -64,7 +66,14 @@ filas y el time-travel queda intacto: un `AS OF` anterior al reorden ve el orden
 época (el orden de columnas se versiona en el mismo b-tree que los datos). El acceso
 por nombre, los índices y el `rowid_alias` son independientes del orden lógico. Es el
 modelo de `attlognum` que Postgres planeó y nunca envió; aquí sale gratis porque el
-catálogo ya es versionado. (DROP/RENAME COLUMN siguen fuera de v1.)
+catálogo ya es versionado.
+
+`RENAME COLUMN` solo cambia el nombre (metadato). `DROP COLUMN` es **lógico**
+(tombstone, estilo `attisdropped` de Postgres): marca la columna como borrada —deja
+de verse en `*` y de resolverse por nombre— pero **congela su posición física** y no
+reescribe filas, así que el time-travel queda intacto (un `AS OF` anterior la sigue
+viendo) y los bytes muertos los reclama el vacuum. No se puede borrar la PK, la última
+columna visible, ni una columna que esté en un índice o FK.
 
 Agregados: `COUNT(*)`, `COUNT(col)`, `SUM`, `AVG`, `MIN`, `MAX`, `GROUP_CONCAT(x[, sep])`.
 Admiten `DISTINCT` (`COUNT(DISTINCT x)`, `SUM(DISTINCT x)`, …). `SELECT DISTINCT`
@@ -182,7 +191,8 @@ SELECT * FROM facturas AS OF TIMESTAMP '2026-05-01T00:00:00Z';
 | Derivadas en `FROM` (`FROM (SELECT …)`) | v1.x |
 | `INTERSECT` / `EXCEPT` (`UNION [ALL]` sí) | v1.x |
 | Índices secundarios (`CREATE INDEX`) | hecho (v1.1) — espacio de claves `0x02` ya reservado en el formato |
-| `ALTER TABLE` salvo `ADD COLUMN` / `MOVE COLUMN` / `REORDER COLUMNS` (DROP/RENAME COLUMN) | v1.x |
+| `ALTER TABLE` físico (cambio de tipo, DROP físico que reescribe filas) | rompería el time-travel sin epoch por fila; `ADD`/`MOVE`/`REORDER`/`RENAME`/`DROP` (lógico) ✅ hechos |
+| `DROP COLUMN` que **recupera el espacio** al instante | el DROP lógico deja bytes muertos; el vacuum los reclama en una reescritura |
 | Optimizador de queries (CBO con estadísticas) | fuera de alcance; hay un planificador **determinista por reglas**: índice-vs-scan y *predicate pushdown* en JOINs |
 | FK: columna no-PK, composite, ON UPDATE | v1.x (v1: una columna → PK del padre, ON DELETE) |
 | Triggers `INSTEAD OF` / statement-level / cuerpo no-DML | v1.x (v1: row-level BEFORE/AFTER, cuerpo DML) |

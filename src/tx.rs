@@ -334,6 +334,7 @@ impl Store {
             enc_buf: Vec::new(),
             values_buf: Vec::new(),
             schema_cache: HashMap::new(),
+            trigger_cache: None,
             trigger_depth: 0,
             savepoints: Vec::new(),
         })
@@ -1472,6 +1473,13 @@ pub struct WriteTx {
     /// `Arc`: entregar el def cacheado es un bump de refcount, no un clone profundo
     /// de columnas e índices por sentencia (M10-perf, fase 2).
     schema_cache: HashMap<String, Arc<TableDef>>,
+    /// Caché de **todos** los triggers de la tx (raros y pequeños). `list_triggers`
+    /// escanea el catálogo; sin caché, un INSERT/UPDATE/DELETE-por-fila en un lote lo
+    /// paga 2× por sentencia **aunque no haya ningún trigger**. Se llena perezosamente
+    /// y se vacía solo cuando el catálogo de triggers cambia (crear/borrar trigger o
+    /// revertir a un savepoint); insertar/actualizar/borrar filas NO lo invalida.
+    /// `Arc`: filtrar la lista cacheada es un bump de refcount, no un re-escaneo.
+    trigger_cache: Option<Arc<Vec<catalog::TriggerDef>>>,
     /// Profundidad de triggers en curso (un trigger puede disparar otra escritura
     /// que dispare más triggers): guarda contra recursión infinita.
     trigger_depth: usize,
@@ -1553,6 +1561,7 @@ impl WriteTx {
     /// Crea un trigger.
     pub fn create_trigger(&mut self, t: &catalog::TriggerDef) -> Result<()> {
         self.data_root = catalog::create_trigger(&mut self.ts, self.data_root, t)?;
+        self.trigger_cache = None; // cambió el catálogo de triggers
         Ok(())
     }
 
@@ -1560,6 +1569,7 @@ impl WriteTx {
     pub fn drop_trigger(&mut self, name: &str) -> Result<bool> {
         let (root, dropped) = catalog::drop_trigger(&mut self.ts, self.data_root, name)?;
         self.data_root = root;
+        self.trigger_cache = None; // cambió el catálogo de triggers
         Ok(dropped)
     }
 
@@ -1567,16 +1577,34 @@ impl WriteTx {
         catalog::get_trigger(&self.ts, self.data_root, name)
     }
 
-    /// Triggers que casan con `(tabla, evento, momento)`, para disparar.
+    /// Todos los triggers de la tx, cacheados. La primera llamada escanea el catálogo;
+    /// las siguientes devuelven el `Arc` (un bump de refcount). Se invalida al cambiar
+    /// el catálogo de triggers (crear/borrar/rollback a savepoint).
+    fn all_triggers(&mut self) -> Result<Arc<Vec<catalog::TriggerDef>>> {
+        if let Some(t) = &self.trigger_cache {
+            return Ok(t.clone());
+        }
+        let all = Arc::new(catalog::list_triggers(&self.ts, self.data_root)?);
+        self.trigger_cache = Some(all.clone());
+        Ok(all)
+    }
+
+    /// Triggers que casan con `(tabla, evento, momento)`, para disparar. Filtra la
+    /// lista cacheada; el caso común (sin triggers) ni escanea el catálogo ni asigna.
     pub fn triggers_for(
-        &self,
+        &mut self,
         table: &str,
         event: catalog::TriggerEvent,
         timing: catalog::TriggerTiming,
     ) -> Result<Vec<catalog::TriggerDef>> {
-        Ok(catalog::list_triggers(&self.ts, self.data_root)?
-            .into_iter()
+        let all = self.all_triggers()?;
+        if all.is_empty() {
+            return Ok(Vec::new());
+        }
+        Ok(all
+            .iter()
             .filter(|t| t.table == table && t.event == event && t.timing == timing)
+            .cloned()
             .collect())
     }
 
@@ -1631,6 +1659,7 @@ impl WriteTx {
         self.ts.alloc_next = alloc_next;
         self.ts.append_cursor = None; // el cursor de append pudo quedar obsoleto
         self.schema_cache.clear(); // el esquema pudo cambiar desde el savepoint
+        self.trigger_cache = None; // pudieron crearse/borrarse triggers desde el savepoint
         self.savepoints.truncate(pos + 1); // conserva el savepoint, quita los internos
         Ok(())
     }

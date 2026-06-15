@@ -793,23 +793,28 @@ fn run_insert(
             &select_rows
         }
     };
-    // Escribir en una vista: lo gestiona un trigger INSTEAD OF (la vista no almacena).
-    if tx.table(table)?.is_none() && tx.view(table)?.is_some() {
-        if returning.is_some() || on_conflict.is_some() {
-            return Err(sql_err(
-                "RETURNING / ON CONFLICT no se admiten al escribir en una vista",
-            ));
+    // Resolver el esquema con la versión **cacheada**: un INSERT-por-fila en un lote
+    // no re-desciende el catálogo por cada sentencia (el esquema no cambia entre
+    // filas). Si no es una tabla, puede ser una vista (la escritura la atiende un
+    // trigger INSTEAD OF); solo entonces se consulta el catálogo de vistas — antes se
+    // decodificaba la tabla SIN cachear en cada sentencia solo para descartar la vista.
+    let def = match tx.table_cached(table)? {
+        Some(def) => def,
+        None => {
+            if tx.view(table)?.is_some() {
+                if returning.is_some() || on_conflict.is_some() {
+                    return Err(sql_err(
+                        "RETURNING / ON CONFLICT no se admiten al escribir en una vista",
+                    ));
+                }
+                return Ok((
+                    run_instead_of_insert(tx, table, columns, rows, params)?,
+                    None,
+                ));
+            }
+            return Err(sql_err(format!("tabla desconocida: {table}")));
         }
-        return Ok((
-            run_instead_of_insert(tx, table, columns, rows, params)?,
-            None,
-        ));
-    }
-    // `table_cached`: un INSERT-por-fila en un lote no re-desciende el catálogo por
-    // cada sentencia (el esquema no cambia entre filas).
-    let def = tx
-        .table_cached(table)?
-        .ok_or_else(|| sql_err(format!("tabla desconocida: {table}")))?;
+    };
     let (ins_before_row, before_stmt) =
         split_for_each(tx.triggers_for(&def.name, TriggerEvent::Insert, TriggerTiming::Before)?);
     let (ins_after_row, after_stmt) =
@@ -825,9 +830,12 @@ fn run_insert(
     } else {
         Vec::new()
     });
-    // Predicados CHECK (parseados una vez; evaluados por fila antes de escribir).
+    // Predicados CHECK (parseados una vez; evaluados por fila antes de escribir). El
+    // esquema para evaluarlos solo se construye si HAY checks: clonar el `TableDef`
+    // por sentencia para nada hundía el INSERT-por-fila en lote (los valores se
+    // calculan posicionalmente con `def`, sin esquema).
     let checks = parse_checks(&def)?;
-    let check_schema = QuerySchema::single(table, (*def).clone());
+    let check_schema = (!checks.is_empty()).then(|| QuerySchema::single(table, (*def).clone()));
     fire(tx, &def, &before_stmt, None, None)?; // BEFORE … FOR EACH STATEMENT
     // La fila NEW (con el rowid asignado) solo se necesita para AFTER INSERT o RETURNING.
     let want_new = !ins_after_row.is_empty() || returning.is_some();
@@ -867,7 +875,9 @@ fn run_insert(
                 }
             }
         }
-        check_row(&checks, &check_schema, &values, params)?; // CHECK antes de insertar
+        if let Some(schema) = &check_schema {
+            check_row(&checks, schema, &values, params)?; // CHECK antes de insertar
+        }
         fire(tx, &def, &ins_before_row, None, Some(&values))?; // BEFORE INSERT
         let rowid = tx.insert_row(&def, &values)?;
         if want_new {
@@ -974,18 +984,23 @@ fn run_update(
     params: &[Value],
     returning: Option<&[SelectItem]>,
 ) -> Result<(usize, Option<SelectOut>)> {
-    if tx.table(table)?.is_none() && tx.view(table)?.is_some() {
-        if returning.is_some() {
-            return Err(sql_err("RETURNING no se admite al escribir en una vista"));
+    // Esquema cacheado (ver `run_insert`): nada de decodificar la tabla sin cachear
+    // por sentencia solo para descartar el caso «vista».
+    let def = match tx.table_cached(table)? {
+        Some(def) => def,
+        None => {
+            if tx.view(table)?.is_some() {
+                if returning.is_some() {
+                    return Err(sql_err("RETURNING no se admite al escribir en una vista"));
+                }
+                return Ok((
+                    run_instead_of_update(tx, table, sets, where_clause, params)?,
+                    None,
+                ));
+            }
+            return Err(sql_err(format!("tabla desconocida: {table}")));
         }
-        return Ok((
-            run_instead_of_update(tx, table, sets, where_clause, params)?,
-            None,
-        ));
-    }
-    let def = tx
-        .table_cached(table)?
-        .ok_or_else(|| sql_err(format!("tabla desconocida: {table}")))?;
+    };
     let schema = QuerySchema::single(table, (*def).clone());
 
     // Resolver SET y validar el WHERE antes de tocar filas. Reasignar el
@@ -1054,18 +1069,23 @@ fn run_delete(
     params: &[Value],
     returning: Option<&[SelectItem]>,
 ) -> Result<(usize, Option<SelectOut>)> {
-    if tx.table(table)?.is_none() && tx.view(table)?.is_some() {
-        if returning.is_some() {
-            return Err(sql_err("RETURNING no se admite al escribir en una vista"));
+    // Esquema cacheado (ver `run_insert`): nada de decodificar la tabla sin cachear
+    // por sentencia solo para descartar el caso «vista».
+    let def = match tx.table_cached(table)? {
+        Some(def) => def,
+        None => {
+            if tx.view(table)?.is_some() {
+                if returning.is_some() {
+                    return Err(sql_err("RETURNING no se admite al escribir en una vista"));
+                }
+                return Ok((
+                    run_instead_of_delete(tx, table, where_clause, params)?,
+                    None,
+                ));
+            }
+            return Err(sql_err(format!("tabla desconocida: {table}")));
         }
-        return Ok((
-            run_instead_of_delete(tx, table, where_clause, params)?,
-            None,
-        ));
-    }
-    let def = tx
-        .table_cached(table)?
-        .ok_or_else(|| sql_err(format!("tabla desconocida: {table}")))?;
+    };
     let schema = QuerySchema::single(table, (*def).clone());
     if let Some(cond) = where_clause {
         no_aggregates(cond, "WHERE")?;

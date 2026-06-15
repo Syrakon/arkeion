@@ -1,0 +1,88 @@
+-- Funciones de ventana: func(args) OVER ([PARTITION BY …] [ORDER BY …]).
+
+> CREATE TABLE sales (id INTEGER PRIMARY KEY, region TEXT, amt INTEGER);
+ok
+
+> INSERT INTO sales (region, amt) VALUES ('n', 10), ('n', 30), ('n', 20), ('s', 5), ('s', 15);
+affected 5
+
+-- ROW_NUMBER por partición, ordenado.
+> SELECT region, amt, row_number() OVER (PARTITION BY region ORDER BY amt) AS rn FROM sales ORDER BY region, amt;
+n|10|1
+n|20|2
+n|30|3
+s|5|1
+s|15|2
+
+-- RANK y DENSE_RANK con empates.
+> CREATE TABLE scores (id INTEGER PRIMARY KEY, p INTEGER);
+ok
+
+> INSERT INTO scores (p) VALUES (100), (90), (90), (80);
+affected 4
+
+> SELECT p, rank() OVER (ORDER BY p DESC) AS r, dense_rank() OVER (ORDER BY p DESC) AS dr FROM scores ORDER BY p DESC;
+100|1|1
+90|2|2
+90|2|2
+80|4|3
+
+-- Agregados como ventana: suma acumulada (con ORDER BY) y total (sin ORDER BY).
+> SELECT region, amt, sum(amt) OVER (PARTITION BY region ORDER BY amt) AS running, sum(amt) OVER (PARTITION BY region) AS total FROM sales ORDER BY region, amt;
+n|10|10|60
+n|20|30|60
+n|30|60|60
+s|5|5|20
+s|15|20|20
+
+-- COUNT(*) OVER y AVG OVER (toda la partición).
+> SELECT region, count(*) OVER (PARTITION BY region) AS cnt, avg(amt) OVER (PARTITION BY region) AS a FROM sales ORDER BY region, amt;
+n|3|20.0
+n|3|20.0
+n|3|20.0
+s|2|10.0
+s|2|10.0
+
+-- LAG y LEAD (global, por orden de amt).
+> SELECT amt, lag(amt) OVER (ORDER BY amt) AS prev, lead(amt) OVER (ORDER BY amt) AS next FROM sales ORDER BY amt;
+5|NULL|10
+10|5|15
+15|10|20
+20|15|30
+30|20|NULL
+
+-- LAG con desplazamiento y valor por defecto.
+> SELECT amt, lag(amt, 2, -1) OVER (ORDER BY amt) AS prev2 FROM sales ORDER BY amt;
+5|-1
+10|-1
+15|5
+20|10
+30|15
+
+-- FIRST_VALUE (constante en la partición) y LAST_VALUE (marco por defecto = fila actual).
+> SELECT region, amt, first_value(amt) OVER (PARTITION BY region ORDER BY amt) AS fv, last_value(amt) OVER (PARTITION BY region ORDER BY amt) AS lv FROM sales ORDER BY region, amt;
+n|10|10|10
+n|20|10|20
+n|30|10|30
+s|5|5|5
+s|15|5|15
+
+-- NTILE reparte en cubos.
+> SELECT amt, ntile(2) OVER (ORDER BY amt) AS bucket FROM sales ORDER BY amt;
+5|1
+10|1
+15|1
+20|2
+30|2
+
+-- Compone con aritmética.
+> SELECT amt, row_number() OVER (ORDER BY amt) * 10 AS rn10 FROM sales ORDER BY amt;
+5|10
+10|20
+15|30
+20|40
+30|50
+
+-- Una ventana en WHERE no se permite.
+> SELECT amt FROM sales WHERE row_number() OVER (ORDER BY amt) = 1;
+error ventana

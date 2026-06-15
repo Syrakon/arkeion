@@ -281,6 +281,25 @@ pub enum AggFunc {
     GroupConcat,
 }
 
+/// Función de ventana (`… OVER (…)`). Las de ranking/posición y las agregadas
+/// reusadas como ventana.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WindowFunc {
+    RowNumber,
+    Rank,
+    DenseRank,
+    Ntile,
+    Lag,
+    Lead,
+    FirstValue,
+    LastValue,
+    Sum,
+    Count,
+    Avg,
+    Min,
+    Max,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum Expr {
     Literal(Value),
@@ -350,6 +369,15 @@ pub enum Expr {
         query: Box<SelectStmt>,
         negated: bool,
     },
+    /// Función de **ventana**: `func(args) OVER ([PARTITION BY …] [ORDER BY …])`.
+    /// Se evalúa sobre el conjunto de filas (tras `WHERE`), particionado y ordenado;
+    /// no es un agregado de grupo. `args` vacío para `ROW_NUMBER()`/`COUNT(*)`.
+    Window {
+        func: WindowFunc,
+        args: Vec<Expr>,
+        partition_by: Vec<Expr>,
+        order_by: Vec<OrderBy>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -400,8 +428,11 @@ impl Expr {
                     && whens.iter().all(|(c, r)| c.is_const() && r.is_const())
                     && else_.as_ref().is_none_or(|e| e.is_const())
             }
-            // Una subconsulta depende de los datos: no es constante.
-            Expr::ScalarSubquery(_) | Expr::Exists(_) | Expr::InSubquery { .. } => false,
+            // Una subconsulta o ventana depende de los datos: no es constante.
+            Expr::ScalarSubquery(_)
+            | Expr::Exists(_)
+            | Expr::InSubquery { .. }
+            | Expr::Window { .. } => false,
         }
     }
 
@@ -432,6 +463,12 @@ impl Expr {
             }
             // Las subconsultas no aparecen en contextos con parámetros enlazados.
             Expr::ScalarSubquery(_) | Expr::Exists(_) | Expr::InSubquery { .. } => false,
+            Expr::Window {
+                args, partition_by, ..
+            } => {
+                args.iter().any(Expr::contains_param)
+                    || partition_by.iter().any(Expr::contains_param)
+            }
         }
     }
 
@@ -460,6 +497,34 @@ impl Expr {
                     || else_.as_ref().is_some_and(|e| e.has_aggregate())
             }
             // Un agregado dentro de la subconsulta es de su propio ámbito.
+            Expr::ScalarSubquery(_) | Expr::Exists(_) | Expr::InSubquery { .. } => false,
+            // Una ventana NO es un agregado de grupo: la maneja su propio camino.
+            Expr::Window { .. } => false,
+        }
+    }
+
+    /// `true` si la expresión contiene alguna función de ventana (`… OVER (…)`).
+    pub fn has_window(&self) -> bool {
+        match self {
+            Expr::Window { .. } => true,
+            Expr::Literal(_) | Expr::Column { .. } | Expr::Param(_) => false,
+            Expr::Unary(_, e) => e.has_window(),
+            Expr::Binary(a, _, b) => a.has_window() || b.has_window(),
+            Expr::IsNull { expr, .. } => expr.has_window(),
+            Expr::Like { expr, pattern, .. } => expr.has_window() || pattern.has_window(),
+            Expr::Aggregate { arg, .. } => arg.as_ref().is_some_and(|e| e.has_window()),
+            Expr::Function { args, .. } => args.iter().any(Expr::has_window),
+            Expr::In { expr, list, .. } => expr.has_window() || list.iter().any(Expr::has_window),
+            Expr::Cast { expr, .. } => expr.has_window(),
+            Expr::Case {
+                operand,
+                whens,
+                else_,
+            } => {
+                operand.as_ref().is_some_and(|o| o.has_window())
+                    || whens.iter().any(|(c, r)| c.has_window() || r.has_window())
+                    || else_.as_ref().is_some_and(|e| e.has_window())
+            }
             Expr::ScalarSubquery(_) | Expr::Exists(_) | Expr::InSubquery { .. } => false,
         }
     }

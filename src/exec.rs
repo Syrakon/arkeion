@@ -16,7 +16,7 @@ use crate::error::{Error, Result};
 use crate::record::Value;
 use crate::sql::ast::{
     AggFunc, BinOp, ColumnAst, Cte, Expr, JoinKind, OnConflict, SelectItem, SelectStmt, SetOp,
-    Stmt, TableRef, UnOp,
+    Stmt, TableRef, UnOp, WindowFunc,
 };
 use crate::sql::json;
 use crate::tx::{Snapshot, WriteTx};
@@ -265,6 +265,20 @@ fn validate_columns(e: &Expr, schema: &QuerySchema) -> Result<()> {
         // solo la parte externa del `IN`.
         Expr::ScalarSubquery(_) | Expr::Exists(_) => Ok(()),
         Expr::InSubquery { expr, .. } => validate_columns(expr, schema),
+        Expr::Window {
+            args,
+            partition_by,
+            order_by,
+            ..
+        } => {
+            for a in args.iter().chain(partition_by) {
+                validate_columns(a, schema)?;
+            }
+            for o in order_by {
+                schema.resolve(o.table.as_deref(), &o.column)?;
+            }
+            Ok(())
+        }
     }
 }
 
@@ -1236,6 +1250,17 @@ fn subst_expr(
             else_: opt(else_)?,
         },
         Expr::ScalarSubquery(_) | Expr::Exists(_) | Expr::InSubquery { .. } => e.clone(),
+        Expr::Window {
+            func,
+            args,
+            partition_by,
+            order_by,
+        } => Expr::Window {
+            func: *func,
+            args: args.iter().map(r).collect::<Result<_>>()?,
+            partition_by: partition_by.iter().map(r).collect::<Result<_>>()?,
+            order_by: order_by.clone(),
+        },
     })
 }
 
@@ -1684,6 +1709,16 @@ pub fn run_select(src: &impl DataSource, stmt: &SelectStmt, params: &[Value]) ->
     }
     if stmt.having.is_some() {
         return Err(sql_err("HAVING requiere GROUP BY o agregados"));
+    }
+
+    // Funciones de ventana en la proyección: camino propio (calculan sobre el
+    // conjunto filtrado, particionado y ordenado, antes del ORDER BY/LIMIT externo).
+    if stmt
+        .projection
+        .iter()
+        .any(|it| matches!(it, SelectItem::Expr { expr, .. } if expr.has_window()))
+    {
+        return run_windowed(stmt, &schema, rows, params);
     }
 
     if !stmt.order_by.is_empty() {
@@ -2321,6 +2356,9 @@ fn expr_has_subquery(e: &Expr) -> bool {
                     .any(|(c, r)| expr_has_subquery(c) || expr_has_subquery(r))
                 || else_.as_deref().is_some_and(expr_has_subquery)
         }
+        Expr::Window {
+            args, partition_by, ..
+        } => args.iter().any(expr_has_subquery) || partition_by.iter().any(expr_has_subquery),
     }
 }
 
@@ -2406,6 +2444,19 @@ fn expr_refs_quals(e: &Expr, quals: &HashSet<String>) -> bool {
         Expr::ScalarSubquery(q) | Expr::Exists(q) => stmt_refs_quals(q, quals),
         Expr::InSubquery { expr, query, .. } => {
             expr_refs_quals(expr, quals) || stmt_refs_quals(query, quals)
+        }
+        Expr::Window {
+            args,
+            partition_by,
+            order_by,
+            ..
+        } => {
+            args.iter()
+                .chain(partition_by)
+                .any(|x| expr_refs_quals(x, quals))
+                || order_by
+                    .iter()
+                    .any(|o| o.table.as_deref().is_some_and(|q| quals.contains(q)))
         }
     }
 }
@@ -2564,6 +2615,17 @@ fn resolve_expr(
                 .collect::<Result<_>>()?,
             else_: opt(else_)?,
         },
+        Expr::Window {
+            func,
+            args,
+            partition_by,
+            order_by,
+        } => Expr::Window {
+            func: *func,
+            args: args.iter().map(res).collect::<Result<_>>()?,
+            partition_by: partition_by.iter().map(res).collect::<Result<_>>()?,
+            order_by: order_by.clone(),
+        },
     })
 }
 
@@ -2653,6 +2715,17 @@ fn subst_outer_expr(e: &Expr, schema: &QuerySchema, row: &[Value]) -> Result<Exp
             expr: b(expr)?,
             query: Box::new(subst_outer_stmt(query, schema, row)?),
             negated: *negated,
+        },
+        Expr::Window {
+            func,
+            args,
+            partition_by,
+            order_by,
+        } => Expr::Window {
+            func: *func,
+            args: args.iter().map(r).collect::<Result<_>>()?,
+            partition_by: partition_by.iter().map(r).collect::<Result<_>>()?,
+            order_by: order_by.clone(),
         },
     })
 }
@@ -2784,6 +2857,17 @@ fn resolve_correlated_expr(
                 .map(|(c, r)| Ok((rec(c)?, rec(r)?)))
                 .collect::<Result<_>>()?,
             else_: opt(else_)?,
+        },
+        Expr::Window {
+            func,
+            args,
+            partition_by,
+            order_by,
+        } => Expr::Window {
+            func: *func,
+            args: args.iter().map(rec).collect::<Result<_>>()?,
+            partition_by: partition_by.iter().map(rec).collect::<Result<_>>()?,
+            order_by: order_by.clone(),
         },
     })
 }
@@ -3298,6 +3382,8 @@ fn col_outside_agg(e: &Expr) -> Option<&str> {
             .or_else(|| else_.as_deref().and_then(col_outside_agg)),
         Expr::ScalarSubquery(_) | Expr::Exists(_) => None,
         Expr::InSubquery { expr, .. } => col_outside_agg(expr),
+        // Las ventanas no conviven con GROUP BY (se rechazan antes); por completitud.
+        Expr::Window { .. } => None,
     }
 }
 
@@ -3354,6 +3440,13 @@ fn collect_columns(e: &Expr, skip_agg: bool, out: &mut Vec<ColRef>) {
         // El cuerpo de una subconsulta es otro ámbito; solo cuenta la parte externa.
         Expr::ScalarSubquery(_) | Expr::Exists(_) => {}
         Expr::InSubquery { expr, .. } => collect_columns(expr, skip_agg, out),
+        Expr::Window {
+            args, partition_by, ..
+        } => {
+            args.iter()
+                .chain(partition_by)
+                .for_each(|x| collect_columns(x, skip_agg, out));
+        }
     }
 }
 
@@ -3498,6 +3591,497 @@ fn run_grouped(
     })
 }
 
+// --- funciones de ventana (OVER) ---
+
+/// Ejecuta un SELECT con funciones de ventana en la proyección. Las ventanas se
+/// calculan sobre `rows` (el conjunto ya filtrado), particionadas por
+/// `PARTITION BY` y ordenadas por el `ORDER BY` de cada `OVER`; luego la
+/// proyección sustituye cada ventana por su valor de fila y se aplican
+/// `DISTINCT`/`ORDER BY` externos y `LIMIT`.
+fn run_windowed(
+    stmt: &SelectStmt,
+    schema: &QuerySchema,
+    rows: Vec<Vec<Value>>,
+    params: &[Value],
+) -> Result<SelectOut> {
+    // Validar columnas y recolectar las expresiones de ventana DISTINTAS.
+    let mut windows: Vec<&Expr> = Vec::new();
+    for item in &stmt.projection {
+        if let SelectItem::Expr { expr, .. } = item {
+            validate_columns(expr, schema)?;
+            collect_windows(expr, &mut windows);
+        }
+    }
+    // Calcular cada ventana → una columna de valores (uno por fila de `rows`).
+    let computed: Vec<Vec<Value>> = windows
+        .iter()
+        .map(|w| compute_window(w, schema, &rows, params))
+        .collect::<Result<_>>()?;
+
+    // Mapa de expansión de `*` (orden lógico, sin columnas borradas).
+    let mut star_map: Vec<usize> = Vec::new();
+    let mut base = 0;
+    for t in &schema.tables {
+        for &phys in &t.def.logical_order {
+            if !t.def.columns[phys].dropped {
+                star_map.push(base + phys);
+            }
+        }
+        base += t.def.columns.len();
+    }
+
+    // Nombres de columnas de salida.
+    let mut columns = Vec::new();
+    for (i, item) in stmt.projection.iter().enumerate() {
+        match item {
+            SelectItem::Star => {
+                for t in &schema.tables {
+                    for &phys in &t.def.logical_order {
+                        if !t.def.columns[phys].dropped {
+                            columns.push(t.def.columns[phys].name.clone());
+                        }
+                    }
+                }
+            }
+            SelectItem::Expr { alias: Some(a), .. } => columns.push(a.clone()),
+            SelectItem::Expr {
+                expr: Expr::Column { name, .. },
+                ..
+            } => columns.push(name.clone()),
+            SelectItem::Expr { .. } => columns.push(format!("col{}", i + 1)),
+        }
+    }
+
+    // Proyectar: por fila, sustituir las ventanas por su literal y evaluar.
+    let mut out_rows = Vec::with_capacity(rows.len());
+    for (i, row) in rows.iter().enumerate() {
+        let mut out = Vec::with_capacity(columns.len());
+        for item in &stmt.projection {
+            match item {
+                SelectItem::Star => out.extend(star_map.iter().map(|&p| row[p].clone())),
+                SelectItem::Expr { expr, .. } => {
+                    let e = subst_windows(expr, &windows, &computed, i);
+                    out.push(eval(&e, Some((schema, row)), params)?);
+                }
+            }
+        }
+        out_rows.push(out);
+    }
+
+    // ORDER BY externo: por columna de SALIDA (alias/proyección) o por una columna
+    // de tabla del esquema (que sigue disponible en `rows`, en paralelo a `out_rows`).
+    if !stmt.order_by.is_empty() {
+        enum Key {
+            Out(usize),
+            Schema(usize),
+        }
+        let mut keys: Vec<(Key, bool)> = Vec::new();
+        for o in &stmt.order_by {
+            if let Some(idx) = columns.iter().position(|c| c == &o.column) {
+                keys.push((Key::Out(idx), o.desc));
+            } else {
+                let idx = schema.resolve(o.table.as_deref(), &o.column)?;
+                keys.push((Key::Schema(idx), o.desc));
+            }
+        }
+        let mut order: Vec<usize> = (0..out_rows.len()).collect();
+        let mut first_err: Option<Error> = None;
+        order.sort_by(|&a, &b| {
+            for (k, desc) in &keys {
+                let (va, vb) = match k {
+                    Key::Out(i) => (&out_rows[a][*i], &out_rows[b][*i]),
+                    Key::Schema(i) => (&rows[a][*i], &rows[b][*i]),
+                };
+                match cmp_nulls_first(va, vb) {
+                    Ok(Ordering::Equal) => continue,
+                    Ok(o) => return if *desc { o.reverse() } else { o },
+                    Err(e) => {
+                        first_err.get_or_insert(e);
+                        return Ordering::Equal;
+                    }
+                }
+            }
+            Ordering::Equal
+        });
+        if let Some(e) = first_err {
+            return Err(e);
+        }
+        out_rows = order.into_iter().map(|i| out_rows[i].clone()).collect();
+    }
+    if stmt.distinct {
+        out_rows = dedup_preserving(out_rows);
+    }
+    let out_rows = limit_offset(out_rows, stmt, params)?;
+    Ok(SelectOut {
+        columns,
+        rows: out_rows,
+    })
+}
+
+/// Recolecta (sin repetir) los nodos `Window` de `e`.
+fn collect_windows<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>) {
+    match e {
+        Expr::Window { .. } if !out.iter().any(|w| **w == *e) => out.push(e),
+        Expr::Window { .. } => {}
+        Expr::Unary(_, x) | Expr::IsNull { expr: x, .. } | Expr::Cast { expr: x, .. } => {
+            collect_windows(x, out)
+        }
+        Expr::Binary(a, _, b)
+        | Expr::Like {
+            expr: a,
+            pattern: b,
+            ..
+        } => {
+            collect_windows(a, out);
+            collect_windows(b, out);
+        }
+        Expr::Function { args, .. } => args.iter().for_each(|a| collect_windows(a, out)),
+        Expr::In { expr, list, .. } => {
+            collect_windows(expr, out);
+            list.iter().for_each(|x| collect_windows(x, out));
+        }
+        Expr::Case {
+            operand,
+            whens,
+            else_,
+        } => {
+            if let Some(o) = operand {
+                collect_windows(o, out);
+            }
+            for (c, r) in whens {
+                collect_windows(c, out);
+                collect_windows(r, out);
+            }
+            if let Some(x) = else_ {
+                collect_windows(x, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Sustituye cada nodo `Window` de `e` por el literal precalculado para la fila `i`.
+fn subst_windows(e: &Expr, windows: &[&Expr], col: &[Vec<Value>], i: usize) -> Expr {
+    if matches!(e, Expr::Window { .. }) {
+        if let Some(idx) = windows.iter().position(|w| **w == *e) {
+            return Expr::Literal(col[idx][i].clone());
+        }
+        return e.clone();
+    }
+    let r = |x: &Expr| subst_windows(x, windows, col, i);
+    let b = |x: &Expr| Box::new(r(x));
+    match e {
+        Expr::Unary(op, x) => Expr::Unary(*op, b(x)),
+        Expr::Binary(a, op, c) => Expr::Binary(b(a), *op, b(c)),
+        Expr::IsNull { expr, negated } => Expr::IsNull {
+            expr: b(expr),
+            negated: *negated,
+        },
+        Expr::Like {
+            expr,
+            pattern,
+            negated,
+        } => Expr::Like {
+            expr: b(expr),
+            pattern: b(pattern),
+            negated: *negated,
+        },
+        Expr::Function { name, args } => Expr::Function {
+            name: name.clone(),
+            args: args.iter().map(r).collect(),
+        },
+        Expr::In {
+            expr,
+            list,
+            negated,
+        } => Expr::In {
+            expr: b(expr),
+            list: list.iter().map(r).collect(),
+            negated: *negated,
+        },
+        Expr::Cast { expr, to } => Expr::Cast {
+            expr: b(expr),
+            to: *to,
+        },
+        Expr::Case {
+            operand,
+            whens,
+            else_,
+        } => Expr::Case {
+            operand: operand.as_deref().map(b),
+            whens: whens.iter().map(|(c, rr)| (r(c), r(rr))).collect(),
+            else_: else_.as_deref().map(b),
+        },
+        other => other.clone(),
+    }
+}
+
+/// Calcula una función de ventana sobre todas las filas: devuelve un valor por
+/// fila (en el orden original de `rows`).
+fn compute_window(
+    w: &Expr,
+    schema: &QuerySchema,
+    rows: &[Vec<Value>],
+    params: &[Value],
+) -> Result<Vec<Value>> {
+    let Expr::Window {
+        func,
+        args,
+        partition_by,
+        order_by,
+    } = w
+    else {
+        unreachable!("compute_window recibe un Window")
+    };
+    let mut result = vec![Value::Null; rows.len()];
+
+    // Particionar los índices de fila por la clave de PARTITION BY.
+    let mut parts: Vec<Vec<usize>> = Vec::new();
+    let mut pindex: std::collections::HashMap<Vec<u8>, usize> = std::collections::HashMap::new();
+    for (i, row) in rows.iter().enumerate() {
+        let key: Vec<Value> = partition_by
+            .iter()
+            .map(|e| eval(e, Some((schema, row)), params))
+            .collect::<Result<_>>()?;
+        let kb = crate::record::encode_values(&key);
+        let pi = *pindex.entry(kb).or_insert_with(|| {
+            parts.push(Vec::new());
+            parts.len() - 1
+        });
+        parts[pi].push(i);
+    }
+
+    // Índices de columna del ORDER BY de la ventana.
+    let order_idx: Vec<(usize, bool)> = order_by
+        .iter()
+        .map(|o| Ok((schema.resolve(o.table.as_deref(), &o.column)?, o.desc)))
+        .collect::<Result<_>>()?;
+
+    for part in &mut parts {
+        // Ordenar los índices de la partición por el ORDER BY de la ventana (estable).
+        if !order_idx.is_empty() {
+            let mut err: Option<Error> = None;
+            part.sort_by(|&a, &b| {
+                for (idx, desc) in &order_idx {
+                    match cmp_nulls_first(&rows[a][*idx], &rows[b][*idx]) {
+                        Ok(Ordering::Equal) => continue,
+                        Ok(o) => return if *desc { o.reverse() } else { o },
+                        Err(e) => {
+                            err.get_or_insert(e);
+                            return Ordering::Equal;
+                        }
+                    }
+                }
+                Ordering::Equal
+            });
+            if let Some(e) = err {
+                return Err(e);
+            }
+        }
+        window_partition(
+            *func,
+            args,
+            &order_idx,
+            part,
+            schema,
+            rows,
+            params,
+            &mut result,
+        )?;
+    }
+    Ok(result)
+}
+
+/// Aplica la función de ventana dentro de UNA partición ya ordenada (`part` son
+/// los índices de fila en orden de ventana), escribiendo en `result`.
+#[allow(clippy::too_many_arguments)]
+fn window_partition(
+    func: WindowFunc,
+    args: &[Expr],
+    order_idx: &[(usize, bool)],
+    part: &[usize],
+    schema: &QuerySchema,
+    rows: &[Vec<Value>],
+    params: &[Value],
+    result: &mut [Value],
+) -> Result<()> {
+    let m = part.len();
+    let has_order = !order_idx.is_empty();
+    // El argumento de valor (LAG/LEAD/FIRST/LAST/SUM/…) es `args[0]`.
+    let arg0 =
+        |idx: usize| -> Result<Value> { eval(&args[0], Some((schema, &rows[part[idx]])), params) };
+    match func {
+        WindowFunc::RowNumber => {
+            for (k, &i) in part.iter().enumerate() {
+                result[i] = Value::Integer((k + 1) as i64);
+            }
+        }
+        WindowFunc::Rank | WindowFunc::DenseRank => {
+            let mut rank = 0i64;
+            let mut dense = 0i64;
+            let mut prev: Option<Vec<Value>> = None;
+            for (k, &i) in part.iter().enumerate() {
+                let key: Vec<Value> = order_idx.iter().map(|(c, _)| rows[i][*c].clone()).collect();
+                if !has_order || prev.as_ref() != Some(&key) {
+                    rank = (k + 1) as i64;
+                    dense += 1;
+                }
+                result[i] = Value::Integer(if matches!(func, WindowFunc::Rank) {
+                    rank
+                } else {
+                    dense
+                });
+                prev = Some(key);
+            }
+        }
+        WindowFunc::Ntile => {
+            let k = match eval_const(&args[0], params)? {
+                Value::Integer(n) if n >= 1 => n as usize,
+                _ => return Err(sql_err("NTILE() requiere un entero positivo")),
+            };
+            let base = m / k;
+            let rem = m % k;
+            for (p, &i) in part.iter().enumerate() {
+                let big = (base + 1) * rem; // filas en los `rem` primeros tiles (de tamaño base+1)
+                let tile = if p < big {
+                    p / (base + 1) + 1
+                } else {
+                    rem + (p - big) / base.max(1) + 1
+                };
+                result[i] = Value::Integer(tile as i64);
+            }
+        }
+        WindowFunc::Lag | WindowFunc::Lead => {
+            let offset = match args.get(1) {
+                None => 1isize,
+                Some(e) => match eval_const(e, params)? {
+                    Value::Integer(n) => n as isize,
+                    _ => return Err(sql_err("el desplazamiento de LAG/LEAD debe ser entero")),
+                },
+            };
+            for (k, &i) in part.iter().enumerate() {
+                let target = if matches!(func, WindowFunc::Lag) {
+                    k as isize - offset
+                } else {
+                    k as isize + offset
+                };
+                result[i] = if target >= 0 && (target as usize) < m {
+                    arg0(target as usize)?
+                } else if let Some(def) = args.get(2) {
+                    eval(def, Some((schema, &rows[i])), params)?
+                } else {
+                    Value::Null
+                };
+            }
+        }
+        WindowFunc::FirstValue | WindowFunc::LastValue => {
+            for (k, &i) in part.iter().enumerate() {
+                // Marco por defecto: del inicio de la partición a la fila actual (con
+                // ORDER BY) o a toda la partición (sin ORDER BY).
+                let target = match func {
+                    WindowFunc::FirstValue => 0,
+                    _ if has_order => k,
+                    _ => m - 1,
+                };
+                result[i] = arg0(target)?;
+            }
+        }
+        WindowFunc::Sum
+        | WindowFunc::Count
+        | WindowFunc::Avg
+        | WindowFunc::Min
+        | WindowFunc::Max => {
+            for (k, &i) in part.iter().enumerate() {
+                let end = if has_order { k } else { m - 1 };
+                result[i] = window_aggregate(func, args, &part[0..=end], schema, rows, params)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Agrega `args[0]` (o cuenta filas, en `COUNT(*)`) sobre las filas `frame` de una
+/// partición. NULL no cuenta; con todo NULL/0 filas devuelve NULL (salvo COUNT → 0).
+fn window_aggregate(
+    func: WindowFunc,
+    args: &[Expr],
+    frame: &[usize],
+    schema: &QuerySchema,
+    rows: &[Vec<Value>],
+    params: &[Value],
+) -> Result<Value> {
+    let val = |i: usize| -> Result<Value> { eval(&args[0], Some((schema, &rows[i])), params) };
+    match func {
+        WindowFunc::Count => {
+            if args.is_empty() {
+                return Ok(Value::Integer(frame.len() as i64));
+            }
+            let mut c = 0i64;
+            for &i in frame {
+                if !matches!(val(i)?, Value::Null) {
+                    c += 1;
+                }
+            }
+            Ok(Value::Integer(c))
+        }
+        WindowFunc::Sum | WindowFunc::Avg => {
+            let (mut isum, mut fsum, mut all_int, mut cnt) = (0i64, 0f64, true, 0i64);
+            for &i in frame {
+                match val(i)? {
+                    Value::Null => {}
+                    Value::Integer(n) => {
+                        cnt += 1;
+                        isum = isum.wrapping_add(n);
+                        fsum += n as f64;
+                    }
+                    Value::Real(f) => {
+                        cnt += 1;
+                        all_int = false;
+                        fsum += f;
+                    }
+                    v => {
+                        return Err(sql_err(format!(
+                            "SUM/AVG requieren números, no {}",
+                            v.type_name()
+                        )));
+                    }
+                }
+            }
+            if cnt == 0 {
+                return Ok(Value::Null);
+            }
+            Ok(if matches!(func, WindowFunc::Sum) {
+                if all_int {
+                    Value::Integer(isum)
+                } else {
+                    Value::Real(fsum)
+                }
+            } else {
+                Value::Real(fsum / cnt as f64)
+            })
+        }
+        WindowFunc::Min | WindowFunc::Max => {
+            let mut best: Option<Value> = None;
+            for &i in frame {
+                let v = val(i)?;
+                if matches!(v, Value::Null) {
+                    continue;
+                }
+                best = Some(match best {
+                    None => v,
+                    Some(b) => match cmp_values(&v, &b)? {
+                        Some(Ordering::Less) if matches!(func, WindowFunc::Min) => v,
+                        Some(Ordering::Greater) if matches!(func, WindowFunc::Max) => v,
+                        _ => b,
+                    },
+                });
+            }
+            Ok(best.unwrap_or(Value::Null))
+        }
+        _ => unreachable!("window_aggregate solo agregados"),
+    }
+}
+
 /// Sustituye cada nodo `Aggregate` por su valor calculado sobre `rows`; el
 /// resultado se evalúa después como expresión constante.
 fn fold_aggregates(
@@ -3592,6 +4176,8 @@ fn fold_aggregates(
         // Las subconsultas ya se resolvieron a literales; no contienen agregados
         // del SELECT exterior, así que pasan tal cual.
         Expr::ScalarSubquery(_) | Expr::Exists(_) | Expr::InSubquery { .. } => e.clone(),
+        // Las ventanas no conviven con GROUP BY/HAVING (se rechazan antes).
+        Expr::Window { .. } => e.clone(),
     })
 }
 
@@ -3755,6 +4341,11 @@ fn eval(e: &Expr, row: Option<(&QuerySchema, &[Value])>, params: &[Value]) -> Re
         }
         Expr::Aggregate { .. } => Err(sql_err(
             "los agregados solo se permiten en la lista del SELECT",
+        )),
+        // Las ventanas se resuelven a literales por fila antes de eval; si una
+        // llega aquí, está en un contexto no soportado (WHERE, agregado, …).
+        Expr::Window { .. } => Err(sql_err(
+            "las funciones de ventana (OVER) solo se permiten en la lista del SELECT",
         )),
         Expr::Unary(UnOp::Neg, inner) => match eval(inner, row, params)? {
             Value::Null => Ok(Value::Null),

@@ -84,6 +84,15 @@ deduplica las filas ya proyectadas.
 `MIN`/`MAX` tienen además **forma escalar** con ≥2 argumentos (`MIN(a, b, …)` = el
 menor; con 1 argumento son agregados, como en SQLite).
 
+**Funciones de ventana**: `func(args) OVER ([PARTITION BY e, …] [ORDER BY col [ASC|DESC],
+…])`, en la lista del SELECT. Se calculan sobre el conjunto ya filtrado, particionado por
+`PARTITION BY` y ordenado por el `ORDER BY` de la ventana, antes del `ORDER BY`/`LIMIT`
+externos. Disponibles: `ROW_NUMBER()`, `RANK()`, `DENSE_RANK()`, `NTILE(k)`,
+`LAG(x[, off[, def]])`, `LEAD(…)`, `FIRST_VALUE(x)`, `LAST_VALUE(x)`, y los agregados
+`SUM`/`COUNT`/`AVG`/`MIN`/`MAX` como ventana. Marco por defecto (sin `ROWS BETWEEN`, no
+soportado): toda la partición sin `ORDER BY`; «desde el inicio hasta la fila actual» con
+`ORDER BY` — por eso `LAST_VALUE … ORDER BY` devuelve la **fila actual** (gotcha estándar).
+
 **Funciones escalares** (insensibles a mayúsculas; NULL propaga salvo donde se diga):
 - Texto: `UPPER`, `LOWER`, `LENGTH`/`CHAR_LENGTH`, `TRIM`/`LTRIM`/`RTRIM`,
   `SUBSTR`/`SUBSTRING`, `REPLACE`, `INSTR`, `REVERSE`, `HEX`, `CONCAT`,

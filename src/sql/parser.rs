@@ -852,26 +852,7 @@ impl<'a> Parser<'a> {
         let mut order_by = Vec::new();
         if self.eat_kw(Kw::Order) {
             self.expect_kw(Kw::By, "BY")?;
-            loop {
-                let first = self.ident("un nombre de columna")?;
-                let (table, column) = if self.eat(&Tok::Dot) {
-                    (Some(first), self.ident("un nombre de columna")?)
-                } else {
-                    (None, first)
-                };
-                let desc = self.eat_kw(Kw::Desc);
-                if !desc {
-                    let _ = self.eat_kw(Kw::Asc); // ASC es el valor por defecto
-                }
-                order_by.push(OrderBy {
-                    table,
-                    column,
-                    desc,
-                });
-                if !self.eat(&Tok::Comma) {
-                    break;
-                }
-            }
+            order_by = self.order_by_items()?;
         }
         let limit = if self.eat_kw(Kw::Limit) {
             Some(self.expr()?)
@@ -890,6 +871,107 @@ impl<'a> Parser<'a> {
         lead.offset = offset;
         lead.as_of = as_of;
         Ok(lead)
+    }
+
+    /// Lista de elementos `ORDER BY` (tras consumir `ORDER BY`): `col [ASC|DESC]`
+    /// separados por comas. Reusada por el `ORDER BY` del SELECT y el de `OVER (…)`.
+    fn order_by_items(&mut self) -> Result<Vec<OrderBy>> {
+        let mut items = Vec::new();
+        loop {
+            let first = self.ident("un nombre de columna")?;
+            let (table, column) = if self.eat(&Tok::Dot) {
+                (Some(first), self.ident("un nombre de columna")?)
+            } else {
+                (None, first)
+            };
+            let desc = self.eat_kw(Kw::Desc);
+            if !desc {
+                let _ = self.eat_kw(Kw::Asc); // ASC es el valor por defecto
+            }
+            items.push(OrderBy {
+                table,
+                column,
+                desc,
+            });
+            if !self.eat(&Tok::Comma) {
+                break;
+            }
+        }
+        Ok(items)
+    }
+
+    /// Si tras una llamada `func(args)` viene `OVER (…)`, la convierte en una
+    /// función de **ventana**; si no, devuelve la llamada tal cual.
+    fn finish_call(&mut self, call: Expr) -> Result<Expr> {
+        if !self.eat_kw(Kw::Over) {
+            return Ok(call);
+        }
+        let (func, args) = match call {
+            Expr::Aggregate {
+                func,
+                arg,
+                distinct,
+                sep,
+            } => {
+                if distinct {
+                    return Err(err_at(self.pos(), "DISTINCT no se admite en una ventana"));
+                }
+                if sep.is_some() || func == AggFunc::GroupConcat {
+                    return Err(err_at(self.pos(), "GROUP_CONCAT no se admite como ventana"));
+                }
+                let wf = match func {
+                    AggFunc::Sum => WindowFunc::Sum,
+                    AggFunc::Count => WindowFunc::Count,
+                    AggFunc::Avg => WindowFunc::Avg,
+                    AggFunc::Min => WindowFunc::Min,
+                    AggFunc::Max => WindowFunc::Max,
+                    AggFunc::GroupConcat => unreachable!("rechazado arriba"),
+                };
+                (wf, arg.map(|a| vec![*a]).into_iter().flatten().collect())
+            }
+            Expr::Function { name, args } => {
+                let wf = match name.to_ascii_uppercase().as_str() {
+                    "ROW_NUMBER" => WindowFunc::RowNumber,
+                    "RANK" => WindowFunc::Rank,
+                    "DENSE_RANK" => WindowFunc::DenseRank,
+                    "NTILE" => WindowFunc::Ntile,
+                    "LAG" => WindowFunc::Lag,
+                    "LEAD" => WindowFunc::Lead,
+                    "FIRST_VALUE" => WindowFunc::FirstValue,
+                    "LAST_VALUE" => WindowFunc::LastValue,
+                    other => {
+                        return Err(err_at(
+                            self.pos(),
+                            format!("«{other}» no es una función de ventana"),
+                        ));
+                    }
+                };
+                (wf, args)
+            }
+            _ => return Err(err_at(self.pos(), "OVER solo puede seguir a una función")),
+        };
+        self.expect(&Tok::LParen, "'(' tras OVER")?;
+        let mut partition_by = Vec::new();
+        if self.eat_kw(Kw::Partition) {
+            self.expect_kw(Kw::By, "BY")?;
+            partition_by.push(self.expr()?);
+            while self.eat(&Tok::Comma) {
+                partition_by.push(self.expr()?);
+            }
+        }
+        let order_by = if self.eat_kw(Kw::Order) {
+            self.expect_kw(Kw::By, "BY")?;
+            self.order_by_items()?
+        } else {
+            Vec::new()
+        };
+        self.expect(&Tok::RParen, "')'")?;
+        Ok(Expr::Window {
+            func,
+            args,
+            partition_by,
+            order_by,
+        })
     }
 
     /// `AS OF VERSION n | AS OF TIMESTAMP 'rfc3339'`, al cierre de un SELECT
@@ -1266,7 +1348,7 @@ impl<'a> Parser<'a> {
                         if self.eat_kw(Kw::Distinct) {
                             let arg = Some(Box::new(self.expr()?));
                             self.expect(&Tok::RParen, "')'")?;
-                            return Ok(Expr::Aggregate {
+                            return self.finish_call(Expr::Aggregate {
                                 func,
                                 arg,
                                 distinct: true,
@@ -1284,14 +1366,14 @@ impl<'a> Parser<'a> {
                         }
                         self.expect(&Tok::RParen, "')'")?;
                         if margs.len() == 1 {
-                            return Ok(Expr::Aggregate {
+                            return self.finish_call(Expr::Aggregate {
                                 func,
                                 arg: Some(Box::new(margs.pop().expect("len 1"))),
                                 distinct: false,
                                 sep: None,
                             });
                         }
-                        return Ok(Expr::Function { name, args: margs });
+                        return self.finish_call(Expr::Function { name, args: margs });
                     }
                     let agg = match upper.as_str() {
                         "COUNT" => Some(AggFunc::Count),
@@ -1320,7 +1402,7 @@ impl<'a> Parser<'a> {
                             None
                         };
                         self.expect(&Tok::RParen, "')'")?;
-                        return Ok(Expr::Aggregate {
+                        return self.finish_call(Expr::Aggregate {
                             func,
                             arg,
                             distinct,
@@ -1355,7 +1437,7 @@ impl<'a> Parser<'a> {
                             else_: Some(Box::new(no)),
                         });
                     }
-                    return Ok(Expr::Function { name, args });
+                    return self.finish_call(Expr::Function { name, args });
                 }
                 Ok(Expr::Column { table: None, name })
             }

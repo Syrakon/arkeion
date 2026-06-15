@@ -1,0 +1,39 @@
+-- Subconsultas CORRELACIONADAS: referencian una columna de la tabla externa
+-- (calificada), así que se evalúan POR FILA (la columna externa se sustituye por su
+-- valor en la fila antes de ejecutar la subconsulta).
+
+> CREATE TABLE dept (id INTEGER PRIMARY KEY, name TEXT);
+ok
+
+> CREATE TABLE emp (id INTEGER PRIMARY KEY, dept_id INTEGER, salary INTEGER);
+ok
+
+> INSERT INTO dept (name) VALUES ('eng'), ('sales'), ('hr');
+affected 3
+
+> INSERT INTO emp (dept_id, salary) VALUES (1, 100), (1, 120), (2, 80);
+affected 3
+
+-- EXISTS correlacionada: departamentos con al menos un empleado.
+> SELECT name FROM dept d WHERE EXISTS (SELECT 1 FROM emp e WHERE e.dept_id = d.id) ORDER BY name;
+eng
+sales
+
+-- NOT EXISTS correlacionada: departamentos SIN empleados.
+> SELECT name FROM dept d WHERE NOT EXISTS (SELECT 1 FROM emp e WHERE e.dept_id = d.id);
+hr
+
+-- IN correlacionada.
+> SELECT name FROM dept d WHERE d.id IN (SELECT e.dept_id FROM emp e WHERE e.salary >= 100) ORDER BY name;
+eng
+
+-- Escalar correlacionada en la PROYECCIÓN: máximo salario por departamento (sin
+-- empleados → NULL).
+> SELECT d.name, (SELECT max(e.salary) FROM emp e WHERE e.dept_id = d.id) FROM dept d ORDER BY d.name;
+eng|120
+hr|NULL
+sales|80
+
+-- Escalar correlacionada en WHERE.
+> SELECT name FROM dept d WHERE (SELECT max(e.salary) FROM emp e WHERE e.dept_id = d.id) > 100 ORDER BY name;
+eng

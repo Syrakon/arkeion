@@ -784,6 +784,19 @@ impl<'a> Parser<'a> {
     }
 
     fn table_ref(&mut self) -> Result<TableRef> {
+        // Tabla derivada: `(SELECT …) [AS] alias` — alias obligatorio.
+        if self.peek() == Some(&Tok::LParen) && self.peek2() == Some(&Tok::Kw(Kw::Select)) {
+            self.eat(&Tok::LParen);
+            let sub = self.select()?;
+            self.expect(&Tok::RParen, "')'")?;
+            let _ = self.eat_kw(Kw::As); // AS opcional
+            let alias = self.ident("un alias para la subconsulta del FROM")?;
+            return Ok(TableRef {
+                name: String::new(),
+                alias: Some(alias),
+                subquery: Some(Box::new(sub)),
+            });
+        }
         let name = self.ident("un nombre de tabla")?;
         // `AS` exige el alias; un identificador suelto también lo es. Pero
         // `AS OF` es la cláusula temporal de sentencia, no un alias: no la
@@ -797,7 +810,11 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
-        Ok(TableRef { name, alias })
+        Ok(TableRef {
+            name,
+            alias,
+            subquery: None,
+        })
     }
 
     fn select_item(&mut self) -> Result<SelectItem> {
@@ -1191,7 +1208,8 @@ mod tests {
             s.from,
             Some(TableRef {
                 name: "facturas".into(),
-                alias: None
+                alias: None,
+                subquery: None
             })
         );
         assert!(s.joins.is_empty());
@@ -1229,7 +1247,8 @@ mod tests {
             s.from,
             Some(TableRef {
                 name: "facturas".into(),
-                alias: Some("f".into())
+                alias: Some("f".into()),
+                subquery: None
             })
         );
         assert_eq!(s.joins.len(), 1);
@@ -1239,7 +1258,8 @@ mod tests {
             j.table,
             TableRef {
                 name: "clientes".into(),
-                alias: Some("c".into())
+                alias: Some("c".into()),
+                subquery: None
             }
         );
         assert!(matches!(

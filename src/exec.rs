@@ -1006,6 +1006,10 @@ pub fn run_select(src: &impl DataSource, stmt: &SelectStmt, params: &[Value]) ->
     if !stmt.with.is_empty() {
         return run_with_ctes(src, stmt, params);
     }
+    // Tablas derivadas en FROM/JOIN: se materializan y se exponen como tablas.
+    if select_has_derived(stmt) {
+        return run_with_derived(src, stmt, params);
+    }
     // Subconsultas NO correlacionadas: se ejecutan una vez y se sustituyen por su
     // valor (escalar → literal, IN → lista, EXISTS → bool) antes de evaluar nada.
     let resolved;
@@ -1609,6 +1613,63 @@ fn run_with_ctes(src: &dyn DataSource, stmt: &SelectStmt, params: &[Value]) -> R
     let mut main = stmt.clone();
     main.with = Vec::new();
     run_select(&overlay, &main, params)
+}
+
+// --- tablas derivadas: `FROM (SELECT …) AS x` (CTE anónima) ---
+
+/// `true` si la FROM o algún JOIN del SELECT es una tabla derivada.
+fn select_has_derived(stmt: &SelectStmt) -> bool {
+    stmt.from.as_ref().is_some_and(|t| t.subquery.is_some())
+        || stmt.joins.iter().any(|j| j.table.subquery.is_some())
+}
+
+/// Materializa las tablas derivadas (cada subconsulta del FROM/JOIN, contra `src`
+/// — sin LATERAL, no se ven entre sí) en un overlay y reescribe sus `TableRef` a
+/// nombres planos (su alias). Usa un rango de `table_id` distinto del de CTEs.
+fn run_with_derived(
+    src: &dyn DataSource,
+    stmt: &SelectStmt,
+    params: &[Value],
+) -> Result<SelectOut> {
+    // Overlay base SIN derivadas: se comporta igual que `src` pero es `Sized`, así
+    // que `run_select` (genérico sobre tipos `Sized`) lo acepta. Cada derivada se
+    // materializa contra él ⇒ no se ven entre sí (sin LATERAL).
+    let base = CteSource {
+        inner: src,
+        ctes: Vec::new(),
+    };
+    let mut entries: Vec<CteEntry> = Vec::new();
+    let mut rewritten = stmt.clone();
+
+    let materialize = |tr: &mut TableRef, entries: &mut Vec<CteEntry>| -> Result<()> {
+        let Some(sub) = tr.subquery.take() else {
+            return Ok(());
+        };
+        let out = run_select(&base, &sub, params)?;
+        let alias = tr.alias.clone().expect("una derivada siempre lleva alias");
+        let mut def = synthetic_cte_def(&alias, &out.columns, 0);
+        def.table_id = 0xFFFE_0000 - entries.len() as u32; // rango propio (≠ CTE/vista)
+        tr.name = alias.clone(); // el overlay la resuelve por su alias
+        entries.push(CteEntry {
+            name: alias,
+            def,
+            rows: out.rows,
+        });
+        Ok(())
+    };
+
+    if let Some(from) = rewritten.from.as_mut() {
+        materialize(from, &mut entries)?;
+    }
+    for j in rewritten.joins.iter_mut() {
+        materialize(&mut j.table, &mut entries)?;
+    }
+
+    let overlay = CteSource {
+        inner: src,
+        ctes: entries,
+    };
+    run_select(&overlay, &rewritten, params)
 }
 
 // --- subconsultas no correlacionadas (pre-pasada) ---

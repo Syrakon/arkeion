@@ -125,6 +125,9 @@ pub struct ColumnAst {
 pub struct TableRef {
     pub name: String,
     pub alias: Option<String>,
+    /// Tabla **derivada**: `FROM (SELECT …) AS alias`. Si está, `name` va vacío y el
+    /// `alias` es obligatorio (es el qualifier). Se materializa como una CTE anónima.
+    pub subquery: Option<Box<SelectStmt>>,
 }
 
 impl TableRef {

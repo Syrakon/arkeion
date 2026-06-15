@@ -27,6 +27,14 @@ fn nums(conn: &Connection, sql: &str) -> Vec<i64> {
         .collect()
 }
 
+/// Primera columna (TEXT) de una consulta, en orden de fila.
+fn texts(conn: &Connection, sql: &str) -> Vec<String> {
+    conn.query(sql, &[])
+        .unwrap()
+        .map(|row| row.unwrap().get::<String>(0).unwrap())
+        .collect()
+}
+
 #[test]
 fn as_of_version_sees_each_past_state() {
     let (_dir, db) = fresh();
@@ -238,5 +246,157 @@ fn drop_column_is_time_travel_safe() {
     assert_eq!(
         star_row(&conn, &format!("SELECT * FROM t AS OF VERSION {before}")),
         vec![Value::Integer(1), Value::Integer(10), Value::Integer(20)],
+    );
+}
+
+/// Las funciones/escalares (`abs`, `CASE`, `CAST`, `||`) y los agregados
+/// (`GROUP_CONCAT(DISTINCT …)`) se evalúan igual sobre un snapshot histórico: el
+/// `AS OF` solo cambia QUÉ filas ve la consulta, no cómo se computan las
+/// expresiones.
+#[test]
+fn as_of_works_with_scalar_and_aggregate_functions() {
+    let (_dir, db) = fresh();
+    let conn = db.connect().unwrap();
+    conn.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER, tag TEXT)",
+        &[],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO t (n, tag) VALUES (1, 'a'), (2, 'b'), (3, 'a')",
+        &[],
+    )
+    .unwrap();
+    let v1 = conn.version(); // t = {(1,a),(2,b),(3,a)}
+
+    // Cambia los datos tras v1.
+    conn.execute("UPDATE t SET n = 999 WHERE tag = 'a'", &[])
+        .unwrap();
+    conn.execute("INSERT INTO t (n, tag) VALUES (4, 'c')", &[])
+        .unwrap();
+
+    // CASE + CAST + || sobre los datos de v1 (no los de head).
+    assert_eq!(
+        texts(
+            &conn,
+            &format!(
+                "SELECT CASE WHEN n >= 2 THEN 'hi' ELSE 'lo' END || ':' || CAST(n AS TEXT) AS s \
+                 FROM t ORDER BY n AS OF VERSION {v1}"
+            )
+        ),
+        vec!["lo:1", "hi:2", "hi:3"],
+    );
+
+    // abs() sobre el snapshot histórico.
+    assert_eq!(
+        nums(
+            &conn,
+            &format!("SELECT abs(n) AS n FROM t WHERE tag = 'a' ORDER BY n AS OF VERSION {v1}")
+        ),
+        vec![1, 3],
+    );
+
+    // GROUP_CONCAT(DISTINCT …) ve solo los tags de v1 (a, b — sin la 'c' posterior).
+    assert_eq!(
+        texts(
+            &conn,
+            &format!("SELECT GROUP_CONCAT(DISTINCT tag) AS g FROM t AS OF VERSION {v1}")
+        ),
+        vec!["a,b"],
+    );
+}
+
+/// Subconsultas (escalar/IN/EXISTS correlacionada), CTEs y vistas se ejecutan
+/// contra el MISMO snapshot histórico que la consulta externa, y la propia
+/// definición de la vista está versionada.
+#[test]
+fn as_of_works_with_subqueries_ctes_and_views() {
+    let (_dir, db) = fresh();
+    let conn = db.connect().unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER)", &[])
+        .unwrap();
+    conn.execute("INSERT INTO t (n) VALUES (1), (2), (3)", &[])
+        .unwrap();
+    let v1 = conn.version(); // t = {1,2,3}, aún sin vista
+
+    conn.execute("INSERT INTO t (n) VALUES (4)", &[]).unwrap();
+    conn.execute("CREATE VIEW hi AS SELECT n FROM t WHERE n >= 3", &[])
+        .unwrap();
+    let v_view = conn.version(); // vista creada; t = {1,2,3,4}
+    conn.execute("INSERT INTO t (n) VALUES (5)", &[]).unwrap();
+
+    // Subconsulta IN: max(n) del snapshot v1 es 3 (no 5).
+    assert_eq!(
+        nums(
+            &conn,
+            &format!("SELECT n FROM t WHERE n IN (SELECT max(n) FROM t) AS OF VERSION {v1}")
+        ),
+        vec![3],
+    );
+
+    // EXISTS correlacionada AS OF v1: hay sucesor (n+1) para 1 y 2, no para 3
+    // (el 4 aún no existía en v1).
+    assert_eq!(
+        nums(
+            &conn,
+            &format!(
+                "SELECT n FROM t a WHERE EXISTS (SELECT 1 FROM t b WHERE b.n = a.n + 1) \
+                 ORDER BY n AS OF VERSION {v1}"
+            )
+        ),
+        vec![1, 2],
+    );
+
+    // CTE AS OF v1.
+    assert_eq!(
+        nums(
+            &conn,
+            &format!(
+                "WITH big AS (SELECT n FROM t WHERE n >= 2) SELECT n FROM big ORDER BY n AS OF VERSION {v1}"
+            )
+        ),
+        vec![2, 3],
+    );
+
+    // La vista materializa contra el snapshot histórico: AS OF v_view ve {3,4}.
+    assert_eq!(
+        nums(
+            &conn,
+            &format!("SELECT n FROM hi ORDER BY n AS OF VERSION {v_view}")
+        ),
+        vec![3, 4],
+    );
+    // En head la vista ve {3,4,5}.
+    assert_eq!(nums(&conn, "SELECT n FROM hi ORDER BY n"), vec![3, 4, 5]);
+    // La definición de la vista está versionada: AS OF antes de crearla → no existe.
+    assert!(
+        conn.query(&format!("SELECT n FROM hi AS OF VERSION {v1}"), &[])
+            .is_err(),
+        "la vista no existía en v1"
+    );
+}
+
+/// `now()` es el reloj de EJECUCIÓN, no un dato versionado: `AS OF` no lo
+/// retrotrae (afecta a las filas, no al tiempo de la sentencia).
+#[test]
+fn as_of_does_not_rewind_the_clock() {
+    let (_dir, db) = fresh();
+    let conn = db.connect().unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER)", &[])
+        .unwrap();
+    conn.execute("INSERT INTO t (n) VALUES (1)", &[]).unwrap();
+    let v1 = conn.version();
+
+    // now() bajo AS OF v1 sigue siendo el reloj actual (epoch ms ~ 2020+),
+    // no un valor del pasado ni 0.
+    let t = nums(
+        &conn,
+        &format!("SELECT now() AS n FROM t LIMIT 1 AS OF VERSION {v1}"),
+    );
+    assert_eq!(t.len(), 1);
+    assert!(
+        t[0] > 1_600_000_000_000,
+        "now() bajo AS OF es el reloj de ejecución, no histórico: {}",
+        t[0]
     );
 }

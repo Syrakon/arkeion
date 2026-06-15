@@ -182,15 +182,25 @@ SELECT * FROM facturas AS OF TIMESTAMP '2026-05-01T00:00:00Z';
   ([05-decisiones, D12](05-decisiones.md#d12)).
 - Solo en `SELECT`. Escribir en el pasado no existe: para eso están las ramas.
 
+`AS OF` compone con **todo** el dialecto: el ejecutor es genérico sobre la fuente de datos, así
+que fija el snapshot histórico una vez y **todo** se evalúa contra él — funciones escalares,
+`CAST`/`CASE`/`||`, agregados (`GROUP_CONCAT(DISTINCT …)`), `UNION`/`INTERSECT`/`EXCEPT`,
+subconsultas (incluidas las **correlacionadas**), CTEs (`WITH`) y **vistas** (que se
+materializan contra ese snapshot; además su propia definición está versionada, así que un
+`AS OF` anterior a `CREATE VIEW` no la ve). El **catálogo** se versiona en el mismo b-tree, de
+modo que un `AS OF` ve el esquema de su época (columnas, orden lógico, FKs). La única excepción
+es el **reloj**: `now()`/`date('now')` devuelven la hora de **ejecución**, no la histórica —
+`AS OF` retrotrae los datos, no el tiempo de la sentencia. Cobertura en `tests/timetravel.rs`.
+
 ## Fuera de v1 (deliberadamente)
+
+Las subconsultas **correlacionadas**, las CTEs **recursivas** (`WITH RECURSIVE`), las derivadas
+en `FROM` (`FROM (SELECT …)`) y `INTERSECT`/`EXCEPT` ya están **hechas** (v1.x); las FKs
+**compuestas**/no-PK/`ON UPDATE` y los triggers `INSTEAD OF`/`FOR EACH STATEMENT`, también. Lo
+que queda deliberadamente fuera:
 
 | Excluido | Cuándo |
 |---|---|
-| Subconsultas **correlacionadas** (las no correlacionadas sí: escalar/`IN`/`EXISTS`) | v1.x |
-| CTEs **recursivas** (las no recursivas, `WITH`, sí) | v1.x |
-| Derivadas en `FROM` (`FROM (SELECT …)`) | v1.x |
-| `INTERSECT` / `EXCEPT` (`UNION [ALL]` sí) | v1.x |
-| Índices secundarios (`CREATE INDEX`) | hecho (v1.1) — espacio de claves `0x02` ya reservado en el formato |
 | `ALTER TABLE` físico (cambio de tipo, DROP físico que reescribe filas) | rompería el time-travel sin epoch por fila; `ADD`/`MOVE`/`REORDER`/`RENAME`/`DROP` (lógico) ✅ hechos |
 | `DROP COLUMN` que **recupera el espacio** al instante | el DROP lógico deja bytes muertos; el vacuum los reclama en una reescritura |
 | Optimizador de queries (CBO con estadísticas) | fuera de alcance; hay un planificador **determinista por reglas**: índice-vs-scan y *predicate pushdown* en JOINs |

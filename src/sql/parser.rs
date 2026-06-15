@@ -1235,13 +1235,22 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// `||` (concatenación): entre `mul` y `unary`, como en SQLite (`||` liga más
-    /// fuerte que `* / %` y más débil que el unario).
+    /// `||` (concat) y `->`/`->>` (extracción JSON): mismo nivel, entre `mul` y
+    /// `unary`, como en SQLite (ligan más fuerte que `* / %` y más débil que el unario).
     fn concat_expr(&mut self) -> Result<Expr> {
         let mut left = self.unary_expr()?;
-        while self.eat(&Tok::Concat) {
+        loop {
+            let op = if self.eat(&Tok::Concat) {
+                BinOp::Concat
+            } else if self.eat(&Tok::Arrow) {
+                BinOp::JsonGet
+            } else if self.eat(&Tok::ArrowArrow) {
+                BinOp::JsonGetText
+            } else {
+                break;
+            };
             let right = self.unary_expr()?;
-            left = Expr::Binary(Box::new(left), BinOp::Concat, Box::new(right));
+            left = Expr::Binary(Box::new(left), op, Box::new(right));
         }
         Ok(left)
     }

@@ -86,3 +86,39 @@ NULL
 
 > SELECT upper(json_extract('{"name":"ada"}', '$.name'));
 ADA
+
+-- Operadores -> (resultado como JSON) y ->> (resultado como valor SQL). La clave
+-- derecha puede ser ruta ($.a), clave de objeto ('a' → $.a) o índice entero (0 → $[0]).
+> SELECT '{"a":1,"b":"hi"}' -> '$.a';
+1
+
+> SELECT '{"a":1,"b":"hi"}' ->> '$.b';
+hi
+
+-- -> conserva la forma JSON (la cadena va entre comillas); ->> la desenvuelve.
+> SELECT '{"a":"hi"}' -> '$.a';
+"hi"
+
+> SELECT '{"a":"hi"}' ->> '$.a';
+hi
+
+> SELECT '{"a":[1,2,3]}' -> '$.a';
+[1,2,3]
+
+-- Encadenado: clave de objeto y luego índice de array.
+> SELECT '{"a":[10,20]}' -> 'a' ->> '$[1]';
+20
+
+-- Índice entero sobre un array de raíz.
+> SELECT '[10,20,30]' ->> 1;
+20
+
+-- Ruta inexistente o NULL ⇒ NULL.
+> SELECT '{"a":1}' ->> 'missing';
+NULL
+
+> SELECT '{"a":1}' -> '$.missing';
+NULL
+
+> SELECT NULL ->> '$.a';
+NULL

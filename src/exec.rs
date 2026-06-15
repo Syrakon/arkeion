@@ -4440,6 +4440,13 @@ fn eval(e: &Expr, row: Option<(&QuerySchema, &[Value])>, params: &[Value]) -> Re
                         b.type_name()
                     ))),
                 },
+                // `->`/`->>`: extracción JSON. La clave/ruta derecha puede ser una
+                // ruta `$.a.b`, una clave de objeto (`'a'` → `$.a`) o un índice
+                // entero (`0` → `$[0]`). `->` devuelve el nodo como JSON (texto),
+                // `->>` como valor SQL. Ruta inexistente ⇒ NULL.
+                BinOp::JsonGet | BinOp::JsonGetText => {
+                    json_arrow(*op, l, eval(right, row, params)?)
+                }
             }
         }
         Expr::Function { name, args } => {
@@ -5205,6 +5212,42 @@ fn json_path(v: &Value) -> Result<String> {
             "la ruta de json_extract debe ser TEXT (p. ej. '$.a')",
         )),
     }
+}
+
+/// `->` / `->>`: extrae de `doc` (TEXT JSON) en la clave/ruta `key`. La clave es
+/// una ruta (`$.…`), una clave de objeto simple (`'a'` → `$.a`) o un índice entero
+/// (`0` → `$[0]`). `->` devuelve el nodo como texto JSON; `->>` como valor SQL.
+/// Cualquier operando NULL, o ruta inexistente ⇒ NULL.
+fn json_arrow(op: BinOp, doc: Value, key: Value) -> Result<Value> {
+    if matches!(doc, Value::Null) || matches!(key, Value::Null) {
+        return Ok(Value::Null);
+    }
+    let text = match doc {
+        Value::Text(s) => s,
+        v => {
+            return Err(sql_err(format!(
+                "->/->> requieren TEXT JSON a la izquierda, no {}",
+                v.type_name()
+            )));
+        }
+    };
+    let path = match key {
+        Value::Integer(n) => format!("$[{n}]"),
+        Value::Text(s) if s.starts_with('$') => s,
+        Value::Text(s) => format!("$.{s}"),
+        v => {
+            return Err(sql_err(format!(
+                "la clave de ->/->> debe ser texto o entero, no {}",
+                v.type_name()
+            )));
+        }
+    };
+    let root = json::parse(&text).ok_or_else(|| sql_err("->/->>: JSON inválido"))?;
+    Ok(match json::extract(&root, &path) {
+        None => Value::Null,
+        Some(node) if matches!(op, BinOp::JsonGet) => Value::Text(json::to_string(node)),
+        Some(node) => json_to_value(node),
+    })
 }
 
 /// Rellena `s` a `len` caracteres con `pad` (por la izquierda o la derecha). Si

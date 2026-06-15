@@ -112,7 +112,10 @@ soportado): toda la partición sin `ORDER BY`; «desde el inicio hasta la fila a
   (valida y minifica), `JSON_VALID(x)`, `JSON_TYPE(json[, ruta])`,
   `JSON_EXTRACT(json, ruta…)` (escalares desenvueltos; con varias rutas → array;
   rutas `$.a.b[0]`), `JSON_ARRAY_LENGTH(json[, ruta])`, `JSON_OBJECT(k, v, …)`,
-  `JSON_ARRAY(v, …)`, `JSON_QUOTE(x)`.
+  `JSON_ARRAY(v, …)`, `JSON_QUOTE(x)`. Operadores `json -> clave` (resultado **como
+  JSON**) y `json ->> clave` (resultado **como valor SQL**); la clave derecha es una
+  ruta (`$.a`), una clave de objeto (`'a'` → `$.a`) o un índice entero (`0` → `$[0]`).
+  Mismo nivel de precedencia que `||`.
 
 **Operadores/expresiones**: `||` (concat de texto), `CAST(x AS tipo)` (válvula del
 tipado estricto), `CASE WHEN … THEN … [ELSE …] END` (buscada y simple),

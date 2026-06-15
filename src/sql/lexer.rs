@@ -29,6 +29,10 @@ pub enum Tok {
     Percent,
     /// `||` — concatenación de texto.
     Concat,
+    /// `->` — extracción JSON (resultado como JSON).
+    Arrow,
+    /// `->>` — extracción JSON (resultado como valor SQL).
+    ArrowArrow,
     LParen,
     RParen,
     Comma,
@@ -263,6 +267,16 @@ pub fn lex(sql: &str) -> Result<Vec<Spanned>> {
                 while i < bytes.len() && bytes[i] != b'\n' {
                     i += 1;
                 }
+            }
+            b'-' if bytes.get(i + 1) == Some(&b'>') => {
+                // `->>` (valor SQL) o `->` (JSON) — extracción JSON.
+                let (tok, len) = if bytes.get(i + 2) == Some(&b'>') {
+                    (Tok::ArrowArrow, 3)
+                } else {
+                    (Tok::Arrow, 2)
+                };
+                out.push(Spanned { tok, pos: start });
+                i += len;
             }
             b'(' => push(&mut out, Tok::LParen, start, &mut i),
             b')' => push(&mut out, Tok::RParen, start, &mut i),

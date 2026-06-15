@@ -403,6 +403,10 @@ pub enum BinOp {
     Mod,
     /// `||` — concatenación de texto.
     Concat,
+    /// `->` — extracción JSON, resultado **como JSON** (texto JSON del nodo).
+    JsonGet,
+    /// `->>` — extracción JSON, resultado **como valor SQL** (escalar desenvuelto).
+    JsonGetText,
 }
 
 impl Expr {

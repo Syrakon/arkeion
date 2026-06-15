@@ -15,8 +15,8 @@ use crate::catalog::{
 use crate::error::{Error, Result};
 use crate::record::Value;
 use crate::sql::ast::{
-    AggFunc, BinOp, ColumnAst, Cte, Expr, JoinKind, SelectItem, SelectStmt, SetOp, Stmt, TableRef,
-    UnOp,
+    AggFunc, BinOp, ColumnAst, Cte, Expr, JoinKind, OnConflict, SelectItem, SelectStmt, SetOp,
+    Stmt, TableRef, UnOp,
 };
 use crate::tx::{Snapshot, WriteTx};
 
@@ -401,6 +401,7 @@ pub fn run_execute(tx: &mut WriteTx, stmt: &Stmt, params: &[Value]) -> Result<us
             table,
             columns,
             rows,
+            on_conflict,
             returning,
         } => Ok(run_insert(
             tx,
@@ -408,6 +409,7 @@ pub fn run_execute(tx: &mut WriteTx, stmt: &Stmt, params: &[Value]) -> Result<us
             columns.as_deref(),
             rows,
             params,
+            on_conflict.as_ref(),
             returning.as_deref(),
         )?
         .0),
@@ -503,6 +505,7 @@ pub fn run_returning(tx: &mut WriteTx, stmt: &Stmt, params: &[Value]) -> Result<
             table,
             columns,
             rows,
+            on_conflict,
             returning,
         } => run_insert(
             tx,
@@ -510,6 +513,7 @@ pub fn run_returning(tx: &mut WriteTx, stmt: &Stmt, params: &[Value]) -> Result<
             columns.as_deref(),
             rows,
             params,
+            on_conflict.as_ref(),
             returning.as_deref(),
         )?,
         Stmt::Update {
@@ -631,12 +635,15 @@ fn run_insert(
     columns: Option<&[String]>,
     rows: &[Vec<Expr>],
     params: &[Value],
+    on_conflict: Option<&OnConflict>,
     returning: Option<&[SelectItem]>,
 ) -> Result<(usize, Option<SelectOut>)> {
     // Escribir en una vista: lo gestiona un trigger INSTEAD OF (la vista no almacena).
     if tx.table(table)?.is_none() && tx.view(table)?.is_some() {
-        if returning.is_some() {
-            return Err(sql_err("RETURNING no se admite al escribir en una vista"));
+        if returning.is_some() || on_conflict.is_some() {
+            return Err(sql_err(
+                "RETURNING / ON CONFLICT no se admiten al escribir en una vista",
+            ));
         }
         return Ok((
             run_instead_of_insert(tx, table, columns, rows, params)?,
@@ -648,38 +655,153 @@ fn run_insert(
     let def = tx
         .table_cached(table)?
         .ok_or_else(|| sql_err(format!("tabla desconocida: {table}")))?;
-    let (before_row, before_stmt) =
+    let (ins_before_row, before_stmt) =
         split_for_each(tx.triggers_for(&def.name, TriggerEvent::Insert, TriggerTiming::Before)?);
-    let (after_row, after_stmt) =
+    let (ins_after_row, after_stmt) =
         split_for_each(tx.triggers_for(&def.name, TriggerEvent::Insert, TriggerTiming::After)?);
+    // La rama DO UPDATE de un UPSERT dispara triggers de UPDATE (row-level).
+    let (upd_before_row, _) = split_for_each(if on_conflict.is_some() {
+        tx.triggers_for(&def.name, TriggerEvent::Update, TriggerTiming::Before)?
+    } else {
+        Vec::new()
+    });
+    let (upd_after_row, _) = split_for_each(if on_conflict.is_some() {
+        tx.triggers_for(&def.name, TriggerEvent::Update, TriggerTiming::After)?
+    } else {
+        Vec::new()
+    });
     fire(tx, &def, &before_stmt, None, None)?; // BEFORE … FOR EACH STATEMENT
     // La fila NEW (con el rowid asignado) solo se necesita para AFTER INSERT o RETURNING.
-    let want_new = !after_row.is_empty() || returning.is_some();
+    let want_new = !ins_after_row.is_empty() || returning.is_some();
     let mut returned = Vec::new();
+    let mut affected = 0usize;
     // Buffer prestado de la tx: ni un `Vec` de valores por fila. Si una fila falla,
     // el `?` lo pierde — camino frío, el próximo take asigna.
     let mut values = tx.take_values_buf();
     for row in rows {
         insert_values_into(&def, columns, row, params, &mut values)?;
-        fire(tx, &def, &before_row, None, Some(&values))?; // BEFORE INSERT
+        // UPSERT: ¿la fila propuesta choca con la PK o un índice UNIQUE?
+        if let Some(oc) = on_conflict
+            && let Some(rid) = find_conflict(tx, &def, &values)?
+        {
+            match oc {
+                OnConflict::Nothing => continue, // omitir (no cuenta como afectada)
+                OnConflict::Update { sets, where_clause } => {
+                    if let Some(new_row) = upsert_update(
+                        tx,
+                        &def,
+                        table,
+                        rid,
+                        sets,
+                        where_clause.as_ref(),
+                        &values,
+                        params,
+                        &upd_before_row,
+                        &upd_after_row,
+                    )? {
+                        if returning.is_some() {
+                            returned.push(new_row);
+                        }
+                        affected += 1;
+                    }
+                    continue;
+                }
+            }
+        }
+        fire(tx, &def, &ins_before_row, None, Some(&values))?; // BEFORE INSERT
         let rowid = tx.insert_row(&def, &values)?;
         if want_new {
             let mut new_after = values.clone();
             if let Some(i) = def.rowid_alias {
                 new_after[i] = Value::Integer(rowid);
             }
-            fire(tx, &def, &after_row, None, Some(&new_after))?; // AFTER INSERT
+            fire(tx, &def, &ins_after_row, None, Some(&new_after))?; // AFTER INSERT
             if returning.is_some() {
                 returned.push(new_after);
             }
         }
+        affected += 1;
     }
     tx.put_values_buf(values);
     fire(tx, &def, &after_stmt, None, None)?; // AFTER … FOR EACH STATEMENT
     let out = returning
         .map(|items| eval_returning(table, &def, items, &returned, params))
         .transpose()?;
-    Ok((rows.len(), out))
+    Ok((affected, out))
+}
+
+/// Rowid de una fila existente que choca con la propuesta `values` (la PK, o un
+/// índice UNIQUE), o `None` si no hay conflicto.
+fn find_conflict(tx: &WriteTx, def: &TableDef, values: &[Value]) -> Result<Option<i64>> {
+    // PK: un rowid explícito que ya existe.
+    if let Some(pk) = def.rowid_alias
+        && let Some(Value::Integer(n)) = values.get(pk)
+        && tx.get_row(def, *n)?.is_some()
+    {
+        return Ok(Some(*n));
+    }
+    // UNIQUE: cualquier índice unique cuya clave ya esté presente (un NULL no choca).
+    for idx in &def.indexes {
+        if !idx.unique {
+            continue;
+        }
+        let key: Vec<Value> = idx.columns.iter().map(|&c| values[c].clone()).collect();
+        if key.iter().any(|v| matches!(v, Value::Null)) {
+            continue;
+        }
+        if let Some(&rid) = tx.index_lookup(idx, &key)?.first() {
+            return Ok(Some(rid));
+        }
+    }
+    Ok(None)
+}
+
+/// Rama `DO UPDATE` de un UPSERT: actualiza la fila en conflicto `rid` con `sets`
+/// (donde `excluded.col` = la fila propuesta `proposed`). Devuelve la fila NEW si
+/// se aplicó, o `None` si el `WHERE` la descartó.
+#[allow(clippy::too_many_arguments)]
+fn upsert_update(
+    tx: &mut WriteTx,
+    def: &TableDef,
+    table: &str,
+    rid: i64,
+    sets: &[(String, Expr)],
+    where_clause: Option<&Expr>,
+    proposed: &[Value],
+    params: &[Value],
+    before_row: &[TriggerDef],
+    after_row: &[TriggerDef],
+) -> Result<Option<Vec<Value>>> {
+    let schema = QuerySchema::single(table, def.clone());
+    let existing = tx
+        .get_row(def, rid)?
+        .ok_or_else(|| sql_err("la fila en conflicto desapareció"))?;
+    // `excluded.col` (la fila propuesta) se sustituye como `NEW`; lo demás se evalúa
+    // contra la fila existente.
+    if let Some(cond) = where_clause {
+        let c = subst_expr(cond, def, None, Some(proposed))?;
+        validate_columns(&c, &schema)?;
+        if !truthy(eval(&c, Some((&schema, &existing)), params)?)? {
+            return Ok(None);
+        }
+    }
+    let mut new_row = existing.clone();
+    for (name, expr) in sets {
+        let i = col_index(def, name)?;
+        if def.rowid_alias == Some(i) {
+            return Err(sql_err(
+                "ON CONFLICT DO UPDATE no puede cambiar la PRIMARY KEY",
+            ));
+        }
+        let e = subst_expr(expr, def, None, Some(proposed))?;
+        no_aggregates(&e, "SET")?;
+        validate_columns(&e, &schema)?;
+        new_row[i] = eval(&e, Some((&schema, &existing)), params)?;
+    }
+    fire(tx, def, before_row, Some(&existing), Some(&new_row))?;
+    tx.update_row(def, rid, &new_row)?;
+    fire(tx, def, after_row, Some(&existing), Some(&new_row))?;
+    Ok(Some(new_row))
 }
 
 fn run_update(
@@ -1037,12 +1159,16 @@ fn subst_expr(
         Expr::Column {
             table: Some(q),
             name,
-        } if q.eq_ignore_ascii_case("OLD") || q.eq_ignore_ascii_case("NEW") => {
-            let is_new = q.eq_ignore_ascii_case("NEW");
+        } if q.eq_ignore_ascii_case("OLD")
+            || q.eq_ignore_ascii_case("NEW")
+            || q.eq_ignore_ascii_case("EXCLUDED") =>
+        {
+            // `EXCLUDED` (la fila propuesta en un UPSERT) se trata como `NEW`.
+            let is_new = !q.eq_ignore_ascii_case("OLD");
             let vals = if is_new { new } else { old }.ok_or_else(|| {
                 sql_err(format!(
-                    "{} no está disponible en este trigger",
-                    if is_new { "NEW" } else { "OLD" }
+                    "{} no está disponible aquí",
+                    q.to_ascii_uppercase()
                 ))
             })?;
             let i = table
@@ -1125,6 +1251,7 @@ fn subst_stmt(
             table: t,
             columns,
             rows,
+            on_conflict,
             returning,
         } => Stmt::Insert {
             table: t.clone(),
@@ -1133,6 +1260,7 @@ fn subst_stmt(
                 .iter()
                 .map(|row| row.iter().map(&r).collect::<Result<Vec<_>>>())
                 .collect::<Result<Vec<_>>>()?,
+            on_conflict: on_conflict.clone(),
             returning: returning.clone(),
         },
         Stmt::Update {

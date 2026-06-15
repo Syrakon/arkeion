@@ -620,13 +620,55 @@ impl<'a> Parser<'a> {
                 break;
             }
         }
+        let on_conflict = self.on_conflict_clause()?;
         let returning = self.returning_clause()?;
         Ok(Stmt::Insert {
             table,
             columns,
             rows,
+            on_conflict,
             returning,
         })
+    }
+
+    /// `ON CONFLICT [(cols)] DO {NOTHING | UPDATE SET col = expr [, …] [WHERE expr]}`
+    /// (UPSERT). La lista de columnas objetivo se acepta pero se ignora (el conflicto
+    /// se detecta sobre la PK o cualquier índice UNIQUE).
+    fn on_conflict_clause(&mut self) -> Result<Option<OnConflict>> {
+        if !(self.peek() == Some(&Tok::Kw(Kw::On)) && self.peek2() == Some(&Tok::Kw(Kw::Conflict)))
+        {
+            return Ok(None);
+        }
+        self.i += 2; // ON CONFLICT
+        // Columnas objetivo opcionales: se consumen y descartan.
+        if self.eat(&Tok::LParen) {
+            let _ = self.ident("una columna")?;
+            while self.eat(&Tok::Comma) {
+                let _ = self.ident("una columna")?;
+            }
+            self.expect(&Tok::RParen, "')'")?;
+        }
+        self.expect_kw(Kw::Do, "DO")?;
+        if self.eat_kw(Kw::Nothing) {
+            return Ok(Some(OnConflict::Nothing));
+        }
+        self.expect_kw(Kw::Update, "UPDATE")?;
+        self.expect_kw(Kw::Set, "SET")?;
+        let mut sets = Vec::new();
+        loop {
+            let col = self.ident("un nombre de columna")?;
+            self.expect(&Tok::Eq, "'='")?;
+            sets.push((col, self.expr()?));
+            if !self.eat(&Tok::Comma) {
+                break;
+            }
+        }
+        let where_clause = if self.eat_kw(Kw::Where) {
+            Some(self.expr()?)
+        } else {
+            None
+        };
+        Ok(Some(OnConflict::Update { sets, where_clause }))
     }
 
     /// `RETURNING <select-list>` opcional al final de un INSERT/UPDATE/DELETE: si

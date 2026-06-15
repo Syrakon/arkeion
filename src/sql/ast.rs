@@ -69,6 +69,10 @@ pub enum Stmt {
         table: String,
         columns: Option<Vec<String>>,
         rows: Vec<Vec<Expr>>,
+        /// `ON CONFLICT [(cols)] DO {NOTHING | UPDATE SET …}` (UPSERT). Si está, una
+        /// fila que choque con la PK o un índice UNIQUE no falla: se omite o se
+        /// actualiza la existente.
+        on_conflict: Option<OnConflict>,
         /// `RETURNING <select-list>`: si está, la sentencia devuelve filas (las
         /// insertadas) en vez de solo el recuento.
         returning: Option<Vec<SelectItem>>,
@@ -117,6 +121,22 @@ pub enum Stmt {
     Begin,
     Commit,
     Rollback,
+}
+
+/// Acción de `ON CONFLICT` (UPSERT). La columna(s) objetivo opcional
+/// (`ON CONFLICT (col) …`) se acepta pero no restringe: el conflicto se detecta
+/// sobre la PK o cualquier índice UNIQUE.
+#[derive(Clone, Debug, PartialEq)]
+pub enum OnConflict {
+    /// `DO NOTHING`: omite la fila en conflicto (sin error).
+    Nothing,
+    /// `DO UPDATE SET … [WHERE …]`: actualiza la fila existente. Las expresiones
+    /// pueden referirse a `excluded.col` (la fila propuesta) y a las columnas de la
+    /// fila existente.
+    Update {
+        sets: Vec<(String, Expr)>,
+        where_clause: Option<Expr>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]

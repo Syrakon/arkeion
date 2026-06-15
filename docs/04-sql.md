@@ -39,7 +39,9 @@ CREATE TRIGGER [IF NOT EXISTS] t {BEFORE|AFTER} {INSERT|UPDATE|DELETE} ON tabla
 DROP TRIGGER [IF EXISTS] t;
 
 -- DML
-INSERT INTO tabla [(cols)] VALUES (expr, …)[, (expr, …)…] [RETURNING lista | *];
+INSERT INTO tabla [(cols)] VALUES (expr, …)[, …]
+  [ON CONFLICT [(cols)] DO {NOTHING | UPDATE SET col = expr [, …] [WHERE expr]}]
+  [RETURNING lista | *];
 UPDATE tabla SET col = expr [, …] [WHERE expr] [RETURNING lista | *];
 DELETE FROM tabla [WHERE expr] [RETURNING lista | *];
 
@@ -144,6 +146,14 @@ los valores **NEW**) o las borradas (sus valores). La lista admite expresiones y
 y `*` se expande a las columnas visibles. Hay que ejecutarla por `query` (devuelve
 filas); por `execute` la escritura se hace igual y se ignoran las filas. No se admite al
 escribir en una vista (vía INSTEAD OF).
+
+**UPSERT** (`INSERT … ON CONFLICT [(cols)] DO {NOTHING | UPDATE SET …}`): si una fila
+choca con la **PK** o un índice **UNIQUE**, en vez de fallar se **omite** (`DO NOTHING`)
+o se **actualiza** la fila existente (`DO UPDATE`). En `DO UPDATE`, las expresiones del
+`SET`/`WHERE` ven las columnas de la fila existente y `excluded.col` = la fila propuesta;
+un `WHERE` falso descarta esa actualización. La lista de columnas objetivo tras
+`ON CONFLICT` se acepta pero no restringe (el conflicto se detecta sobre cualquier clave
+única). El recuento incluye filas insertadas y actualizadas, no las omitidas.
 
 `GROUP BY` / `HAVING` (post-M9): `SELECT … GROUP BY e1, e2 [HAVING cond]` agrupa por el
 valor de las expresiones (normalmente columnas) y emite una fila por grupo, plegando los

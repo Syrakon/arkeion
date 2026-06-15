@@ -1,0 +1,65 @@
+-- UPSERT: INSERT … ON CONFLICT [(cols)] DO {NOTHING | UPDATE SET …}. El conflicto
+-- se detecta sobre la PK o un índice UNIQUE; `excluded.col` = la fila propuesta.
+
+> CREATE TABLE kv (id INTEGER PRIMARY KEY, k TEXT, v INTEGER);
+ok
+
+> CREATE UNIQUE INDEX ux_kv_k ON kv (k);
+ok
+
+> INSERT INTO kv (k, v) VALUES ('a', 1), ('b', 2);
+affected 2
+
+-- Sin ON CONFLICT, un choque UNIQUE sigue fallando.
+> INSERT INTO kv (k, v) VALUES ('a', 9);
+error UNIQUE
+
+-- Conflicto por UNIQUE con DO NOTHING: se omite (no error, no cambia, no cuenta).
+> INSERT INTO kv (k, v) VALUES ('a', 99) ON CONFLICT DO NOTHING;
+affected 0
+
+> SELECT v FROM kv WHERE k = 'a';
+1
+
+-- DO UPDATE: actualiza la fila existente con el valor propuesto (excluded).
+> INSERT INTO kv (k, v) VALUES ('a', 10) ON CONFLICT (k) DO UPDATE SET v = excluded.v;
+affected 1
+
+> SELECT v FROM kv WHERE k = 'a';
+10
+
+-- DO UPDATE con expresión: acumula (existente + propuesto).
+> INSERT INTO kv (k, v) VALUES ('a', 5) ON CONFLICT (k) DO UPDATE SET v = v + excluded.v;
+affected 1
+
+> SELECT v FROM kv WHERE k = 'a';
+15
+
+-- Sin conflicto: inserta normal (DO NOTHING/UPDATE no consumen rowid).
+> INSERT INTO kv (k, v) VALUES ('c', 3) ON CONFLICT (k) DO UPDATE SET v = excluded.v;
+affected 1
+
+> SELECT k, v FROM kv ORDER BY k;
+a|15
+b|2
+c|3
+
+-- DO UPDATE … WHERE: la condición se evalúa sobre la fila EXISTENTE.
+> INSERT INTO kv (k, v) VALUES ('b', 100) ON CONFLICT (k) DO UPDATE SET v = excluded.v WHERE v < 2;
+affected 0
+
+> SELECT v FROM kv WHERE k = 'b';
+2
+
+> INSERT INTO kv (k, v) VALUES ('b', 100) ON CONFLICT (k) DO UPDATE SET v = excluded.v WHERE v < 5;
+affected 1
+
+> SELECT v FROM kv WHERE k = 'b';
+100
+
+-- Conflicto por la PRIMARY KEY (rowid explícito).
+> INSERT INTO kv (id, k, v) VALUES (1, 'a', 0) ON CONFLICT DO UPDATE SET v = 777;
+affected 1
+
+> SELECT v FROM kv WHERE id = 1;
+777

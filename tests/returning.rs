@@ -111,6 +111,47 @@ fn execute_of_returning_statement_still_returns_count() {
 }
 
 #[test]
+fn upsert_with_returning() {
+    let (_d, db) = fresh();
+    let c = db.connect().unwrap();
+    c.execute(
+        "CREATE TABLE kv (id INTEGER PRIMARY KEY, k TEXT, v INTEGER)",
+        &[],
+    )
+    .unwrap();
+    c.execute("CREATE UNIQUE INDEX ux ON kv (k)", &[]).unwrap();
+    c.execute("INSERT INTO kv (k, v) VALUES ('a', 1)", &[])
+        .unwrap();
+
+    // Conflicto → DO UPDATE: RETURNING ve la fila actualizada.
+    assert_eq!(
+        rows_of(
+            &c,
+            "INSERT INTO kv (k, v) VALUES ('a', 5) ON CONFLICT (k) \
+             DO UPDATE SET v = v + excluded.v RETURNING k, v"
+        ),
+        vec![vec![txt("a"), int(6)]],
+    );
+    // Sin conflicto → inserta: RETURNING ve la fila insertada.
+    assert_eq!(
+        rows_of(
+            &c,
+            "INSERT INTO kv (k, v) VALUES ('b', 9) ON CONFLICT (k) \
+             DO UPDATE SET v = excluded.v RETURNING k, v"
+        ),
+        vec![vec![txt("b"), int(9)]],
+    );
+    // DO NOTHING en conflicto → no devuelve fila.
+    assert!(
+        rows_of(
+            &c,
+            "INSERT INTO kv (k, v) VALUES ('a', 100) ON CONFLICT DO NOTHING RETURNING k, v"
+        )
+        .is_empty()
+    );
+}
+
+#[test]
 fn returning_inside_a_transaction() {
     let (_d, db) = fresh();
     let c = db.connect().unwrap();

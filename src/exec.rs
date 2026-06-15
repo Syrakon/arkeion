@@ -15,8 +15,8 @@ use crate::catalog::{
 use crate::error::{Error, Result};
 use crate::record::Value;
 use crate::sql::ast::{
-    AggFunc, BinOp, ColumnAst, Cte, Expr, JoinKind, OnConflict, SelectItem, SelectStmt, SetOp,
-    Stmt, TableRef, UnOp, WindowFunc,
+    AggFunc, BinOp, ColumnAst, Cte, Expr, InsertSource, JoinKind, OnConflict, SelectItem,
+    SelectStmt, SetOp, Stmt, TableRef, UnOp, WindowFunc,
 };
 use crate::sql::json;
 use crate::tx::{Snapshot, WriteTx};
@@ -415,14 +415,14 @@ pub fn run_execute(tx: &mut WriteTx, stmt: &Stmt, params: &[Value]) -> Result<us
         Stmt::Insert {
             table,
             columns,
-            rows,
+            source,
             on_conflict,
             returning,
         } => Ok(run_insert(
             tx,
             table,
             columns.as_deref(),
-            rows,
+            source,
             params,
             on_conflict.as_ref(),
             returning.as_deref(),
@@ -519,14 +519,14 @@ pub fn run_returning(tx: &mut WriteTx, stmt: &Stmt, params: &[Value]) -> Result<
         Stmt::Insert {
             table,
             columns,
-            rows,
+            source,
             on_conflict,
             returning,
         } => run_insert(
             tx,
             table,
             columns.as_deref(),
-            rows,
+            source,
             params,
             on_conflict.as_ref(),
             returning.as_deref(),
@@ -648,11 +648,26 @@ fn run_insert(
     tx: &mut WriteTx,
     table: &str,
     columns: Option<&[String]>,
-    rows: &[Vec<Expr>],
+    source: &InsertSource,
     params: &[Value],
     on_conflict: Option<&OnConflict>,
     returning: Option<&[SelectItem]>,
 ) -> Result<(usize, Option<SelectOut>)> {
+    // Origen de las filas → filas de literales. El `SELECT` se materializa **entero**
+    // antes de insertar nada, así que `INSERT INTO t SELECT … FROM t` es seguro.
+    let select_rows;
+    let rows: &[Vec<Expr>] = match source {
+        InsertSource::Values(v) => v,
+        InsertSource::Select(sel) => {
+            let out = run_query(&*tx, sel, params)?;
+            select_rows = out
+                .rows
+                .into_iter()
+                .map(|r| r.into_iter().map(Expr::Literal).collect::<Vec<Expr>>())
+                .collect::<Vec<Vec<Expr>>>();
+            &select_rows
+        }
+    };
     // Escribir en una vista: lo gestiona un trigger INSTEAD OF (la vista no almacena).
     if tx.table(table)?.is_none() && tx.view(table)?.is_some() {
         if returning.is_some() || on_conflict.is_some() {
@@ -1276,16 +1291,22 @@ fn subst_stmt(
         Stmt::Insert {
             table: t,
             columns,
-            rows,
+            source,
             on_conflict,
             returning,
         } => Stmt::Insert {
             table: t.clone(),
             columns: columns.clone(),
-            rows: rows
-                .iter()
-                .map(|row| row.iter().map(&r).collect::<Result<Vec<_>>>())
-                .collect::<Result<Vec<_>>>()?,
+            // OLD/NEW se sustituyen en las filas literales; un `INSERT … SELECT` en el
+            // cuerpo de un trigger se deja igual (otro ámbito).
+            source: match source {
+                InsertSource::Values(rows) => InsertSource::Values(
+                    rows.iter()
+                        .map(|row| row.iter().map(&r).collect::<Result<Vec<_>>>())
+                        .collect::<Result<Vec<_>>>()?,
+                ),
+                InsertSource::Select(s) => InsertSource::Select(s.clone()),
+            },
             on_conflict: on_conflict.clone(),
             returning: returning.clone(),
         },

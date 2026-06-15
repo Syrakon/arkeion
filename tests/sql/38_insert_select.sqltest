@@ -1,0 +1,58 @@
+-- INSERT … SELECT: las filas de una consulta se insertan. El SELECT se materializa
+-- ENTERO antes de insertar (seguro aunque lea de la misma tabla).
+
+> CREATE TABLE src (id INTEGER PRIMARY KEY, name TEXT, n INTEGER);
+ok
+
+> CREATE TABLE dst (id INTEGER PRIMARY KEY, name TEXT, n2 INTEGER);
+ok
+
+> INSERT INTO src (name, n) VALUES ('a', 1), ('b', 2), ('c', 3);
+affected 3
+
+-- Con lista de columnas, desde un SELECT con expresiones y WHERE.
+> INSERT INTO dst (name, n2) SELECT name, n * 10 FROM src WHERE n >= 2;
+affected 2
+
+> SELECT name, n2 FROM dst ORDER BY name;
+b|20
+c|30
+
+-- Posicional (sin lista): SELECT * con todas las columnas.
+> CREATE TABLE copy (id INTEGER PRIMARY KEY, name TEXT, n INTEGER);
+ok
+
+> INSERT INTO copy SELECT * FROM src;
+affected 3
+
+> SELECT id, name, n FROM copy ORDER BY id;
+1|a|1
+2|b|2
+3|c|3
+
+-- Auto-copia: el SELECT se materializa primero, así que no entra en bucle.
+> INSERT INTO src (name, n) SELECT name, n FROM src;
+affected 3
+
+> SELECT COUNT(*) FROM src;
+6
+
+-- Compone con ON CONFLICT (UPSERT) y con un SELECT sin FROM.
+> CREATE TABLE u (id INTEGER PRIMARY KEY, k TEXT, v INTEGER);
+ok
+
+> CREATE UNIQUE INDEX ux_u ON u (k);
+ok
+
+> INSERT INTO u (k, v) VALUES ('x', 1);
+affected 1
+
+> INSERT INTO u (k, v) SELECT 'x', 99 ON CONFLICT (k) DO UPDATE SET v = excluded.v;
+affected 1
+
+> SELECT v FROM u WHERE k = 'x';
+99
+
+-- El SELECT debe producir tantas columnas como pide el INSERT.
+> INSERT INTO dst (name) SELECT name, n FROM src;
+error número distinto

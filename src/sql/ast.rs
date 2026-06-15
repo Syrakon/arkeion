@@ -68,7 +68,8 @@ pub enum Stmt {
     Insert {
         table: String,
         columns: Option<Vec<String>>,
-        rows: Vec<Vec<Expr>>,
+        /// Origen de las filas: `VALUES (…), …` o `SELECT …`.
+        source: InsertSource,
         /// `ON CONFLICT [(cols)] DO {NOTHING | UPDATE SET …}` (UPSERT). Si está, una
         /// fila que choque con la PK o un índice UNIQUE no falla: se omite o se
         /// actualiza la existente.
@@ -121,6 +122,15 @@ pub enum Stmt {
     Begin,
     Commit,
     Rollback,
+}
+
+/// Origen de las filas de un `INSERT`: literal (`VALUES`) o una consulta.
+#[derive(Clone, Debug, PartialEq)]
+pub enum InsertSource {
+    /// `VALUES (e, …)[, (e, …)…]`.
+    Values(Vec<Vec<Expr>>),
+    /// `SELECT …` (o `WITH … SELECT …`): se materializa y sus filas se insertan.
+    Select(Box<SelectStmt>),
 }
 
 /// Acción de `ON CONFLICT` (UPSERT). La columna(s) objetivo opcional

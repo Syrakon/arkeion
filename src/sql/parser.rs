@@ -606,26 +606,40 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
-        self.expect_kw(Kw::Values, "VALUES")?;
-        let mut rows = Vec::new();
-        loop {
-            self.expect(&Tok::LParen, "'('")?;
-            let mut row = vec![self.expr()?];
-            while self.eat(&Tok::Comma) {
-                row.push(self.expr()?);
+        // Origen: `VALUES (…), …` o una consulta (`SELECT …` / `WITH … SELECT …`).
+        let source = if matches!(self.peek(), Some(Tok::Kw(Kw::Select | Kw::With))) {
+            let sel = if self.eat_kw(Kw::With) {
+                let ctes = self.with_ctes()?;
+                let mut s = self.select()?;
+                s.with = ctes;
+                s
+            } else {
+                self.select()?
+            };
+            InsertSource::Select(Box::new(sel))
+        } else {
+            self.expect_kw(Kw::Values, "VALUES")?;
+            let mut rows = Vec::new();
+            loop {
+                self.expect(&Tok::LParen, "'('")?;
+                let mut row = vec![self.expr()?];
+                while self.eat(&Tok::Comma) {
+                    row.push(self.expr()?);
+                }
+                self.expect(&Tok::RParen, "')'")?;
+                rows.push(row);
+                if !self.eat(&Tok::Comma) {
+                    break;
+                }
             }
-            self.expect(&Tok::RParen, "')'")?;
-            rows.push(row);
-            if !self.eat(&Tok::Comma) {
-                break;
-            }
-        }
+            InsertSource::Values(rows)
+        };
         let on_conflict = self.on_conflict_clause()?;
         let returning = self.returning_clause()?;
         Ok(Stmt::Insert {
             table,
             columns,
-            rows,
+            source,
             on_conflict,
             returning,
         })
@@ -1758,12 +1772,28 @@ mod tests {
     #[test]
     fn insert_multi_row_and_named_columns() {
         let stmt = parse("INSERT INTO t (a, b) VALUES (1, 'x'), (?1, NULL)").unwrap();
-        let Stmt::Insert { columns, rows, .. } = stmt else {
+        let Stmt::Insert {
+            columns, source, ..
+        } = stmt
+        else {
             panic!()
         };
         assert_eq!(columns, Some(vec!["a".into(), "b".into()]));
+        let InsertSource::Values(rows) = source else {
+            panic!("VALUES")
+        };
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[1][0], Expr::Param(1));
+
+        // INSERT … SELECT.
+        let stmt = parse("INSERT INTO t (a) SELECT x FROM u WHERE x > 0").unwrap();
+        assert!(matches!(
+            stmt,
+            Stmt::Insert {
+                source: InsertSource::Select(_),
+                ..
+            }
+        ));
     }
 
     #[test]

@@ -3,6 +3,7 @@
 
 pub mod ast;
 pub(crate) mod datetime;
+pub(crate) mod json;
 pub mod lexer;
 pub mod parser;
 

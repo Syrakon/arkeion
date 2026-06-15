@@ -18,6 +18,7 @@ use crate::sql::ast::{
     AggFunc, BinOp, ColumnAst, Cte, Expr, JoinKind, OnConflict, SelectItem, SelectStmt, SetOp,
     Stmt, TableRef, UnOp,
 };
+use crate::sql::json;
 use crate::tx::{Snapshot, WriteTx};
 
 pub struct SelectOut {
@@ -4418,6 +4419,104 @@ fn call_function(name: &str, args: &[Value]) -> Result<Value> {
             ))),
             _ => Err(bad_arity()),
         },
+        // --- JSON (estilo SQLite JSON1; parser en Rust puro, sin deps) ---
+        "json" => match args {
+            [Value::Null] => Ok(Value::Null),
+            [Value::Text(s)] => json::parse(s)
+                .map(|j| Value::Text(json::to_string(&j)))
+                .ok_or_else(|| sql_err("json(): texto JSON inválido")),
+            [v] => Err(sql_err(format!("json() espera TEXT, no {}", v.type_name()))),
+            _ => Err(bad_arity()),
+        },
+        "json_valid" => match args {
+            [Value::Null] => Ok(Value::Null),
+            [Value::Text(s)] => Ok(Value::Bool(json::parse(s).is_some())),
+            [_] => Ok(Value::Bool(false)),
+            _ => Err(bad_arity()),
+        },
+        "json_type" => {
+            let (text, path) = match args {
+                [Value::Null] | [Value::Null, _] | [_, Value::Null] => return Ok(Value::Null),
+                [Value::Text(s)] => (s, None),
+                [Value::Text(s), Value::Text(p)] => (s, Some(p.as_str())),
+                _ => return Err(sql_err("json_type(json TEXT [, path TEXT])")),
+            };
+            let root = json::parse(text).ok_or_else(|| sql_err("json_type(): JSON inválido"))?;
+            let node = match path {
+                Some(p) => json::extract(&root, p),
+                None => Some(&root),
+            };
+            Ok(node.map_or(Value::Null, |j| Value::Text(json::type_name(j).to_string())))
+        }
+        "json_extract" => match args {
+            [Value::Null, ..] => Ok(Value::Null),
+            [Value::Text(s), paths @ ..] if !paths.is_empty() => {
+                let root =
+                    json::parse(s).ok_or_else(|| sql_err("json_extract(): JSON inválido"))?;
+                if let [p] = paths {
+                    let path = json_path(p)?;
+                    Ok(json::extract(&root, &path).map_or(Value::Null, json_to_value))
+                } else {
+                    // Varias rutas → array JSON con un elemento por ruta.
+                    let mut arr = Vec::with_capacity(paths.len());
+                    for p in paths {
+                        let path = json_path(p)?;
+                        arr.push(
+                            json::extract(&root, &path)
+                                .cloned()
+                                .unwrap_or(json::Json::Null),
+                        );
+                    }
+                    Ok(Value::Text(json::to_string(&json::Json::Array(arr))))
+                }
+            }
+            _ => Err(sql_err("json_extract(json TEXT, path TEXT, …)")),
+        },
+        "json_array_length" => {
+            let (text, path) = match args {
+                [Value::Null] | [Value::Null, _] | [_, Value::Null] => return Ok(Value::Null),
+                [Value::Text(s)] => (s, None),
+                [Value::Text(s), Value::Text(p)] => (s, Some(p.as_str())),
+                _ => return Err(sql_err("json_array_length(json TEXT [, path TEXT])")),
+            };
+            let root =
+                json::parse(text).ok_or_else(|| sql_err("json_array_length(): JSON inválido"))?;
+            let node = match path {
+                Some(p) => json::extract(&root, p),
+                None => Some(&root),
+            };
+            Ok(match node {
+                Some(json::Json::Array(a)) => Value::Integer(a.len() as i64),
+                _ => Value::Integer(0), // como SQLite: 0 si no es un array
+            })
+        }
+        "json_object" => {
+            if !args.len().is_multiple_of(2) {
+                return Err(sql_err("json_object() requiere pares clave/valor"));
+            }
+            let mut o = Vec::with_capacity(args.len() / 2);
+            for pair in args.chunks(2) {
+                let key = match &pair[0] {
+                    Value::Null => {
+                        return Err(sql_err("json_object(): la clave no puede ser NULL"));
+                    }
+                    v => value_text(v).ok_or_else(|| need_text(v))?,
+                };
+                o.push((key, value_to_json(&pair[1])?));
+            }
+            Ok(Value::Text(json::to_string(&json::Json::Object(o))))
+        }
+        "json_array" => {
+            let mut a = Vec::with_capacity(args.len());
+            for v in args {
+                a.push(value_to_json(v)?);
+            }
+            Ok(Value::Text(json::to_string(&json::Json::Array(a))))
+        }
+        "json_quote" => match args {
+            [v] => Ok(Value::Text(json::to_string(&value_to_json(v)?))),
+            _ => Err(bad_arity()),
+        },
         // Fecha/hora: el entero de tiempo de arkeion es **epoch en milisegundos**
         // (igual que los timestamps de auditoría), no el día juliano de SQLite.
         "now" => match args {
@@ -4478,6 +4577,42 @@ fn value_text(v: &Value) -> Option<String> {
     match cast_value(v.clone(), crate::catalog::ColType::Text) {
         Ok(Value::Text(s)) => Some(s),
         _ => None,
+    }
+}
+
+/// Un valor SQL como nodo JSON (para `json_object`/`json_array`/`json_quote`).
+/// Los BLOB no tienen representación JSON natural ⇒ error.
+fn value_to_json(v: &Value) -> Result<json::Json> {
+    Ok(match v {
+        Value::Null => json::Json::Null,
+        Value::Bool(b) => json::Json::Bool(*b),
+        Value::Integer(n) => json::Json::Int(*n),
+        Value::Real(f) => json::Json::Float(*f),
+        Value::Text(s) => json::Json::Str(s.clone()),
+        Value::Blob(_) => return Err(sql_err("JSON no admite BLOB")),
+    })
+}
+
+/// Un nodo JSON como valor SQL (para `json_extract`): escalares se desenvuelven;
+/// arrays/objetos se devuelven como su texto JSON.
+fn json_to_value(j: &json::Json) -> Value {
+    match j {
+        json::Json::Null => Value::Null,
+        json::Json::Bool(b) => Value::Integer(i64::from(*b)),
+        json::Json::Int(n) => Value::Integer(*n),
+        json::Json::Float(f) => Value::Real(*f),
+        json::Json::Str(s) => Value::Text(s.clone()),
+        json::Json::Array(_) | json::Json::Object(_) => Value::Text(json::to_string(j)),
+    }
+}
+
+/// La ruta de `json_extract` debe ser TEXT (`$.a.b[0]`).
+fn json_path(v: &Value) -> Result<String> {
+    match v {
+        Value::Text(s) => Ok(s.clone()),
+        _ => Err(sql_err(
+            "la ruta de json_extract debe ser TEXT (p. ej. '$.a')",
+        )),
     }
 }
 

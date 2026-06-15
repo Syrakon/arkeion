@@ -1,0 +1,88 @@
+-- Funciones JSON (estilo SQLite JSON1; parser en Rust puro, sin dependencias).
+
+-- json(): valida y minifica.
+> SELECT json(' { "a" : 1 , "b" : [2, 3] } ');
+{"a":1,"b":[2,3]}
+
+> SELECT json('no es json');
+error JSON inválido
+
+-- json_valid().
+> SELECT json_valid('{"a":1}');
+TRUE
+
+> SELECT json_valid('{bad}');
+FALSE
+
+-- json_type() en la raíz y por ruta.
+> SELECT json_type('{"a":[1,2]}');
+object
+
+> SELECT json_type('{"a":[1,2]}', '$.a');
+array
+
+> SELECT json_type('{"a":[1,2]}', '$.a[0]');
+integer
+
+> SELECT json_type('{"x":3.5}', '$.x');
+real
+
+> SELECT json_type('{"s":"hi"}', '$.s');
+text
+
+> SELECT json_type('{"b":true}', '$.b');
+true
+
+> SELECT json_type('{"n":null}', '$.n');
+null
+
+-- json_extract(): escalares desenvueltos; contenedores como texto JSON.
+> SELECT json_extract('{"a":1,"b":"hi"}', '$.a');
+1
+
+> SELECT json_extract('{"a":1,"b":"hi"}', '$.b');
+hi
+
+> SELECT json_extract('{"a":[10,20,30]}', '$.a[1]');
+20
+
+> SELECT json_extract('{"a":[10,20]}', '$.a');
+[10,20]
+
+> SELECT json_extract('{"a":1}', '$.missing');
+NULL
+
+-- Varias rutas → array JSON.
+> SELECT json_extract('{"a":1,"b":2}', '$.a', '$.b');
+[1,2]
+
+-- json_array_length().
+> SELECT json_array_length('[1, 2, 3, 4]');
+4
+
+> SELECT json_array_length('{"a":[1,2]}', '$.a');
+2
+
+> SELECT json_array_length('{"a":1}');
+0
+
+-- json_object() / json_array() construyen JSON.
+> SELECT json_object('a', 1, 'b', 'hi');
+{"a":1,"b":"hi"}
+
+> SELECT json_array(1, 'two', 3.5, NULL);
+[1,"two",3.5,null]
+
+-- json_quote().
+> SELECT json_quote('a"b');
+"a\"b"
+
+> SELECT json_quote(42);
+42
+
+-- NULL propaga y compone con otras funciones.
+> SELECT json_extract(NULL, '$.a');
+NULL
+
+> SELECT upper(json_extract('{"name":"ada"}', '$.name'));
+ADA

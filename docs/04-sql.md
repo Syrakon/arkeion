@@ -99,6 +99,11 @@ menor; con 1 argumento son agregados, como en SQLite).
 - Fecha/hora: `NOW`, `DATE`, `TIME`, `DATETIME`, `STRFTIME(fmt, ms)`,
   `JULIANDAY(ms)`, `UNIXEPOCH(ms)` (→ segundos). El entero de tiempo es **epoch en
   milisegundos** UTC (igual que los timestamps de auditoría), no el día juliano de SQLite.
+- JSON (estilo SQLite JSON1; parser en Rust puro, sin dependencias): `JSON(x)`
+  (valida y minifica), `JSON_VALID(x)`, `JSON_TYPE(json[, ruta])`,
+  `JSON_EXTRACT(json, ruta…)` (escalares desenvueltos; con varias rutas → array;
+  rutas `$.a.b[0]`), `JSON_ARRAY_LENGTH(json[, ruta])`, `JSON_OBJECT(k, v, …)`,
+  `JSON_ARRAY(v, …)`, `JSON_QUOTE(x)`.
 
 **Operadores/expresiones**: `||` (concat de texto), `CAST(x AS tipo)` (válvula del
 tipado estricto), `CASE WHEN … THEN … [ELSE …] END` (buscada y simple),

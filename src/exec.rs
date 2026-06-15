@@ -10,7 +10,7 @@ use std::collections::HashSet;
 
 use crate::catalog::{
     self, ColType, ColumnDef, ColumnSpec, IndexDef, TableDef, TableSpec, TriggerDef, TriggerEvent,
-    TriggerTiming,
+    TriggerForEach, TriggerTiming,
 };
 use crate::error::{Error, Result};
 use crate::record::Value;
@@ -326,6 +326,7 @@ pub fn run_execute(tx: &mut WriteTx, stmt: &Stmt, params: &[Value]) -> Result<us
             name,
             timing,
             event,
+            for_each,
             table,
             body_sql,
         } => {
@@ -351,6 +352,7 @@ pub fn run_execute(tx: &mut WriteTx, stmt: &Stmt, params: &[Value]) -> Result<us
                 name: name.clone(),
                 timing: *timing,
                 event: *event,
+                for_each: *for_each,
                 table: table.clone(),
                 body: body_sql.clone(),
             })?;
@@ -405,25 +407,35 @@ pub fn run_execute(tx: &mut WriteTx, stmt: &Stmt, params: &[Value]) -> Result<us
             let def = tx
                 .table_cached(table)?
                 .ok_or_else(|| sql_err(format!("tabla desconocida: {table}")))?;
-            let before = tx.triggers_for(&def.name, TriggerEvent::Insert, TriggerTiming::Before)?;
-            let after = tx.triggers_for(&def.name, TriggerEvent::Insert, TriggerTiming::After)?;
+            let (before_row, before_stmt) = split_for_each(tx.triggers_for(
+                &def.name,
+                TriggerEvent::Insert,
+                TriggerTiming::Before,
+            )?);
+            let (after_row, after_stmt) = split_for_each(tx.triggers_for(
+                &def.name,
+                TriggerEvent::Insert,
+                TriggerTiming::After,
+            )?);
+            fire(tx, &def, &before_stmt, None, None)?; // BEFORE … FOR EACH STATEMENT
             // Buffer prestado de la tx: ni un `Vec` de valores por fila. Si una
             // fila falla, el `?` lo pierde — camino frío, el próximo take asigna.
             let mut values = tx.take_values_buf();
             for row in rows {
                 insert_values_into(&def, columns.as_deref(), row, params, &mut values)?;
-                fire(tx, &def, &before, None, Some(&values))?; // BEFORE INSERT
+                fire(tx, &def, &before_row, None, Some(&values))?; // BEFORE INSERT
                 let rowid = tx.insert_row(&def, &values)?;
-                if !after.is_empty() {
+                if !after_row.is_empty() {
                     // NEW con el rowid ya asignado.
                     let mut new_after = values.clone();
                     if let Some(i) = def.rowid_alias {
                         new_after[i] = Value::Integer(rowid);
                     }
-                    fire(tx, &def, &after, None, Some(&new_after))?; // AFTER INSERT
+                    fire(tx, &def, &after_row, None, Some(&new_after))?; // AFTER INSERT
                 }
             }
             tx.put_values_buf(values);
+            fire(tx, &def, &after_stmt, None, None)?; // AFTER … FOR EACH STATEMENT
             Ok(rows.len())
         }
         Stmt::AlterTableAddColumn { table, column } => {
@@ -601,8 +613,10 @@ fn run_update(
         no_aggregates(cond, "WHERE")?;
         validate_columns(cond, &schema)?;
     }
-    let before = tx.triggers_for(&def.name, TriggerEvent::Update, TriggerTiming::Before)?;
-    let after = tx.triggers_for(&def.name, TriggerEvent::Update, TriggerTiming::After)?;
+    let (before_row, before_stmt) =
+        split_for_each(tx.triggers_for(&def.name, TriggerEvent::Update, TriggerTiming::Before)?);
+    let (after_row, after_stmt) =
+        split_for_each(tx.triggers_for(&def.name, TriggerEvent::Update, TriggerTiming::After)?);
 
     // Materializar primero (point lookup por PK o full scan): el scan toma
     // prestada la tx, que luego necesitamos en exclusiva para escribir.
@@ -621,11 +635,13 @@ fn run_update(
         updates.push((rowid, row, new_row));
     }
     let n = updates.len();
+    fire(tx, &def, &before_stmt, None, None)?; // BEFORE … FOR EACH STATEMENT
     for (rowid, old_row, new_row) in updates {
-        fire(tx, &def, &before, Some(&old_row), Some(&new_row))?;
+        fire(tx, &def, &before_row, Some(&old_row), Some(&new_row))?;
         tx.update_row(&def, rowid, &new_row)?;
-        fire(tx, &def, &after, Some(&old_row), Some(&new_row))?;
+        fire(tx, &def, &after_row, Some(&old_row), Some(&new_row))?;
     }
+    fire(tx, &def, &after_stmt, None, None)?; // AFTER … FOR EACH STATEMENT
     Ok(n)
 }
 
@@ -643,8 +659,10 @@ fn run_delete(
         no_aggregates(cond, "WHERE")?;
         validate_columns(cond, &schema)?;
     }
-    let before = tx.triggers_for(&def.name, TriggerEvent::Delete, TriggerTiming::Before)?;
-    let after = tx.triggers_for(&def.name, TriggerEvent::Delete, TriggerTiming::After)?;
+    let (before_row, before_stmt) =
+        split_for_each(tx.triggers_for(&def.name, TriggerEvent::Delete, TriggerTiming::Before)?);
+    let (after_row, after_stmt) =
+        split_for_each(tx.triggers_for(&def.name, TriggerEvent::Delete, TriggerTiming::After)?);
     let mut doomed: Vec<(i64, Vec<Value>)> = Vec::new(); // rowid, OLD
     for (rowid, row) in candidate_rows(tx, &def, &schema, where_clause, params)? {
         if let Some(cond) = where_clause
@@ -655,11 +673,13 @@ fn run_delete(
         doomed.push((rowid, row));
     }
     let n = doomed.len();
+    fire(tx, &def, &before_stmt, None, None)?; // BEFORE … FOR EACH STATEMENT
     for (rowid, old_row) in doomed {
-        fire(tx, &def, &before, Some(&old_row), None)?;
+        fire(tx, &def, &before_row, Some(&old_row), None)?;
         tx.delete_row(&def, rowid)?;
-        fire(tx, &def, &after, Some(&old_row), None)?;
+        fire(tx, &def, &after_row, Some(&old_row), None)?;
     }
+    fire(tx, &def, &after_stmt, None, None)?; // AFTER … FOR EACH STATEMENT
     Ok(n)
 }
 
@@ -799,6 +819,14 @@ fn subst_stmt(
         },
         other => other.clone(),
     })
+}
+
+/// Particiona los triggers de un (evento, momento) en `(row-level, statement-level)`.
+/// Los row-level se disparan por fila; los statement-level una vez por sentencia.
+fn split_for_each(triggers: Vec<TriggerDef>) -> (Vec<TriggerDef>, Vec<TriggerDef>) {
+    triggers
+        .into_iter()
+        .partition(|t| t.for_each == TriggerForEach::Row)
 }
 
 /// Dispara `triggers` (mismo evento+momento) para una fila, con guarda de recursión.

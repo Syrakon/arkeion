@@ -174,15 +174,43 @@ impl TriggerEvent {
     }
 }
 
-/// Trigger **row-level**: dispara su cuerpo (DML) por cada fila afectada del evento.
+/// Granularidad de disparo: por fila afectada o una vez por sentencia.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TriggerForEach {
+    /// `FOR EACH ROW`: el cuerpo se dispara por cada fila afectada (con OLD/NEW).
+    Row,
+    /// `FOR EACH STATEMENT`: el cuerpo se dispara una sola vez por sentencia,
+    /// aunque afecte a cero o varias filas. Sin acceso a OLD/NEW (no hay fila).
+    Statement,
+}
+
+impl TriggerForEach {
+    fn as_u8(self) -> u8 {
+        match self {
+            TriggerForEach::Row => 0,
+            TriggerForEach::Statement => 1,
+        }
+    }
+    fn from_u8(b: u8) -> Option<TriggerForEach> {
+        match b {
+            0 => Some(TriggerForEach::Row),
+            1 => Some(TriggerForEach::Statement),
+            _ => None,
+        }
+    }
+}
+
+/// Trigger: dispara su cuerpo (DML) en un evento INSERT/UPDATE/DELETE, por fila
+/// (`Row`, con `OLD`/`NEW`) o una vez por sentencia (`Statement`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TriggerDef {
     pub name: String,
     pub timing: TriggerTiming,
     pub event: TriggerEvent,
+    pub for_each: TriggerForEach,
     pub table: String,
     /// Cuerpo `BEGIN … END` como texto; se re-parsea al disparar (con `OLD`/`NEW`
-    /// sustituidos por los valores de la fila).
+    /// sustituidos por los valores de la fila en los triggers `Row`).
     pub body: String,
 }
 
@@ -1157,10 +1185,17 @@ fn trigger_key(name: &str) -> Vec<u8> {
 }
 
 /// `[timing u8][event u8][tabla_len varint][tabla][cuerpo]` (el nombre va en la clave).
+/// Marcador del formato de registro de trigger v2 (con `for_each` e INSTEAD OF).
+/// El v1 empezaba con el byte de `timing` (0/1), así que `0xF1` lo distingue sin
+/// ambigüedad: un registro antiguo nunca empieza por `0xF1`.
+const TRIGGER_FMT_V2: u8 = 0xF1;
+
 fn encode_trigger(t: &TriggerDef) -> Vec<u8> {
     let mut out = Vec::with_capacity(8 + t.table.len() + t.body.len());
+    out.push(TRIGGER_FMT_V2);
     out.push(t.timing.as_u8());
     out.push(t.event.as_u8());
+    out.push(t.for_each.as_u8());
     put_varint(&mut out, t.table.len() as u64);
     out.extend_from_slice(t.table.as_bytes());
     out.extend_from_slice(t.body.as_bytes());
@@ -1169,9 +1204,20 @@ fn encode_trigger(t: &TriggerDef) -> Vec<u8> {
 
 fn decode_trigger(name: &str, buf: &[u8]) -> Result<TriggerDef> {
     let bad = || Error::CorruptRecord("trigger mal formado");
-    let timing = TriggerTiming::from_u8(*buf.first().ok_or_else(bad)?).ok_or_else(bad)?;
-    let event = TriggerEvent::from_u8(*buf.get(1).ok_or_else(bad)?).ok_or_else(bad)?;
-    let mut pos = 2usize;
+    // v2: `[0xF1][timing][event][for_each][tlen][table][body]`. v1 (antiguo):
+    // `[timing][event][tlen][table][body]`, row-level y sin INSTEAD OF.
+    let (timing_at, for_each) = if buf.first().copied() == Some(TRIGGER_FMT_V2) {
+        (
+            1usize,
+            TriggerForEach::from_u8(*buf.get(3).ok_or_else(bad)?).ok_or_else(bad)?,
+        )
+    } else {
+        (0usize, TriggerForEach::Row)
+    };
+    let timing = TriggerTiming::from_u8(*buf.get(timing_at).ok_or_else(bad)?).ok_or_else(bad)?;
+    let event = TriggerEvent::from_u8(*buf.get(timing_at + 1).ok_or_else(bad)?).ok_or_else(bad)?;
+    // El v2 inserta el byte `for_each` entre `event` y `tlen`; el v1 no.
+    let mut pos = timing_at + 2 + usize::from(timing_at == 1);
     let tlen = take_varint(buf, &mut pos).ok_or_else(bad)? as usize;
     let table =
         String::from_utf8(buf.get(pos..pos + tlen).ok_or_else(bad)?.to_vec()).map_err(|_| bad())?;
@@ -1181,6 +1227,7 @@ fn decode_trigger(name: &str, buf: &[u8]) -> Result<TriggerDef> {
         name: name.to_owned(),
         timing,
         event,
+        for_each,
         table,
         body,
     })

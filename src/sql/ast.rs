@@ -1,6 +1,8 @@
 //! AST del subconjunto SQL v1 (docs/04-sql.md).
 
-use crate::catalog::{ColType, ColumnFk, ColumnPos, ForeignKeySpec, TriggerEvent, TriggerTiming};
+use crate::catalog::{
+    ColType, ColumnFk, ColumnPos, ForeignKeySpec, TriggerEvent, TriggerForEach, TriggerTiming,
+};
 use crate::record::Value;
 
 // `Select` es bastante más grande que el resto de variantes, pero `Stmt` es un
@@ -33,13 +35,15 @@ pub enum Stmt {
         if_exists: bool,
         name: String,
     },
-    /// `CREATE TRIGGER … {BEFORE|AFTER} {INSERT|UPDATE|DELETE} ON t [FOR EACH ROW]
-    /// BEGIN … END`. El cuerpo (DML) se guarda como texto y se re-parsea al disparar.
+    /// `CREATE TRIGGER … {BEFORE|AFTER|INSTEAD OF} {INSERT|UPDATE|DELETE} ON t
+    /// [FOR EACH {ROW|STATEMENT}] BEGIN … END`. El cuerpo (DML) se guarda como
+    /// texto y se re-parsea al disparar.
     CreateTrigger {
         if_not_exists: bool,
         name: String,
         timing: TriggerTiming,
         event: TriggerEvent,
+        for_each: TriggerForEach,
         table: String,
         body_sql: String,
     },

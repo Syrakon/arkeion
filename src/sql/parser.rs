@@ -11,7 +11,8 @@
 //! ```
 
 use crate::catalog::{
-    ColType, ColumnFk, ColumnPos, FkAction, ForeignKeySpec, TriggerEvent, TriggerTiming,
+    ColType, ColumnFk, ColumnPos, FkAction, ForeignKeySpec, TriggerEvent, TriggerForEach,
+    TriggerTiming,
 };
 use crate::error::{Error, Result};
 use crate::record::Value;
@@ -208,7 +209,8 @@ impl<'a> Parser<'a> {
     }
 
     /// `CREATE TRIGGER [IF NOT EXISTS] nombre {BEFORE|AFTER} {INSERT|UPDATE|DELETE}
-    /// ON tabla [FOR EACH ROW] BEGIN <dml>; … END`. El cuerpo se guarda como texto.
+    /// ON tabla [FOR EACH {ROW|STATEMENT}] BEGIN <dml>; … END`. El cuerpo se guarda
+    /// como texto.
     fn create_trigger(&mut self) -> Result<Stmt> {
         self.expect_kw(Kw::Trigger, "TRIGGER")?;
         let if_not_exists = self.if_not_exists()?;
@@ -231,11 +233,19 @@ impl<'a> Parser<'a> {
         };
         self.expect_kw(Kw::On, "ON")?;
         let table = self.ident("una tabla")?;
-        if self.eat_kw(Kw::For) {
-            // FOR EACH ROW (solo soportamos row-level; opcional).
+        // `FOR EACH {ROW|STATEMENT}` — opcional; por defecto ROW (estilo SQLite).
+        let for_each = if self.eat_kw(Kw::For) {
             self.expect_kw(Kw::Each, "EACH")?;
-            self.expect_kw(Kw::Row, "ROW")?;
-        }
+            if self.eat_kw(Kw::Row) {
+                TriggerForEach::Row
+            } else if self.eat_kw(Kw::Statement) {
+                TriggerForEach::Statement
+            } else {
+                return Err(err_at(self.pos(), "se esperaba ROW o STATEMENT"));
+            }
+        } else {
+            TriggerForEach::Row
+        };
         self.expect_kw(Kw::Begin, "BEGIN")?;
         // Cuerpo: sentencias hasta END. Se parsean para validar y localizar el END
         // (un CASE…END interno lo consume `statement`, no este bucle); se guarda el
@@ -252,6 +262,7 @@ impl<'a> Parser<'a> {
             name,
             timing,
             event,
+            for_each,
             table,
             body_sql,
         })

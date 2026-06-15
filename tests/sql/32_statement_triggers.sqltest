@@ -1,0 +1,66 @@
+-- Triggers FOR EACH STATEMENT: el cuerpo se dispara UNA vez por sentencia,
+-- afecte a 0, 1 o N filas (sin acceso a OLD/NEW, no hay fila concreta).
+
+> CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT);
+ok
+
+> CREATE TABLE audit (id INTEGER PRIMARY KEY, what TEXT);
+ok
+
+> CREATE TABLE audit_row (id INTEGER PRIMARY KEY, what TEXT);
+ok
+
+-- AFTER INSERT a nivel de sentencia: una sola entrada por sentencia.
+> CREATE TRIGGER log_ins AFTER INSERT ON items FOR EACH STATEMENT BEGIN INSERT INTO audit (what) VALUES ('insert'); END;
+ok
+
+-- INSERT de 3 filas → 3 items, pero UNA sola entrada de auditoría.
+> INSERT INTO items (name) VALUES ('a'), ('b'), ('c');
+affected 3
+
+> SELECT COUNT(*) FROM items;
+3
+
+> SELECT COUNT(*) FROM audit;
+1
+
+-- Statement-level frente a row-level: el row-level registra por cada fila.
+> CREATE TRIGGER log_ins_row AFTER INSERT ON items FOR EACH ROW BEGIN INSERT INTO audit_row (what) VALUES ('row'); END;
+ok
+
+> INSERT INTO items (name) VALUES ('d'), ('e');
+affected 2
+
+-- statement-level: +1 (total 2); row-level: +2.
+> SELECT COUNT(*) FROM audit;
+2
+
+> SELECT COUNT(*) FROM audit_row;
+2
+
+-- Dispara aunque la sentencia afecte a CERO filas (un row-level no lo haría).
+> CREATE TRIGGER log_del AFTER DELETE ON items FOR EACH STATEMENT BEGIN INSERT INTO audit (what) VALUES ('delete'); END;
+ok
+
+> DELETE FROM items WHERE id = 999;
+affected 0
+
+> SELECT COUNT(*) FROM audit;
+3
+
+-- BEFORE … FOR EACH STATEMENT: también una sola vez.
+> CREATE TRIGGER before_upd BEFORE UPDATE ON items FOR EACH STATEMENT BEGIN INSERT INTO audit (what) VALUES ('preupd'); END;
+ok
+
+> UPDATE items SET name = 'X' WHERE id = 1;
+affected 1
+
+> SELECT COUNT(*) FROM audit;
+4
+
+-- OLD/NEW no están disponibles en un trigger de sentencia.
+> CREATE TRIGGER bad_stmt AFTER INSERT ON items FOR EACH STATEMENT BEGIN INSERT INTO audit (what) VALUES (NEW.name); END;
+ok
+
+> INSERT INTO items (name) VALUES ('z');
+error NEW

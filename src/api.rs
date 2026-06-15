@@ -738,6 +738,13 @@ impl Connection {
         })
     }
 
+    /// `true` si hay una transacción abierta en esta conexión (un `BEGIN` sin
+    /// `COMMIT`/`ROLLBACK`). El servidor la usa para acotar con un timeout las
+    /// transacciones inactivas que retendrían el escritor único.
+    pub fn in_transaction(&self) -> bool {
+        self.open_tx.borrow().is_some()
+    }
+
     /// Versión actual de la conexión: el snapshot fijado si la conexión es de
     /// solo lectura ([`Connection::snapshot`]), o el head de su rama si no.
     pub fn version(&self) -> u64 {

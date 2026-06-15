@@ -33,6 +33,7 @@ const REQ_QUERY: u8 = 4;
 const REQ_VERIFY: u8 = 5;
 const REQ_DIFF: u8 = 6;
 const REQ_MERGE: u8 = 7;
+const REQ_AUTH: u8 = 8;
 
 const RES_WELCOME: u8 = 1;
 const RES_AFFECTED: u8 = 2;
@@ -254,6 +255,10 @@ pub enum Request {
     /// Fusiona `from` en `into` (política FailOnConflict); responde
     /// [`Response::Merged`] o [`Response::Error`] si hay conflicto.
     Merge { from: String, into: String },
+    /// Autenticación: usuario y contraseña. Responde [`Response::Welcome`] si las
+    /// credenciales valen, o [`Response::Error`]. La verificación (hash) la hace el
+    /// servidor; el protocolo solo transporta las cadenas.
+    Auth { user: String, password: String },
 }
 
 impl Request {
@@ -290,6 +295,11 @@ impl Request {
                 put_str(&mut o, from);
                 put_str(&mut o, into);
             }
+            Request::Auth { user, password } => {
+                o.push(REQ_AUTH);
+                put_str(&mut o, user);
+                put_str(&mut o, password);
+            }
         }
         o
     }
@@ -318,6 +328,10 @@ impl Request {
             REQ_MERGE => Request::Merge {
                 from: take_str(buf, &mut pos)?,
                 into: take_str(buf, &mut pos)?,
+            },
+            REQ_AUTH => Request::Auth {
+                user: take_str(buf, &mut pos)?,
+                password: take_str(buf, &mut pos)?,
             },
             other => return Err(ProtoError::BadTag(other)),
         };
@@ -499,6 +513,10 @@ mod tests {
         req_roundtrip(Request::Merge {
             from: "migracion-iva".into(),
             into: "main".into(),
+        });
+        req_roundtrip(Request::Auth {
+            user: "ada".into(),
+            password: "s3cr3t·áéí".into(),
         });
     }
 

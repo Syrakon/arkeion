@@ -942,21 +942,14 @@ impl<'a> Parser<'a> {
     fn order_by_items(&mut self) -> Result<Vec<OrderBy>> {
         let mut items = Vec::new();
         loop {
-            let first = self.ident("un nombre de columna")?;
-            let (table, column) = if self.eat(&Tok::Dot) {
-                (Some(first), self.ident("un nombre de columna")?)
-            } else {
-                (None, first)
-            };
+            // Una expresión: columna, `tabla.columna`, alias de la proyección, un
+            // literal entero (posición ordinal) o cualquier expresión.
+            let expr = self.expr()?;
             let desc = self.eat_kw(Kw::Desc);
             if !desc {
                 let _ = self.eat_kw(Kw::Asc); // ASC es el valor por defecto
             }
-            items.push(OrderBy {
-                table,
-                column,
-                desc,
-            });
+            items.push(OrderBy { expr, desc });
             if !self.eat(&Tok::Comma) {
                 break;
             }
@@ -1574,13 +1567,17 @@ mod tests {
             s.order_by,
             vec![
                 OrderBy {
-                    table: None,
-                    column: "total".into(),
+                    expr: Expr::Column {
+                        table: None,
+                        name: "total".into()
+                    },
                     desc: true
                 },
                 OrderBy {
-                    table: None,
-                    column: "id".into(),
+                    expr: Expr::Column {
+                        table: None,
+                        name: "id".into()
+                    },
                     desc: false
                 },
             ]
@@ -1622,7 +1619,13 @@ mod tests {
             &s.projection[0],
             SelectItem::Expr { expr: Expr::Column { table: Some(t), name }, .. } if t == "c" && name == "nombre"
         ));
-        assert_eq!(s.order_by[0].table.as_deref(), Some("c"));
+        assert_eq!(
+            s.order_by[0].expr,
+            Expr::Column {
+                table: Some("c".into()),
+                name: "id".into()
+            }
+        );
     }
 
     #[test]

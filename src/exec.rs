@@ -15,7 +15,7 @@ use crate::catalog::{
 use crate::error::{Error, Result};
 use crate::record::Value;
 use crate::sql::ast::{
-    AggFunc, BinOp, ColumnAst, Cte, Expr, InsertSource, JoinKind, OnConflict, SelectItem,
+    AggFunc, BinOp, ColumnAst, Cte, Expr, InsertSource, JoinKind, OnConflict, OrderBy, SelectItem,
     SelectStmt, SetOp, Stmt, TableRef, UnOp, WindowFunc,
 };
 use crate::sql::json;
@@ -275,7 +275,7 @@ fn validate_columns(e: &Expr, schema: &QuerySchema) -> Result<()> {
                 validate_columns(a, schema)?;
             }
             for o in order_by {
-                schema.resolve(o.table.as_deref(), &o.column)?;
+                validate_columns(&o.expr, schema)?;
             }
             Ok(())
         }
@@ -287,6 +287,48 @@ fn no_aggregates(e: &Expr, clause: &str) -> Result<()> {
         return Err(sql_err(format!("los agregados no se permiten en {clause}")));
     }
     Ok(())
+}
+
+/// Resuelve un destino de `ORDER BY` a un índice de columna de **salida**: por
+/// nombre (columna/alias de la proyección) o por posición ordinal 1-based
+/// (`ORDER BY 2`). Para los caminos que ordenan filas ya proyectadas
+/// (UNION, GROUP BY, ventanas).
+fn order_output_index(o: &OrderBy, columns: &[String]) -> Result<usize> {
+    match &o.expr {
+        Expr::Column { table: None, name } => columns
+            .iter()
+            .position(|c| c == name)
+            .ok_or_else(|| sql_err(format!("ORDER BY: «{name}» no está en la proyección"))),
+        Expr::Literal(Value::Integer(n)) if *n >= 1 && (*n as usize) <= columns.len() => {
+            Ok(*n as usize - 1)
+        }
+        _ => Err(sql_err(
+            "ORDER BY aquí solo admite una columna de salida o su posición",
+        )),
+    }
+}
+
+/// Para el `ORDER BY` del SELECT principal: la expresión a evaluar sobre la fila
+/// de **entrada**. Un literal entero N → la N-ésima expresión de la proyección;
+/// un alias → su expresión; si no, la propia expresión (columna o cálculo).
+fn order_key_expr<'a>(o: &'a OrderBy, projection: &'a [SelectItem]) -> Result<&'a Expr> {
+    match &o.expr {
+        Expr::Literal(Value::Integer(n)) if *n >= 1 => match projection.get(*n as usize - 1) {
+            Some(SelectItem::Expr { expr, .. }) => Ok(expr),
+            _ => Err(sql_err("ORDER BY: posición fuera de rango o sobre '*'")),
+        },
+        Expr::Column { table: None, name } => Ok(projection
+            .iter()
+            .find_map(|it| match it {
+                SelectItem::Expr {
+                    expr,
+                    alias: Some(a),
+                } if a == name => Some(expr),
+                _ => None,
+            })
+            .unwrap_or(&o.expr)),
+        _ => Ok(&o.expr),
+    }
 }
 
 // --- sentencias de escritura (autocommit lo gestiona la API) ---
@@ -1877,15 +1919,24 @@ pub fn run_select(src: &impl DataSource, stmt: &SelectStmt, params: &[Value]) ->
     }
 
     if !stmt.order_by.is_empty() {
-        let order: Vec<(usize, bool)> = stmt
-            .order_by
-            .iter()
-            .map(|o| Ok((schema.resolve(o.table.as_deref(), &o.column)?, o.desc)))
-            .collect::<Result<_>>()?;
+        // Cada clave de ORDER BY es una expresión sobre la fila de entrada (una
+        // columna, un alias/posición de la proyección, o cualquier cálculo). Se
+        // pre-calculan los valores de clave por fila y se ordena por ellos.
+        let mut keyed: Vec<(Vec<Value>, Vec<Value>)> = Vec::with_capacity(rows.len());
+        for row in rows {
+            let mut keys = Vec::with_capacity(stmt.order_by.len());
+            for o in &stmt.order_by {
+                let e = order_key_expr(o, &stmt.projection)?;
+                validate_columns(e, &schema)?;
+                keys.push(eval(e, Some((&schema, &row)), params)?);
+            }
+            keyed.push((keys, row));
+        }
+        let descs: Vec<bool> = stmt.order_by.iter().map(|o| o.desc).collect();
         let mut first_err: Option<Error> = None;
-        rows.sort_by(|a, b| {
-            for (idx, desc) in &order {
-                match cmp_nulls_first(&a[*idx], &b[*idx]) {
+        keyed.sort_by(|(ka, _), (kb, _)| {
+            for (i, desc) in descs.iter().enumerate() {
+                match cmp_nulls_first(&ka[i], &kb[i]) {
                     Ok(Ordering::Equal) => continue,
                     Ok(o) => return if *desc { o.reverse() } else { o },
                     Err(e) => {
@@ -1899,6 +1950,7 @@ pub fn run_select(src: &impl DataSource, stmt: &SelectStmt, params: &[Value]) ->
         if let Some(e) = first_err {
             return Err(e);
         }
+        rows = keyed.into_iter().map(|(_, row)| row).collect();
     }
 
     // Sin DISTINCT, LIMIT/OFFSET se aplica ya (cada fila de entrada da una de
@@ -2606,14 +2658,11 @@ fn expr_refs_quals(e: &Expr, quals: &HashSet<String>) -> bool {
             partition_by,
             order_by,
             ..
-        } => {
-            args.iter()
-                .chain(partition_by)
-                .any(|x| expr_refs_quals(x, quals))
-                || order_by
-                    .iter()
-                    .any(|o| o.table.as_deref().is_some_and(|q| quals.contains(q)))
-        }
+        } => args
+            .iter()
+            .chain(partition_by)
+            .chain(order_by.iter().map(|o| &o.expr))
+            .any(|x| expr_refs_quals(x, quals)),
     }
 }
 
@@ -3075,23 +3124,12 @@ fn run_compound(src: &impl DataSource, stmt: &SelectStmt, params: &[Value]) -> R
         }
     }
 
-    // ORDER BY sobre las columnas de SALIDA de la unión (por nombre).
+    // ORDER BY sobre las columnas de SALIDA de la unión (por nombre o posición).
     if !stmt.order_by.is_empty() {
         let order: Vec<(usize, bool)> = stmt
             .order_by
             .iter()
-            .map(|o| {
-                columns
-                    .iter()
-                    .position(|c| *c == o.column)
-                    .map(|i| (i, o.desc))
-                    .ok_or_else(|| {
-                        sql_err(format!(
-                            "ORDER BY en UNION: columna desconocida «{}»",
-                            o.column
-                        ))
-                    })
-            })
+            .map(|o| Ok((order_output_index(o, &columns)?, o.desc)))
             .collect::<Result<_>>()?;
         let mut first_err: Option<Error> = None;
         rows.sort_by(|a, b| {
@@ -3709,17 +3747,12 @@ fn run_grouped(
         out_rows.push(out);
     }
 
-    // ORDER BY sobre las columnas de SALIDA, por nombre.
+    // ORDER BY sobre las columnas de SALIDA (por nombre o posición).
     if !stmt.order_by.is_empty() {
         let order: Vec<(usize, bool)> = stmt
             .order_by
             .iter()
-            .map(|o| {
-                let idx = columns.iter().position(|c| c == &o.column).ok_or_else(|| {
-                    sql_err(format!("ORDER BY: «{}» no está en la proyección", o.column))
-                })?;
-                Ok((idx, o.desc))
-            })
+            .map(|o| Ok((order_output_index(o, &columns)?, o.desc)))
             .collect::<Result<_>>()?;
         let mut first_err: Option<Error> = None;
         out_rows.sort_by(|a, b| {
@@ -3833,11 +3866,25 @@ fn run_windowed(
         }
         let mut keys: Vec<(Key, bool)> = Vec::new();
         for o in &stmt.order_by {
-            if let Some(idx) = columns.iter().position(|c| c == &o.column) {
-                keys.push((Key::Out(idx), o.desc));
-            } else {
-                let idx = schema.resolve(o.table.as_deref(), &o.column)?;
-                keys.push((Key::Schema(idx), o.desc));
+            match &o.expr {
+                Expr::Column { table: None, name } if columns.iter().any(|c| c == name) => {
+                    let idx = columns
+                        .iter()
+                        .position(|c| c == name)
+                        .expect("recién comprobado");
+                    keys.push((Key::Out(idx), o.desc));
+                }
+                Expr::Literal(Value::Integer(n)) if *n >= 1 && (*n as usize) <= columns.len() => {
+                    keys.push((Key::Out(*n as usize - 1), o.desc));
+                }
+                Expr::Column { table, name } => {
+                    keys.push((Key::Schema(schema.resolve(table.as_deref(), name)?), o.desc));
+                }
+                _ => {
+                    return Err(sql_err(
+                        "ORDER BY con ventanas solo admite una columna o su posición",
+                    ));
+                }
             }
         }
         let mut order: Vec<usize> = (0..out_rows.len()).collect();
@@ -4007,19 +4054,27 @@ fn compute_window(
         parts[pi].push(i);
     }
 
-    // Índices de columna del ORDER BY de la ventana.
-    let order_idx: Vec<(usize, bool)> = order_by
+    // Pre-evaluar las claves de ORDER BY de la ventana por fila (expresiones), en
+    // paralelo a `rows`. El ORDER BY de `OVER` admite cualquier expresión.
+    let order_keys: Vec<Vec<Value>> = rows
         .iter()
-        .map(|o| Ok((schema.resolve(o.table.as_deref(), &o.column)?, o.desc)))
+        .map(|row| {
+            order_by
+                .iter()
+                .map(|o| eval(&o.expr, Some((schema, row)), params))
+                .collect::<Result<_>>()
+        })
         .collect::<Result<_>>()?;
+    let descs: Vec<bool> = order_by.iter().map(|o| o.desc).collect();
+    let has_order = !order_by.is_empty();
 
     for part in &mut parts {
-        // Ordenar los índices de la partición por el ORDER BY de la ventana (estable).
-        if !order_idx.is_empty() {
+        // Ordenar los índices de la partición por las claves de ventana (estable).
+        if has_order {
             let mut err: Option<Error> = None;
             part.sort_by(|&a, &b| {
-                for (idx, desc) in &order_idx {
-                    match cmp_nulls_first(&rows[a][*idx], &rows[b][*idx]) {
+                for (i, desc) in descs.iter().enumerate() {
+                    match cmp_nulls_first(&order_keys[a][i], &order_keys[b][i]) {
                         Ok(Ordering::Equal) => continue,
                         Ok(o) => return if *desc { o.reverse() } else { o },
                         Err(e) => {
@@ -4037,7 +4092,8 @@ fn compute_window(
         window_partition(
             *func,
             args,
-            &order_idx,
+            &order_keys,
+            has_order,
             part,
             schema,
             rows,
@@ -4054,7 +4110,8 @@ fn compute_window(
 fn window_partition(
     func: WindowFunc,
     args: &[Expr],
-    order_idx: &[(usize, bool)],
+    order_keys: &[Vec<Value>],
+    has_order: bool,
     part: &[usize],
     schema: &QuerySchema,
     rows: &[Vec<Value>],
@@ -4062,7 +4119,6 @@ fn window_partition(
     result: &mut [Value],
 ) -> Result<()> {
     let m = part.len();
-    let has_order = !order_idx.is_empty();
     // El argumento de valor (LAG/LEAD/FIRST/LAST/SUM/…) es `args[0]`.
     let arg0 =
         |idx: usize| -> Result<Value> { eval(&args[0], Some((schema, &rows[part[idx]])), params) };
@@ -4075,10 +4131,10 @@ fn window_partition(
         WindowFunc::Rank | WindowFunc::DenseRank => {
             let mut rank = 0i64;
             let mut dense = 0i64;
-            let mut prev: Option<Vec<Value>> = None;
+            let mut prev: Option<&Vec<Value>> = None;
             for (k, &i) in part.iter().enumerate() {
-                let key: Vec<Value> = order_idx.iter().map(|(c, _)| rows[i][*c].clone()).collect();
-                if !has_order || prev.as_ref() != Some(&key) {
+                let key = &order_keys[i];
+                if !has_order || prev != Some(key) {
                     rank = (k + 1) as i64;
                     dense += 1;
                 }

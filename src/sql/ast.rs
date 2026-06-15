@@ -211,8 +211,9 @@ pub struct Join {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct OrderBy {
-    pub table: Option<String>,
-    pub column: String,
+    /// Clave de ordenación: una expresión, una columna, un **alias** de la
+    /// proyección, o un **literal entero** = posición ordinal (`ORDER BY 1`).
+    pub expr: Expr,
     pub desc: bool,
 }
 

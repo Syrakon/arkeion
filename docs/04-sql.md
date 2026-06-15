@@ -180,6 +180,12 @@ un `WHERE` falso descarta esa actualización. La lista de columnas objetivo tras
 `ON CONFLICT` se acepta pero no restringe (el conflicto se detecta sobre cualquier clave
 única). El recuento incluye filas insertadas y actualizadas, no las omitidas.
 
+**`ORDER BY`** acepta una **expresión** (`ORDER BY a + b`, `ORDER BY length(name)`),
+un **alias** de la proyección, o una **posición ordinal** 1-based (`ORDER BY 2`),
+además de un nombre de columna; `[ASC|DESC]` por clave (NULL primero, estilo SQLite).
+En el SELECT principal la clave se evalúa sobre la fila de entrada; en `GROUP BY`/
+`UNION`/ventanas, `ORDER BY` resuelve por columna de salida o posición.
+
 `GROUP BY` / `HAVING` (post-M9): `SELECT … GROUP BY e1, e2 [HAVING cond]` agrupa por el
 valor de las expresiones (normalmente columnas) y emite una fila por grupo, plegando los
 agregados de la proyección sobre cada grupo. Una columna fuera de un agregado debe aparecer

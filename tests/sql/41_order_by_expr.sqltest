@@ -1,0 +1,56 @@
+-- ORDER BY admite expresiones, alias de la proyección y posición ordinal (no solo
+-- un nombre de columna).
+
+> CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, name TEXT);
+ok
+
+> INSERT INTO t (a, b, name) VALUES (3, 1, 'cc'), (1, 5, 'a'), (2, 2, 'bbbb');
+affected 3
+
+-- Por expresión aritmética (orden estable en empates).
+> SELECT a, b FROM t ORDER BY a + b;
+3|1
+2|2
+1|5
+
+-- Por expresión de función.
+> SELECT name FROM t ORDER BY length(name);
+a
+cc
+bbbb
+
+-- Por posición ordinal (la 2ª columna de salida = b).
+> SELECT a, b FROM t ORDER BY 2;
+3|1
+2|2
+1|5
+
+> SELECT a, b FROM t ORDER BY 2 DESC;
+1|5
+2|2
+3|1
+
+-- Por alias de la proyección.
+> SELECT a, a * 10 AS x FROM t ORDER BY x DESC;
+3|30
+2|20
+1|10
+
+-- Varias claves: expresión DESC y luego columna ASC.
+> SELECT a, b FROM t ORDER BY (a + b) DESC, a;
+1|5
+2|2
+3|1
+
+-- Posición ordinal con GROUP BY (camino de salida).
+> SELECT name, length(name) AS len FROM t GROUP BY name ORDER BY 2;
+a|1
+cc|2
+bbbb|4
+
+-- Posición ordinal con UNION.
+> SELECT a FROM t UNION SELECT b FROM t ORDER BY 1 DESC;
+5
+3
+2
+1

@@ -219,8 +219,11 @@ impl<'a> Parser<'a> {
             TriggerTiming::Before
         } else if self.eat_kw(Kw::After) {
             TriggerTiming::After
+        } else if self.eat_kw(Kw::Instead) {
+            self.expect_kw(Kw::Of, "OF")?;
+            TriggerTiming::InsteadOf
         } else {
-            return Err(err_at(self.pos(), "se esperaba BEFORE o AFTER"));
+            return Err(err_at(self.pos(), "se esperaba BEFORE, AFTER o INSTEAD OF"));
         };
         let event = if self.eat_kw(Kw::Insert) {
             TriggerEvent::Insert

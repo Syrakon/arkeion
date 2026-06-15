@@ -74,7 +74,7 @@ error OLD no está disponible
 
 -- Errores de creación.
 > CREATE TRIGGER t2 AFTER INSERT ON ghosttable BEGIN DELETE FROM audit; END;
-error tabla del trigger no existe
+error requiere una tabla existente
 
 > CREATE TRIGGER log_upd AFTER UPDATE ON accounts BEGIN DELETE FROM audit; END;
 error el trigger ya existe

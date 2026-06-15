@@ -402,6 +402,11 @@ pub fn run_execute(tx: &mut WriteTx, stmt: &Stmt, params: &[Value]) -> Result<us
             columns,
             rows,
         } => {
+            // Escribir en una vista: lo gestiona un trigger INSTEAD OF (la vista no
+            // almacena).
+            if tx.table(table)?.is_none() && tx.view(table)?.is_some() {
+                return run_instead_of_insert(tx, table, columns.as_deref(), rows, params);
+            }
             // `table_cached`: un INSERT-por-fila en un lote no re-desciende el
             // catálogo por cada sentencia (el esquema no cambia entre filas).
             let def = tx
@@ -590,6 +595,9 @@ fn run_update(
     where_clause: Option<&Expr>,
     params: &[Value],
 ) -> Result<usize> {
+    if tx.table(table)?.is_none() && tx.view(table)?.is_some() {
+        return run_instead_of_update(tx, table, sets, where_clause, params);
+    }
     let def = tx
         .table_cached(table)?
         .ok_or_else(|| sql_err(format!("tabla desconocida: {table}")))?;
@@ -651,6 +659,9 @@ fn run_delete(
     where_clause: Option<&Expr>,
     params: &[Value],
 ) -> Result<usize> {
+    if tx.table(table)?.is_none() && tx.view(table)?.is_some() {
+        return run_instead_of_delete(tx, table, where_clause, params);
+    }
     let def = tx
         .table_cached(table)?
         .ok_or_else(|| sql_err(format!("tabla desconocida: {table}")))?;
@@ -680,6 +691,153 @@ fn run_delete(
         fire(tx, &def, &after_row, Some(&old_row), None)?;
     }
     fire(tx, &def, &after_stmt, None, None)?; // AFTER … FOR EACH STATEMENT
+    Ok(n)
+}
+
+// --- INSTEAD OF: escrituras sobre vistas reemplazadas por el cuerpo del trigger ---
+
+/// Materializa una vista contra el estado actual de la tx: devuelve su `TableDef`
+/// sintética (nombres de columna de salida) y sus filas. Es lo que ve `OLD`/`NEW`
+/// de un trigger INSTEAD OF.
+fn materialize_view(tx: &WriteTx, name: &str) -> Result<(TableDef, Vec<Vec<Value>>)> {
+    let vs = ViewSource::new(tx);
+    let def = vs
+        .table(name)?
+        .ok_or_else(|| sql_err(format!("vista desconocida: {name}")))?;
+    let rows = vs.scan_rows(&def)?;
+    Ok((def, rows))
+}
+
+/// `INSERT INTO vista …`: dispara el trigger INSTEAD OF INSERT con `NEW` = la fila
+/// propuesta (sobre el esquema de columnas de la vista).
+fn run_instead_of_insert(
+    tx: &mut WriteTx,
+    view: &str,
+    columns: Option<&[String]>,
+    rows: &[Vec<Expr>],
+    params: &[Value],
+) -> Result<usize> {
+    let trigs = tx.triggers_for(view, TriggerEvent::Insert, TriggerTiming::InsteadOf)?;
+    if trigs.is_empty() {
+        return Err(sql_err(
+            "no se puede INSERT en una vista sin un trigger INSTEAD OF",
+        ));
+    }
+    let (vdef, _) = materialize_view(tx, view)?;
+    for row in rows {
+        let mut new = vec![Value::Null; vdef.columns.len()];
+        match columns {
+            Some(names) => {
+                if names.len() != row.len() {
+                    return Err(sql_err("número distinto de columnas y de valores"));
+                }
+                for (nm, e) in names.iter().zip(row) {
+                    let i = vdef
+                        .columns
+                        .iter()
+                        .position(|c| &c.name == nm)
+                        .ok_or_else(|| sql_err(format!("columna desconocida en la vista: {nm}")))?;
+                    new[i] = eval_const(e, params)?;
+                }
+            }
+            None => {
+                if row.len() != vdef.columns.len() {
+                    return Err(sql_err(format!(
+                        "la vista tiene {} columnas pero se dieron {} valores",
+                        vdef.columns.len(),
+                        row.len()
+                    )));
+                }
+                for (i, e) in row.iter().enumerate() {
+                    new[i] = eval_const(e, params)?;
+                }
+            }
+        }
+        fire(tx, &vdef, &trigs, None, Some(&new))?;
+    }
+    Ok(rows.len())
+}
+
+/// `UPDATE vista SET … WHERE …`: por cada fila de la vista que casa el WHERE,
+/// dispara el trigger INSTEAD OF UPDATE con `OLD` = la fila y `NEW` = OLD con el
+/// SET aplicado.
+fn run_instead_of_update(
+    tx: &mut WriteTx,
+    view: &str,
+    sets: &[(String, Expr)],
+    where_clause: Option<&Expr>,
+    params: &[Value],
+) -> Result<usize> {
+    let trigs = tx.triggers_for(view, TriggerEvent::Update, TriggerTiming::InsteadOf)?;
+    if trigs.is_empty() {
+        return Err(sql_err(
+            "no se puede UPDATE una vista sin un trigger INSTEAD OF",
+        ));
+    }
+    let (vdef, rows) = materialize_view(tx, view)?;
+    let schema = QuerySchema::single(view, vdef.clone());
+    let mut set_idx = Vec::with_capacity(sets.len());
+    for (name, expr) in sets {
+        let i = vdef
+            .columns
+            .iter()
+            .position(|c| &c.name == name)
+            .ok_or_else(|| sql_err(format!("columna desconocida en la vista: {name}")))?;
+        no_aggregates(expr, "SET")?;
+        validate_columns(expr, &schema)?;
+        set_idx.push(i);
+    }
+    if let Some(cond) = where_clause {
+        no_aggregates(cond, "WHERE")?;
+        validate_columns(cond, &schema)?;
+    }
+    let mut n = 0;
+    for row in rows {
+        if let Some(cond) = where_clause
+            && !truthy(eval(cond, Some((&schema, &row)), params)?)?
+        {
+            continue;
+        }
+        let mut new_row = row.clone();
+        for (&i, (_, expr)) in set_idx.iter().zip(sets) {
+            new_row[i] = eval(expr, Some((&schema, &row)), params)?;
+        }
+        fire(tx, &vdef, &trigs, Some(&row), Some(&new_row))?;
+        n += 1;
+    }
+    Ok(n)
+}
+
+/// `DELETE FROM vista WHERE …`: por cada fila de la vista que casa el WHERE,
+/// dispara el trigger INSTEAD OF DELETE con `OLD` = la fila.
+fn run_instead_of_delete(
+    tx: &mut WriteTx,
+    view: &str,
+    where_clause: Option<&Expr>,
+    params: &[Value],
+) -> Result<usize> {
+    let trigs = tx.triggers_for(view, TriggerEvent::Delete, TriggerTiming::InsteadOf)?;
+    if trigs.is_empty() {
+        return Err(sql_err(
+            "no se puede DELETE en una vista sin un trigger INSTEAD OF",
+        ));
+    }
+    let (vdef, rows) = materialize_view(tx, view)?;
+    let schema = QuerySchema::single(view, vdef.clone());
+    if let Some(cond) = where_clause {
+        no_aggregates(cond, "WHERE")?;
+        validate_columns(cond, &schema)?;
+    }
+    let mut n = 0;
+    for row in rows {
+        if let Some(cond) = where_clause
+            && !truthy(eval(cond, Some((&schema, &row)), params)?)?
+        {
+            continue;
+        }
+        fire(tx, &vdef, &trigs, Some(&row), None)?;
+        n += 1;
+    }
     Ok(n)
 }
 

@@ -130,6 +130,9 @@ pub struct ForeignKey {
 pub enum TriggerTiming {
     Before,
     After,
+    /// `INSTEAD OF` — solo en vistas: el cuerpo **reemplaza** la escritura sobre la
+    /// vista (que no tiene almacenamiento). Siempre row-level.
+    InsteadOf,
 }
 
 /// Evento que dispara un trigger.
@@ -145,12 +148,14 @@ impl TriggerTiming {
         match self {
             TriggerTiming::Before => 0,
             TriggerTiming::After => 1,
+            TriggerTiming::InsteadOf => 2,
         }
     }
     fn from_u8(b: u8) -> Option<TriggerTiming> {
         match b {
             0 => Some(TriggerTiming::Before),
             1 => Some(TriggerTiming::After),
+            2 => Some(TriggerTiming::InsteadOf),
             _ => None,
         }
     }
@@ -1240,8 +1245,23 @@ pub fn create_trigger<S: NodeStore>(s: &mut S, root: PageId, t: &TriggerDef) -> 
     if get_trigger(s, root, &t.name)?.is_some() {
         return Err(Error::Constraint("el trigger ya existe"));
     }
-    if get_table(s, root, &t.table)?.is_none() {
-        return Err(Error::Constraint("la tabla del trigger no existe"));
+    // INSTEAD OF → solo sobre una vista y row-level; BEFORE/AFTER → solo tabla.
+    match t.timing {
+        TriggerTiming::InsteadOf => {
+            if get_view(s, root, &t.table)?.is_none() {
+                return Err(Error::Constraint("INSTEAD OF requiere una vista existente"));
+            }
+            if t.for_each != TriggerForEach::Row {
+                return Err(Error::Constraint("INSTEAD OF debe ser FOR EACH ROW"));
+            }
+        }
+        TriggerTiming::Before | TriggerTiming::After => {
+            if get_table(s, root, &t.table)?.is_none() {
+                return Err(Error::Constraint(
+                    "un trigger BEFORE/AFTER requiere una tabla existente",
+                ));
+            }
+        }
     }
     btree::insert(s, root, &trigger_key(&t.name), &encode_trigger(t))
 }

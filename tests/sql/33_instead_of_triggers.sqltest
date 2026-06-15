@@ -1,0 +1,70 @@
+-- Triggers INSTEAD OF: hacen ESCRIBIBLE una vista. La escritura sobre la vista
+-- (que no almacena) se reemplaza por el cuerpo del trigger; OLD/NEW son las filas
+-- de la vista, y el cuerpo traduce la operación a la(s) tabla(s) base.
+
+> CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, active INTEGER);
+ok
+
+> INSERT INTO users (name, active) VALUES ('ada', 1), ('bob', 0), ('cy', 1);
+affected 3
+
+> CREATE VIEW active_users AS SELECT id, name FROM users WHERE active = 1;
+ok
+
+-- La vista muestra solo los activos.
+> SELECT id, name FROM active_users ORDER BY id;
+1|ada
+3|cy
+
+-- INSTEAD OF INSERT: alta de un usuario activo.
+> CREATE TRIGGER au_ins INSTEAD OF INSERT ON active_users BEGIN INSERT INTO users (name, active) VALUES (NEW.name, 1); END;
+ok
+
+> INSERT INTO active_users (name) VALUES ('dot');
+affected 1
+
+> SELECT id, name FROM active_users ORDER BY id;
+1|ada
+3|cy
+4|dot
+
+-- INSTEAD OF UPDATE: renombrar (OLD.id localiza la fila base).
+> CREATE TRIGGER au_upd INSTEAD OF UPDATE ON active_users BEGIN UPDATE users SET name = NEW.name WHERE id = OLD.id; END;
+ok
+
+> UPDATE active_users SET name = 'ADA' WHERE id = 1;
+affected 1
+
+> SELECT name FROM users WHERE id = 1;
+ADA
+
+-- INSTEAD OF DELETE: borrado lógico (marcar inactivo en la tabla base).
+> CREATE TRIGGER au_del INSTEAD OF DELETE ON active_users BEGIN UPDATE users SET active = 0 WHERE id = OLD.id; END;
+ok
+
+> DELETE FROM active_users WHERE id = 3;
+affected 1
+
+-- 'cy' ya no aparece en la vista, pero sigue en la tabla base (inactivo).
+> SELECT id, name FROM active_users ORDER BY id;
+1|ADA
+4|dot
+
+> SELECT name, active FROM users WHERE id = 3;
+cy|0
+
+-- --- Validaciones ---
+-- INSTEAD OF requiere una vista (no una tabla).
+> CREATE TRIGGER bad_io INSTEAD OF INSERT ON users BEGIN DELETE FROM users; END;
+error INSTEAD OF requiere una vista
+
+-- INSTEAD OF debe ser FOR EACH ROW.
+> CREATE TRIGGER bad_io2 INSTEAD OF INSERT ON active_users FOR EACH STATEMENT BEGIN DELETE FROM users; END;
+error FOR EACH ROW
+
+-- Escribir en una vista SIN el trigger INSTEAD OF correspondiente → error.
+> CREATE VIEW plain_v AS SELECT id, name FROM users;
+ok
+
+> DELETE FROM plain_v WHERE id = 1;
+error INSTEAD OF

@@ -401,48 +401,16 @@ pub fn run_execute(tx: &mut WriteTx, stmt: &Stmt, params: &[Value]) -> Result<us
             table,
             columns,
             rows,
-        } => {
-            // Escribir en una vista: lo gestiona un trigger INSTEAD OF (la vista no
-            // almacena).
-            if tx.table(table)?.is_none() && tx.view(table)?.is_some() {
-                return run_instead_of_insert(tx, table, columns.as_deref(), rows, params);
-            }
-            // `table_cached`: un INSERT-por-fila en un lote no re-desciende el
-            // catálogo por cada sentencia (el esquema no cambia entre filas).
-            let def = tx
-                .table_cached(table)?
-                .ok_or_else(|| sql_err(format!("tabla desconocida: {table}")))?;
-            let (before_row, before_stmt) = split_for_each(tx.triggers_for(
-                &def.name,
-                TriggerEvent::Insert,
-                TriggerTiming::Before,
-            )?);
-            let (after_row, after_stmt) = split_for_each(tx.triggers_for(
-                &def.name,
-                TriggerEvent::Insert,
-                TriggerTiming::After,
-            )?);
-            fire(tx, &def, &before_stmt, None, None)?; // BEFORE … FOR EACH STATEMENT
-            // Buffer prestado de la tx: ni un `Vec` de valores por fila. Si una
-            // fila falla, el `?` lo pierde — camino frío, el próximo take asigna.
-            let mut values = tx.take_values_buf();
-            for row in rows {
-                insert_values_into(&def, columns.as_deref(), row, params, &mut values)?;
-                fire(tx, &def, &before_row, None, Some(&values))?; // BEFORE INSERT
-                let rowid = tx.insert_row(&def, &values)?;
-                if !after_row.is_empty() {
-                    // NEW con el rowid ya asignado.
-                    let mut new_after = values.clone();
-                    if let Some(i) = def.rowid_alias {
-                        new_after[i] = Value::Integer(rowid);
-                    }
-                    fire(tx, &def, &after_row, None, Some(&new_after))?; // AFTER INSERT
-                }
-            }
-            tx.put_values_buf(values);
-            fire(tx, &def, &after_stmt, None, None)?; // AFTER … FOR EACH STATEMENT
-            Ok(rows.len())
-        }
+            returning,
+        } => Ok(run_insert(
+            tx,
+            table,
+            columns.as_deref(),
+            rows,
+            params,
+            returning.as_deref(),
+        )?
+        .0),
         Stmt::AlterTableAddColumn { table, column } => {
             if column.primary_key {
                 return Err(sql_err(
@@ -496,17 +464,86 @@ pub fn run_execute(tx: &mut WriteTx, stmt: &Stmt, params: &[Value]) -> Result<us
             table,
             sets,
             where_clause,
-        } => run_update(tx, table, sets, where_clause.as_ref(), params),
+            returning,
+        } => Ok(run_update(
+            tx,
+            table,
+            sets,
+            where_clause.as_ref(),
+            params,
+            returning.as_deref(),
+        )?
+        .0),
         Stmt::Delete {
             table,
             where_clause,
-        } => run_delete(tx, table, where_clause.as_ref(), params),
+            returning,
+        } => Ok(run_delete(
+            tx,
+            table,
+            where_clause.as_ref(),
+            params,
+            returning.as_deref(),
+        )?
+        .0),
         // La conexión intercepta estas tres antes de llegar aquí (api.rs).
         Stmt::Begin | Stmt::Commit | Stmt::Rollback => Err(sql_err(
             "BEGIN/COMMIT/ROLLBACK los gestiona la conexión, no el ejecutor",
         )),
         Stmt::Select(_) => Err(sql_err("SELECT devuelve filas: usa query, no execute")),
     }
+}
+
+/// Ejecuta una escritura **con `RETURNING`** y devuelve sus filas. La usa el
+/// camino de consulta de la conexión (la escritura se realiza igual que en
+/// `run_execute`; aquí además se proyectan las filas afectadas).
+pub fn run_returning(tx: &mut WriteTx, stmt: &Stmt, params: &[Value]) -> Result<SelectOut> {
+    let out = match stmt {
+        Stmt::Insert {
+            table,
+            columns,
+            rows,
+            returning,
+        } => run_insert(
+            tx,
+            table,
+            columns.as_deref(),
+            rows,
+            params,
+            returning.as_deref(),
+        )?,
+        Stmt::Update {
+            table,
+            sets,
+            where_clause,
+            returning,
+        } => run_update(
+            tx,
+            table,
+            sets,
+            where_clause.as_ref(),
+            params,
+            returning.as_deref(),
+        )?,
+        Stmt::Delete {
+            table,
+            where_clause,
+            returning,
+        } => run_delete(
+            tx,
+            table,
+            where_clause.as_ref(),
+            params,
+            returning.as_deref(),
+        )?,
+        _ => {
+            return Err(sql_err(
+                "solo INSERT/UPDATE/DELETE … RETURNING devuelven filas",
+            ));
+        }
+    };
+    out.1
+        .ok_or_else(|| sql_err("la sentencia no lleva RETURNING"))
 }
 
 /// Filas candidatas a un UPDATE/DELETE. Si el `WHERE` es exactamente
@@ -588,15 +625,79 @@ fn candidate_rows(
     Ok(all)
 }
 
+fn run_insert(
+    tx: &mut WriteTx,
+    table: &str,
+    columns: Option<&[String]>,
+    rows: &[Vec<Expr>],
+    params: &[Value],
+    returning: Option<&[SelectItem]>,
+) -> Result<(usize, Option<SelectOut>)> {
+    // Escribir en una vista: lo gestiona un trigger INSTEAD OF (la vista no almacena).
+    if tx.table(table)?.is_none() && tx.view(table)?.is_some() {
+        if returning.is_some() {
+            return Err(sql_err("RETURNING no se admite al escribir en una vista"));
+        }
+        return Ok((
+            run_instead_of_insert(tx, table, columns, rows, params)?,
+            None,
+        ));
+    }
+    // `table_cached`: un INSERT-por-fila en un lote no re-desciende el catálogo por
+    // cada sentencia (el esquema no cambia entre filas).
+    let def = tx
+        .table_cached(table)?
+        .ok_or_else(|| sql_err(format!("tabla desconocida: {table}")))?;
+    let (before_row, before_stmt) =
+        split_for_each(tx.triggers_for(&def.name, TriggerEvent::Insert, TriggerTiming::Before)?);
+    let (after_row, after_stmt) =
+        split_for_each(tx.triggers_for(&def.name, TriggerEvent::Insert, TriggerTiming::After)?);
+    fire(tx, &def, &before_stmt, None, None)?; // BEFORE … FOR EACH STATEMENT
+    // La fila NEW (con el rowid asignado) solo se necesita para AFTER INSERT o RETURNING.
+    let want_new = !after_row.is_empty() || returning.is_some();
+    let mut returned = Vec::new();
+    // Buffer prestado de la tx: ni un `Vec` de valores por fila. Si una fila falla,
+    // el `?` lo pierde — camino frío, el próximo take asigna.
+    let mut values = tx.take_values_buf();
+    for row in rows {
+        insert_values_into(&def, columns, row, params, &mut values)?;
+        fire(tx, &def, &before_row, None, Some(&values))?; // BEFORE INSERT
+        let rowid = tx.insert_row(&def, &values)?;
+        if want_new {
+            let mut new_after = values.clone();
+            if let Some(i) = def.rowid_alias {
+                new_after[i] = Value::Integer(rowid);
+            }
+            fire(tx, &def, &after_row, None, Some(&new_after))?; // AFTER INSERT
+            if returning.is_some() {
+                returned.push(new_after);
+            }
+        }
+    }
+    tx.put_values_buf(values);
+    fire(tx, &def, &after_stmt, None, None)?; // AFTER … FOR EACH STATEMENT
+    let out = returning
+        .map(|items| eval_returning(table, &def, items, &returned, params))
+        .transpose()?;
+    Ok((rows.len(), out))
+}
+
 fn run_update(
     tx: &mut WriteTx,
     table: &str,
     sets: &[(String, Expr)],
     where_clause: Option<&Expr>,
     params: &[Value],
-) -> Result<usize> {
+    returning: Option<&[SelectItem]>,
+) -> Result<(usize, Option<SelectOut>)> {
     if tx.table(table)?.is_none() && tx.view(table)?.is_some() {
-        return run_instead_of_update(tx, table, sets, where_clause, params);
+        if returning.is_some() {
+            return Err(sql_err("RETURNING no se admite al escribir en una vista"));
+        }
+        return Ok((
+            run_instead_of_update(tx, table, sets, where_clause, params)?,
+            None,
+        ));
     }
     let def = tx
         .table_cached(table)?
@@ -643,14 +744,21 @@ fn run_update(
         updates.push((rowid, row, new_row));
     }
     let n = updates.len();
+    let mut returned = Vec::new(); // filas NEW para RETURNING
     fire(tx, &def, &before_stmt, None, None)?; // BEFORE … FOR EACH STATEMENT
     for (rowid, old_row, new_row) in updates {
         fire(tx, &def, &before_row, Some(&old_row), Some(&new_row))?;
         tx.update_row(&def, rowid, &new_row)?;
+        if returning.is_some() {
+            returned.push(new_row.clone());
+        }
         fire(tx, &def, &after_row, Some(&old_row), Some(&new_row))?;
     }
     fire(tx, &def, &after_stmt, None, None)?; // AFTER … FOR EACH STATEMENT
-    Ok(n)
+    let out = returning
+        .map(|items| eval_returning(table, &def, items, &returned, params))
+        .transpose()?;
+    Ok((n, out))
 }
 
 fn run_delete(
@@ -658,9 +766,16 @@ fn run_delete(
     table: &str,
     where_clause: Option<&Expr>,
     params: &[Value],
-) -> Result<usize> {
+    returning: Option<&[SelectItem]>,
+) -> Result<(usize, Option<SelectOut>)> {
     if tx.table(table)?.is_none() && tx.view(table)?.is_some() {
-        return run_instead_of_delete(tx, table, where_clause, params);
+        if returning.is_some() {
+            return Err(sql_err("RETURNING no se admite al escribir en una vista"));
+        }
+        return Ok((
+            run_instead_of_delete(tx, table, where_clause, params)?,
+            None,
+        ));
     }
     let def = tx
         .table_cached(table)?
@@ -684,14 +799,76 @@ fn run_delete(
         doomed.push((rowid, row));
     }
     let n = doomed.len();
+    let mut returned = Vec::new(); // filas OLD (borradas) para RETURNING
     fire(tx, &def, &before_stmt, None, None)?; // BEFORE … FOR EACH STATEMENT
     for (rowid, old_row) in doomed {
         fire(tx, &def, &before_row, Some(&old_row), None)?;
         tx.delete_row(&def, rowid)?;
+        if returning.is_some() {
+            returned.push(old_row.clone());
+        }
         fire(tx, &def, &after_row, Some(&old_row), None)?;
     }
     fire(tx, &def, &after_stmt, None, None)?; // AFTER … FOR EACH STATEMENT
-    Ok(n)
+    let out = returning
+        .map(|items| eval_returning(table, &def, items, &returned, params))
+        .transpose()?;
+    Ok((n, out))
+}
+
+/// Proyecta `RETURNING` sobre las filas afectadas (esquema de una sola tabla).
+/// `*` se expande a las columnas visibles (orden lógico, sin las borradas). No
+/// admite agregados.
+fn eval_returning(
+    table: &str,
+    def: &TableDef,
+    items: &[SelectItem],
+    rows: &[Vec<Value>],
+    params: &[Value],
+) -> Result<SelectOut> {
+    let schema = QuerySchema::single(table, def.clone());
+    let visible: Vec<usize> = def
+        .logical_order
+        .iter()
+        .copied()
+        .filter(|&p| !def.columns[p].dropped)
+        .collect();
+    let mut columns = Vec::new();
+    let mut projs: Vec<Option<&Expr>> = Vec::new(); // None = Star
+    for (i, item) in items.iter().enumerate() {
+        match item {
+            SelectItem::Star => {
+                for &p in &visible {
+                    columns.push(def.columns[p].name.clone());
+                }
+                projs.push(None);
+            }
+            SelectItem::Expr { expr, alias } => {
+                no_aggregates(expr, "RETURNING")?;
+                validate_columns(expr, &schema)?;
+                columns.push(alias.clone().unwrap_or_else(|| match expr {
+                    Expr::Column { name, .. } => name.clone(),
+                    _ => format!("col{}", i + 1),
+                }));
+                projs.push(Some(expr));
+            }
+        }
+    }
+    let mut out_rows = Vec::with_capacity(rows.len());
+    for row in rows {
+        let mut out = Vec::with_capacity(columns.len());
+        for proj in &projs {
+            match proj {
+                None => out.extend(visible.iter().map(|&i| row[i].clone())),
+                Some(e) => out.push(eval(e, Some((&schema, row)), params)?),
+            }
+        }
+        out_rows.push(out);
+    }
+    Ok(SelectOut {
+        columns,
+        rows: out_rows,
+    })
 }
 
 // --- INSTEAD OF: escrituras sobre vistas reemplazadas por el cuerpo del trigger ---
@@ -948,6 +1125,7 @@ fn subst_stmt(
             table: t,
             columns,
             rows,
+            returning,
         } => Stmt::Insert {
             table: t.clone(),
             columns: columns.clone(),
@@ -955,11 +1133,13 @@ fn subst_stmt(
                 .iter()
                 .map(|row| row.iter().map(&r).collect::<Result<Vec<_>>>())
                 .collect::<Result<Vec<_>>>()?,
+            returning: returning.clone(),
         },
         Stmt::Update {
             table: t,
             sets,
             where_clause,
+            returning,
         } => Stmt::Update {
             table: t.clone(),
             sets: sets
@@ -967,13 +1147,16 @@ fn subst_stmt(
                 .map(|(c, e)| Ok((c.clone(), r(e)?)))
                 .collect::<Result<_>>()?,
             where_clause: where_clause.as_ref().map(&r).transpose()?,
+            returning: returning.clone(),
         },
         Stmt::Delete {
             table: t,
             where_clause,
+            returning,
         } => Stmt::Delete {
             table: t.clone(),
             where_clause: where_clause.as_ref().map(&r).transpose()?,
+            returning: returning.clone(),
         },
         other => other.clone(),
     })

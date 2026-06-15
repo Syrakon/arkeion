@@ -407,6 +407,23 @@ fn clause_to_asof(clause: &AsOfClause) -> AsOf {
     }
 }
 
+/// `true` si la sentencia es una escritura con `RETURNING` (devuelve filas).
+fn stmt_has_returning(stmt: &Stmt) -> bool {
+    matches!(
+        stmt,
+        Stmt::Insert {
+            returning: Some(_),
+            ..
+        } | Stmt::Update {
+            returning: Some(_),
+            ..
+        } | Stmt::Delete {
+            returning: Some(_),
+            ..
+        }
+    )
+}
+
 /// Conexión: ejecuta SQL. Las lecturas usan snapshots inmutables y jamás
 /// bloquean ni son bloqueadas por la escritura en curso.
 pub struct Connection {
@@ -518,8 +535,14 @@ impl Connection {
     }
 
     fn query_stmt(&self, stmt: &Stmt, params: &[Value]) -> Result<Rows> {
+        // Escrituras con RETURNING: ejecutan y devuelven las filas afectadas.
+        if stmt_has_returning(stmt) {
+            return self.query_returning(stmt, params);
+        }
         let Stmt::Select(select) = stmt else {
-            return Err(sql_err("solo SELECT devuelve filas: usa execute"));
+            return Err(sql_err(
+                "solo SELECT (o INSERT/UPDATE/DELETE … RETURNING) devuelve filas: usa execute",
+            ));
         };
         let out = if let Some(snap) = &self.pinned {
             // Conexión ya fijada a un instante: no se puede re-fijar por sentencia.
@@ -553,6 +576,26 @@ impl Connection {
                     }
                     exec::run_query(&snap, select, params)?
                 }
+            }
+        };
+        Ok(Rows::buffered(out))
+    }
+
+    /// Camino de una escritura con `RETURNING`: realiza la escritura (en la tx
+    /// abierta, o en autocommit) y devuelve las filas afectadas.
+    fn query_returning(&self, stmt: &Stmt, params: &[Value]) -> Result<Rows> {
+        if self.pinned.is_some() {
+            return Err(sql_err(
+                "conexión de solo lectura (snapshot histórico): no admite escrituras",
+            ));
+        }
+        let out = match self.open_tx.borrow_mut().as_mut() {
+            Some(tx) => exec::run_returning(tx, stmt, params)?,
+            None => {
+                let mut tx = self.store.begin_on(&self.branch)?;
+                let out = exec::run_returning(&mut tx, stmt, params)?;
+                tx.commit()?;
+                out
             }
         };
         Ok(Rows::buffered(out))

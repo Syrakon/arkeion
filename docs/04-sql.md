@@ -39,9 +39,9 @@ CREATE TRIGGER [IF NOT EXISTS] t {BEFORE|AFTER} {INSERT|UPDATE|DELETE} ON tabla
 DROP TRIGGER [IF EXISTS] t;
 
 -- DML
-INSERT INTO tabla [(cols)] VALUES (expr, …)[, (expr, …)…];
-UPDATE tabla SET col = expr [, …] [WHERE expr];
-DELETE FROM tabla [WHERE expr];
+INSERT INTO tabla [(cols)] VALUES (expr, …)[, (expr, …)…] [RETURNING lista | *];
+UPDATE tabla SET col = expr [, …] [WHERE expr] [RETURNING lista | *];
+DELETE FROM tabla [WHERE expr] [RETURNING lista | *];
 
 -- Consulta
 [WITH cte AS (SELECT …) [, …]]              -- CTEs (tablas con nombre, no recursivas)
@@ -137,6 +137,13 @@ comprueba antes de escribir, y CASCADE/SET NULL después). Auto-referencia (árb
 
 Hay guarda de recursión (un trigger que dispara otra escritura). Buenos para
 **bitácoras de auditoría**.
+
+**`RETURNING`** (`INSERT`/`UPDATE`/`DELETE … RETURNING lista | *`): la escritura
+**devuelve filas** en vez de solo el recuento — las insertadas, las actualizadas (con
+los valores **NEW**) o las borradas (sus valores). La lista admite expresiones y alias,
+y `*` se expande a las columnas visibles. Hay que ejecutarla por `query` (devuelve
+filas); por `execute` la escritura se hace igual y se ignoran las filas. No se admite al
+escribir en una vista (vía INSTEAD OF).
 
 `GROUP BY` / `HAVING` (post-M9): `SELECT … GROUP BY e1, e2 [HAVING cond]` agrupa por el
 valor de las expresiones (normalmente columnas) y emite una fila por grupo, plegando los

@@ -620,11 +620,27 @@ impl<'a> Parser<'a> {
                 break;
             }
         }
+        let returning = self.returning_clause()?;
         Ok(Stmt::Insert {
             table,
             columns,
             rows,
+            returning,
         })
+    }
+
+    /// `RETURNING <select-list>` opcional al final de un INSERT/UPDATE/DELETE: si
+    /// está, la sentencia devuelve las filas afectadas (proyectadas) en vez del
+    /// recuento. Reusa `select_item` (`expr [AS alias]` o `*`).
+    fn returning_clause(&mut self) -> Result<Option<Vec<SelectItem>>> {
+        if !self.eat_kw(Kw::Returning) {
+            return Ok(None);
+        }
+        let mut items = vec![self.select_item()?];
+        while self.eat(&Tok::Comma) {
+            items.push(self.select_item()?);
+        }
+        Ok(Some(items))
     }
 
     fn update(&mut self) -> Result<Stmt> {
@@ -645,10 +661,12 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
+        let returning = self.returning_clause()?;
         Ok(Stmt::Update {
             table,
             sets,
             where_clause,
+            returning,
         })
     }
 
@@ -661,9 +679,11 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
+        let returning = self.returning_clause()?;
         Ok(Stmt::Delete {
             table,
             where_clause,
+            returning,
         })
     }
 
@@ -1485,6 +1505,7 @@ mod tests {
             table,
             sets,
             where_clause,
+            ..
         } = stmt
         else {
             panic!()
@@ -1495,7 +1516,9 @@ mod tests {
         assert!(where_clause.is_some());
 
         let stmt = parse("DELETE FROM t WHERE a IS NULL").unwrap();
-        assert!(matches!(stmt, Stmt::Delete { ref table, where_clause: Some(_) } if table == "t"));
+        assert!(
+            matches!(stmt, Stmt::Delete { ref table, where_clause: Some(_), .. } if table == "t")
+        );
         assert!(matches!(
             parse("DELETE FROM t").unwrap(),
             Stmt::Delete {

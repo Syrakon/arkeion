@@ -69,6 +69,9 @@ pub enum Stmt {
         table: String,
         columns: Option<Vec<String>>,
         rows: Vec<Vec<Expr>>,
+        /// `RETURNING <select-list>`: si está, la sentencia devuelve filas (las
+        /// insertadas) en vez de solo el recuento.
+        returning: Option<Vec<SelectItem>>,
     },
     Select(SelectStmt),
     /// `ALTER TABLE t ADD [COLUMN] coldef`. La columna se añade al final; las
@@ -104,10 +107,12 @@ pub enum Stmt {
         table: String,
         sets: Vec<(String, Expr)>,
         where_clause: Option<Expr>,
+        returning: Option<Vec<SelectItem>>,
     },
     Delete {
         table: String,
         where_clause: Option<Expr>,
+        returning: Option<Vec<SelectItem>>,
     },
     Begin,
     Commit,

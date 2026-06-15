@@ -27,6 +27,7 @@ se **aceptan sintácticamente** y quedan registradas en el esquema, pero no se a
 CREATE TABLE [IF NOT EXISTS] tabla (col TIPO [restricciones], …[, restricción_tabla…]);
   -- de columna: PRIMARY KEY | NOT NULL | DEFAULT v | UNIQUE | CHECK (expr) | REFERENCES padre […]
   -- de tabla:   UNIQUE (c…) | CHECK (expr) | FOREIGN KEY (c…) REFERENCES padre (p…) […]
+CREATE TABLE [IF NOT EXISTS] tabla AS SELECT …;   -- CTAS: columnas (nombres+tipos) de la consulta
 DROP TABLE [IF EXISTS] tabla;
 ALTER TABLE tabla ADD [COLUMN] col TIPO [DEFAULT v] [NOT NULL];  -- al final; no reescribe filas
 ALTER TABLE tabla MOVE COLUMN col {FIRST | BEFORE x | AFTER x};  -- reorden lógico (presentación)

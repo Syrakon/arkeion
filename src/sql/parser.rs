@@ -332,6 +332,22 @@ impl<'a> Parser<'a> {
         self.expect_kw(Kw::Table, "TABLE")?;
         let if_not_exists = self.if_not_exists()?;
         let name = self.ident("un nombre de tabla")?;
+        // `CREATE TABLE t AS SELECT …` (CTAS): columnas inferidas de la consulta.
+        if self.eat_kw(Kw::As) {
+            let query = if self.eat_kw(Kw::With) {
+                let ctes = self.with_ctes()?;
+                let mut s = self.select()?;
+                s.with = ctes;
+                s
+            } else {
+                self.select()?
+            };
+            return Ok(Stmt::CreateTableAs {
+                if_not_exists,
+                name,
+                query: Box::new(query),
+            });
+        }
         self.expect(&Tok::LParen, "'('")?;
         let mut columns = Vec::new();
         let mut foreign_keys = Vec::new();

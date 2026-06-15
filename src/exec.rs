@@ -310,6 +310,52 @@ pub fn run_execute(tx: &mut WriteTx, stmt: &Stmt, params: &[Value]) -> Result<us
             tx.create_table(&table_spec(name, columns, foreign_keys, uniques, checks)?)?;
             Ok(0)
         }
+        Stmt::CreateTableAs {
+            if_not_exists,
+            name,
+            query,
+        } => {
+            if tx.table(name)?.is_some() || tx.view(name)?.is_some() {
+                if *if_not_exists {
+                    return Ok(0);
+                }
+                return Err(Error::Constraint("la tabla ya existe"));
+            }
+            // Materializa la consulta; infiere el tipo de cada columna de sus valores.
+            let out = run_query(&*tx, query, params)?;
+            if out.columns.is_empty() {
+                return Err(sql_err(
+                    "CREATE TABLE AS SELECT necesita al menos una columna",
+                ));
+            }
+            let mut col_specs = Vec::with_capacity(out.columns.len());
+            for (i, cname) in out.columns.iter().enumerate() {
+                let col_type = infer_coltype(out.rows.iter().map(|r| &r[i]))?;
+                col_specs.push(ColumnSpec {
+                    name: cname.clone(),
+                    col_type,
+                    not_null: false,
+                    primary_key: false,
+                    default: None,
+                    references: None,
+                    unique: false,
+                    check: None,
+                });
+            }
+            let spec = TableSpec {
+                name: name.clone(),
+                columns: col_specs,
+                foreign_keys: Vec::new(),
+                uniques: Vec::new(),
+                checks: Vec::new(),
+            };
+            let def = tx.create_table(&spec)?;
+            let n = out.rows.len();
+            for row in out.rows {
+                tx.insert_row(&def, &row)?;
+            }
+            Ok(n)
+        }
         Stmt::DropTable { if_exists, name } => {
             let dropped = tx.drop_table(name)?;
             if !dropped && !if_exists {
@@ -1417,6 +1463,47 @@ fn fire_inner(
         }
     }
     Ok(())
+}
+
+/// Infiere el `ColType` de una columna de un `CREATE TABLE AS SELECT` a partir de
+/// sus valores (los NULL se ignoran). El tipo elegido debe **aceptar todos** los
+/// valores (Arkeion es de tipado estricto, INTEGER→REAL es la única promoción).
+/// Columna vacía o toda NULL ⇒ TEXT; mezcla incompatible ⇒ error.
+fn infer_coltype<'a>(values: impl Iterator<Item = &'a Value>) -> Result<ColType> {
+    let (mut int, mut real, mut text, mut boolean, mut blob) = (false, false, false, false, false);
+    for v in values {
+        match v {
+            Value::Null => {}
+            Value::Integer(_) => int = true,
+            Value::Real(_) => real = true,
+            Value::Text(_) => text = true,
+            Value::Bool(_) => boolean = true,
+            Value::Blob(_) => blob = true,
+        }
+    }
+    let numeric = int || real;
+    let families = [numeric, text, boolean, blob]
+        .iter()
+        .filter(|x| **x)
+        .count();
+    if families > 1 {
+        return Err(sql_err(
+            "CREATE TABLE AS SELECT: una columna mezcla tipos incompatibles",
+        ));
+    }
+    Ok(if blob {
+        ColType::Blob
+    } else if boolean {
+        ColType::Boolean
+    } else if text {
+        ColType::Text
+    } else if real {
+        ColType::Real
+    } else if int {
+        ColType::Integer
+    } else {
+        ColType::Text // toda NULL / vacía
+    })
 }
 
 fn table_spec(

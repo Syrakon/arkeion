@@ -1,0 +1,49 @@
+-- CREATE TABLE AS SELECT: crea una tabla con las columnas (nombres y tipos
+-- inferidos) de la consulta y la rellena con sus filas.
+
+> CREATE TABLE src (id INTEGER PRIMARY KEY, name TEXT, n INTEGER);
+ok
+
+> INSERT INTO src (name, n) VALUES ('a', 10), ('b', 20), ('c', 30);
+affected 3
+
+-- CTAS con expresión, alias y WHERE; devuelve las filas insertadas.
+> CREATE TABLE big AS SELECT name, n * 2 AS dbl FROM src WHERE n >= 20;
+affected 2
+
+> SELECT name, dbl FROM big ORDER BY name;
+b|40
+c|60
+
+-- La tabla resultante es normal: admite más inserciones con los tipos inferidos.
+> INSERT INTO big (name, dbl) VALUES ('z', 99);
+affected 1
+
+> SELECT COUNT(*) FROM big;
+3
+
+-- Tipo REAL inferido cuando hay reales (INTEGER promociona a REAL).
+> CREATE TABLE nums AS SELECT 1 AS a UNION ALL SELECT 2.5;
+affected 2
+
+> SELECT a FROM nums ORDER BY a;
+1.0
+2.5
+
+-- Consulta vacía → columna TEXT por defecto (toda NULL / sin filas).
+> CREATE TABLE empty_t AS SELECT name FROM src WHERE n > 1000;
+affected 0
+
+> INSERT INTO empty_t (name) VALUES ('x');
+affected 1
+
+> SELECT name FROM empty_t;
+x
+
+-- IF NOT EXISTS: no hace nada si ya existe.
+> CREATE TABLE IF NOT EXISTS big AS SELECT name FROM src;
+ok
+
+-- Una columna que mezcla tipos incompatibles no se puede crear (tipado estricto).
+> CREATE TABLE bad AS SELECT 1 AS a UNION ALL SELECT 'two';
+error tipos incompatibles

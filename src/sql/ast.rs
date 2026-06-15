@@ -25,6 +25,13 @@ pub enum Stmt {
         /// en `ColumnAst.check`.
         checks: Vec<String>,
     },
+    /// `CREATE TABLE [IF NOT EXISTS] t AS SELECT …`: crea la tabla con las columnas
+    /// (nombres y tipos inferidos) de la consulta y la rellena con sus filas.
+    CreateTableAs {
+        if_not_exists: bool,
+        name: String,
+        query: Box<SelectStmt>,
+    },
     DropTable {
         if_exists: bool,
         name: String,

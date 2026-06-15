@@ -12,7 +12,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
@@ -146,9 +146,99 @@ pub struct VacuumReport {
 /// a ver un pager y un head descasados (un `data_root` de un archivo leído del
 /// otro). Los snapshots ya en vuelo siguen siendo dueños de su `Arc<Pager>`
 /// anterior, así que leen su archivo (el inodo viejo) hasta soltarse.
+/// **Group commit** (líder-seguidor): agrupa los `fdatasync` de commits
+/// concurrentes en uno solo, sin debilitar la durabilidad. El commit que llega
+/// cuando no hay sello en curso se vuelve **líder** y lanza su fsync de inmediato
+/// (un commit solo nunca espera — cero latencia añadida); los que llegan mientras
+/// ese fsync está en vuelo se encolan y el líder los sella a todos de una pasada.
+/// La propia latencia del fsync ES la ventana de agrupación: sin temporizadores.
+///
+/// Vive **por generación de pager** (uno nuevo en cada `vacuum`): así un commit en
+/// vuelo siempre sella su propio archivo aunque `vacuum` cambie el `DbState`.
+struct SyncGroup {
+    inner: Mutex<SyncProgress>,
+    cv: Condvar,
+}
+
+struct SyncProgress {
+    /// Hay un fsync en curso (un líder dentro de `pager.sync()`).
+    in_progress: bool,
+    /// Mayor versión cuyas páginas ya están **durables** (fsync completado).
+    durable_version: u64,
+    /// Mayor versión cuyas páginas ya están **escritas** en el archivo (marca de
+    /// agua; un fsync ahora la haría durable). Se actualiza bajo el lock del escritor.
+    written_version: u64,
+    /// Head que casa con `written_version`, para `write_meta` tras sellar.
+    written_head: Head,
+}
+
+impl SyncGroup {
+    fn new(head: Head) -> SyncGroup {
+        SyncGroup {
+            inner: Mutex::new(SyncProgress {
+                in_progress: false,
+                durable_version: head.version,
+                written_version: head.version,
+                written_head: head,
+            }),
+            cv: Condvar::new(),
+        }
+    }
+
+    /// Marca (bajo el lock del escritor, durante la write-phase) que las páginas de
+    /// `head` ya están escritas en el archivo: sube la marca de agua de «escrito».
+    fn mark_written(&self, head: Head) {
+        let mut p = self.inner.lock().expect("sync group envenenado");
+        if head.version >= p.written_version {
+            p.written_version = head.version;
+            p.written_head = head;
+        }
+    }
+
+    /// Asegura que el commit `version` (en `pager`) sea durable, agrupando con los
+    /// fsync concurrentes. Devuelve cuando `version` está sellado.
+    fn make_durable(&self, pager: &Pager, version: u64) -> Result<()> {
+        let mut p = self.inner.lock().expect("sync group envenenado");
+        loop {
+            if p.durable_version >= version {
+                return Ok(()); // ya lo selló otro líder
+            }
+            if p.in_progress {
+                p = self.cv.wait(p).expect("sync group envenenado");
+                continue; // seguidor: espera al líder en curso
+            }
+            // Líder: captura la marca de agua y sella TODO hasta ahí de una pasada.
+            // `fdatasync` vuelca todo lo escrito antes de la llamada, así que cubre a
+            // los demás committers cuyas páginas ya estaban en el archivo.
+            p.in_progress = true;
+            let target_version = p.written_version;
+            let target_head = p.written_head.clone();
+            drop(p);
+            let res = pager
+                .sync()
+                .and_then(|()| pager.write_meta(&commit::meta_for(&target_head)));
+            p = self.inner.lock().expect("sync group envenenado");
+            p.in_progress = false;
+            self.cv.notify_all();
+            match res {
+                Ok(()) => {
+                    if target_version > p.durable_version {
+                        p.durable_version = target_version;
+                    }
+                    // El bucle re-chequea: si mi versión ya es durable, retorna;
+                    // si llegué después del corte, me vuelvo el siguiente líder.
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+}
+
 struct DbState {
     pager: Arc<Pager>,
     head: Head,
+    /// Coordinador de group commit de ESTA generación de pager (nuevo en `vacuum`).
+    sync_group: Arc<SyncGroup>,
 }
 
 /// Almacén clave-valor transaccional sobre un único archivo. Todos sus campos
@@ -250,6 +340,7 @@ impl Store {
         Store {
             state: Arc::new(Mutex::new(DbState {
                 pager: Arc::new(pager),
+                sync_group: Arc::new(SyncGroup::new(head.clone())),
                 head,
             })),
             writer: Arc::new(AtomicBool::new(false)),
@@ -307,9 +398,9 @@ impl Store {
         if self.writer.swap(true, Ordering::Acquire) {
             return Err(Error::Busy);
         }
-        let (pager, global) = {
+        let (pager, sync_group, global) = {
             let st = self.lock();
-            (st.pager.clone(), st.head.clone())
+            (st.pager.clone(), st.sync_group.clone(), st.head.clone())
         };
         let bh = match resolve_branch_head(&pager, &global, branch) {
             Ok(bh) => bh,
@@ -321,6 +412,8 @@ impl Store {
         Ok(WriteTx {
             ts: TxStore::new(pager.clone()),
             pager,
+            sync_group,
+            writer_released: false,
             state: self.state.clone(),
             writer: self.writer.clone(),
             branch: branch.to_owned(),
@@ -868,10 +961,13 @@ impl Store {
         }
         let pages_after = new_head.n_pages;
 
-        // Intercambia pager y head juntos, bajo un único lock.
+        // Intercambia pager, head y coordinador de sello juntos, bajo un único lock.
+        // El `sync_group` se renueva con el pager: un commit en vuelo en el pager
+        // viejo sigue sellando su propio archivo con su propio coordinador.
         {
             let mut st = self.lock();
             st.pager = new_pager;
+            st.sync_group = Arc::new(SyncGroup::new(new_head.clone()));
             st.head = new_head;
         }
 
@@ -1442,6 +1538,14 @@ pub struct WriteTx {
     /// mientras la tx vive, así que `pager` y `state.pager` coinciden al commit.
     state: Arc<Mutex<DbState>>,
     writer: Arc<AtomicBool>,
+    /// Coordinador de group commit de la generación de pager en que empezó esta tx
+    /// (ver [`SyncGroup`]). El commit suelta el escritor tras escribir y sella aquí,
+    /// agrupando su fsync con otros committers concurrentes.
+    sync_group: Arc<SyncGroup>,
+    /// `true` si `commit` ya soltó el escritor único (tras la write-phase, antes del
+    /// fsync agrupado): el `Drop` no debe volver a soltarlo (otro committer podría
+    /// tenerlo ya). En rollback queda `false` y lo suelta el `Drop`.
+    writer_released: bool,
     /// Head **global** anterior (versión, `prev_page`/`prev_chain`, `meta_root`).
     base: Head,
     /// Rama sobre la que se publica (M8). `data_root`/`parent_*` son de esta rama.
@@ -1504,8 +1608,13 @@ struct Savepoint {
 
 impl Drop for WriteTx {
     fn drop(&mut self) {
-        // Libera el escritor único tanto en commit como en rollback.
-        self.writer.store(false, Ordering::Release);
+        // Libera el escritor único en rollback (y en commit fallido antes de
+        // soltarlo). El commit lo suelta él mismo tras la write-phase para no
+        // retener el escritor durante el fsync agrupado; entonces `writer_released`
+        // está puesto y aquí NO se vuelve a soltar (otro committer podría tenerlo).
+        if !self.writer_released {
+            self.writer.store(false, Ordering::Release);
+        }
     }
 }
 
@@ -2133,8 +2242,10 @@ impl WriteTx {
             self.parent_version,
         )?;
 
-        // Páginas sucias + página de commit + un fsync (durabilidad, M1/M9).
-        let head = publish_commit(
+        // --- write-phase (con el escritor único retenido) ---
+        // Escribe las páginas sucias + la de commit y avanza el estado en memoria,
+        // SIN sellar todavía. El fsync se hace fuera del lock (group commit).
+        let head = write_commit_pages(
             &self.pager,
             &mut self.ts,
             CommitParams::after(&self.base, &self.branch, self.parent_page),
@@ -2142,7 +2253,21 @@ impl WriteTx {
             meta_root,
             timestamp_ms,
         )?;
-        self.state.lock().expect("estado del store envenenado").head = head;
+        // Publica el head (base del siguiente committer) y la marca de agua de
+        // «escrito», ambos mientras aún se tiene el escritor (serializado).
+        self.state.lock().expect("estado del store envenenado").head = head.clone();
+        self.sync_group.mark_written(head.clone());
+
+        // Suelta el escritor ANTES de sellar: así otro committer puede escribir sus
+        // páginas mientras nuestro fsync está en vuelo, y un único fsync los cubre a
+        // todos (group commit). El `Drop` ya no lo soltará.
+        self.writer.store(false, Ordering::Release);
+        self.writer_released = true;
+
+        // --- durability-phase (escritor ya libre) ---
+        // Sella agrupando con los fsync concurrentes. Un commit solo se vuelve líder
+        // y sella al instante; bajo carga, comparte el fsync con los que se encolaron.
+        self.sync_group.make_durable(&self.pager, head.version)?;
         Ok(version)
     }
 }
@@ -2219,12 +2344,40 @@ fn publish_commit(
     meta_root: PageId,
     timestamp_ms: u64,
 ) -> Result<Head> {
+    let head = write_commit_pages(pager, ts, params, data_root, meta_root, timestamp_ms)?;
+    // **Único** fsync del commit (M9-perf): páginas de datos y de commit escritas,
+    // una sola barrera. Basta para la durabilidad porque la recuperación no
+    // confía en el orden de flush del SO: el tag de integridad por página hace
+    // **ilegible** cualquier página escrita a medias o no escrita, y el escaneo
+    // hacia delante (que lee en orden y las páginas de datos van antes que la de
+    // commit) se detiene en la primera ilegible. Así, un commit a medio escribir
+    // jamás se adopta; solo se adopta uno cuyas páginas son **todas** legibles
+    // (i.e., el fsync llegó a completarse). Camino síncrono: lo usan ramas/merge/
+    // `vacuum`; `WriteTx::commit` sella fuera del lock vía group commit ([`SyncGroup`]).
+    pager.sync()?;
+    pager.write_meta(&commit::meta_for(&head))?;
+    Ok(head)
+}
+
+/// Escribe las páginas sucias de la tx y la de commit (append, en orden de id),
+/// instala el directorio/`write_offset`/`next_page` en memoria y devuelve el head
+/// — **sin sellar**. El fsync lo hace el llamador: `publish_commit` (síncrono) o el
+/// group commit de [`WriteTx::commit`] (fuera del lock del escritor). Avanzar el
+/// estado en memoria antes del fsync es seguro: al reabrir, el directorio se
+/// reconstruye **escaneando el archivo** y `recover` solo adopta commits cuyas
+/// páginas son TODAS legibles — un commit a medio sellar nunca se adopta.
+fn write_commit_pages(
+    pager: &Pager,
+    ts: &mut TxStore,
+    params: CommitParams<'_>,
+    data_root: PageId,
+    meta_root: PageId,
+    timestamp_ms: u64,
+) -> Result<Head> {
     let commit_page = PageId(ts.alloc_next);
 
     // Páginas sucias como registros enmarcados, en orden de id (v2, M10);
     // content_hash cubre los bodies lógicos en claro (BODY_SIZE, sin recortar).
-    // Las localizaciones se acumulan y se instalan en el directorio tras el
-    // fsync: un fallo a mitad no deja estado en memoria que revertir.
     let mut cursor = pager.write_offset();
     let mut entries = Vec::new();
     let mut hasher = Sha256::new();
@@ -2262,15 +2415,6 @@ fn publish_commit(
     cursor += commit_rec_len;
     entries.push((commit_page, commit_loc));
     pager.cache_insert(commit_page, Arc::new(page));
-    // **Único** fsync del commit (M9-perf): páginas de datos y de commit escritas,
-    // una sola barrera. Basta para la durabilidad porque la recuperación no
-    // confía en el orden de flush del SO: el tag de integridad por página hace
-    // **ilegible** cualquier página escrita a medias o no escrita, y el escaneo
-    // hacia delante (que lee en orden y las páginas de datos van antes que la de
-    // commit) se detiene en la primera ilegible. Así, un commit a medio escribir
-    // jamás se adopta; solo se adopta uno cuyas páginas son **todas** legibles
-    // (i.e., el fsync llegó a completarse). ~2× en escrituras durables.
-    pager.sync()?;
 
     let head = Head {
         version: header.version,
@@ -2281,9 +2425,9 @@ fn publish_commit(
         nonce_counter: header.nonce_counter,
         n_pages: commit_page.0 + 1,
     };
-    // Publica el directorio, write_offset y next_page en un solo paso atómico.
+    // Publica el directorio, write_offset y next_page en un solo paso atómico (aún
+    // en memoria; la durabilidad la da el fsync que hará el llamador).
     pager.install_commit(&entries, cursor, head.n_pages);
-    pager.write_meta(&commit::meta_for(&head))?;
     Ok(head)
 }
 

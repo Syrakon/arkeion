@@ -382,6 +382,55 @@ fn run_engine(bulk_n: i64, scan_reps: i64) -> Vec<(&'static str, f64, f64)> {
     out
 }
 
+// --- GROUP COMMIT: throughput de commits durables concurrentes ---
+//
+// N hilos, cada uno con su conexión, hacen INSERTs durables (1 commit/fila,
+// autocommit) reintentando ante `Busy`. El escritor único serializa la write-phase
+// (microsegundos), pero el fsync se agrupa fuera del lock: bajo carga, un solo
+// fsync sella varios commits. Mide commits/s por nº de hilos → el multiplicador.
+// Solo significativo en disco REAL (`ARKEION_BENCH_DIR`); en tmpfs el fsync es
+// gratis y no hay nada que amortizar.
+fn run_group_commit(per_thread: i64) -> Vec<(usize, f64)> {
+    let mut out = Vec::new();
+    for &threads in &[1usize, 2, 4, 8, 16] {
+        let rate = median_of(DURABLE_REPS, || {
+            let dir = bench_dir();
+            let db = Database::open(dir.path().join("gc.arkeion"), Options::default()).unwrap();
+            db.connect().unwrap().execute(CREATE, &[]).unwrap();
+            let t = Instant::now();
+            let mut handles = Vec::new();
+            for who in 0..threads as i64 {
+                let db = db.clone();
+                handles.push(std::thread::spawn(move || {
+                    let conn = db.connect().unwrap();
+                    for seq in 0..per_thread {
+                        let id = who * per_thread + seq + 1; // único entre hilos
+                        loop {
+                            match conn.execute(
+                                "INSERT INTO t (id, n) VALUES (?1, ?2)",
+                                &params![id, id * 2],
+                            ) {
+                                Ok(_) => break,
+                                Err(arkeion::Error::Busy) => {
+                                    std::hint::spin_loop();
+                                    continue;
+                                }
+                                Err(e) => panic!("insert concurrente falló: {e}"),
+                            }
+                        }
+                    }
+                }));
+            }
+            for h in handles {
+                h.join().unwrap();
+            }
+            ops(threads as i64 * per_thread, t.elapsed())
+        });
+        out.push((threads, rate));
+    }
+    out
+}
+
 // --- SQLite (rusqlite, bundled), tras la feature `bench-sqlite` ---
 
 #[cfg(feature = "bench-sqlite")]
@@ -768,6 +817,18 @@ fn main() {
         );
     }
     println!("speedup = motor / SQL  (>1 ⇒ saltarse SQL es más rápido).");
+
+    // Group commit: commits durables concurrentes. El fsync se amortiza entre hilos.
+    let gc = run_group_commit(500);
+    let base = gc.first().map(|&(_, r)| r).unwrap_or(1.0);
+    println!();
+    println!("— GROUP COMMIT: INSERTs durables concurrentes (commits/s) —");
+    println!("{:>8} {:>14} {:>10}", "hilos", "commits/s", "vs 1 hilo");
+    println!("{}", "-".repeat(34));
+    for (threads, rate) in &gc {
+        println!("{:>8} {:>14} {:>9.2}x", threads, human(*rate), rate / base);
+    }
+    println!("el fsync se agrupa fuera del lock del escritor; solo real en disco.");
 
     // Comparación justa: SQLite con las garantías de arkeion (historia + hash chain).
     #[cfg(feature = "bench-sqlite")]

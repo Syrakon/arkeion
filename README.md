@@ -25,7 +25,7 @@ supply chain (4 runtime dependencies, all pure-Rust except the FIPS primitives).
 | **Bulk load** | `bulk_insert`: the whole batch in one transaction, no per-row executor, indexes in bulk — 2.5M rows/s |
 | **Engine API** | `Connection::table` → typed row access without SQL (`get`/`scan`/`scan_columns`), same guarantees — point lookups ~3.7× the SQL path |
 | **Reads** | Simple SELECT in **streaming** (lazy decode: only the projected columns, straight from the page) |
-| **Durability** | ACID, tail-scan recovery, a single `fsync` per commit |
+| **Durability** | ACID, tail-scan recovery, a single `fsync` per commit; **group commit** batches concurrent committers' fsyncs (leader-follower, no added latency for a lone commit) — ~4.6× durable throughput at 16 threads |
 | **Time-travel** | `SELECT … AS OF <version/timestamp>`; `history()` / `diff_versions()` / `changes()` |
 | **Branching** | Data branches with 3-way *diff* and *merge*, Git conceptual model |
 | **Audit** | Every commit hash-chained with SHA-256 — tampering with the past is detectable; `verify()` + anchors |

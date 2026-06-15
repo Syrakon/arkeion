@@ -3931,6 +3931,182 @@ fn call_function(name: &str, args: &[Value]) -> Result<Value> {
             [] => Ok(Value::Integer(next_random())),
             _ => Err(bad_arity()),
         },
+        // --- pack de escalares v1.x: mates, string y fecha ---
+        "pi" => match args {
+            [] => Ok(Value::Real(std::f64::consts::PI)),
+            _ => Err(bad_arity()),
+        },
+        "exp" | "ln" | "log10" | "log2" | "sin" | "cos" | "tan" | "asin" | "acos" | "atan"
+        | "radians" | "degrees" | "trunc" => match args {
+            [Value::Null] => Ok(Value::Null),
+            [v] => {
+                let x = num_f64(v).ok_or_else(|| need_num(v))?;
+                Ok(Value::Real(match lname.as_str() {
+                    "exp" => x.exp(),
+                    "ln" => x.ln(),
+                    "log10" => x.log10(),
+                    "log2" => x.log2(),
+                    "sin" => x.sin(),
+                    "cos" => x.cos(),
+                    "tan" => x.tan(),
+                    "asin" => x.asin(),
+                    "acos" => x.acos(),
+                    "atan" => x.atan(),
+                    "radians" => x.to_radians(),
+                    "degrees" => x.to_degrees(),
+                    "trunc" => x.trunc(),
+                    _ => unreachable!(),
+                }))
+            }
+            _ => Err(bad_arity()),
+        },
+        "log" => match args {
+            // log(x) = base 10; log(b, x) = base b (como las funciones math de SQLite).
+            [Value::Null] | [Value::Null, _] | [_, Value::Null] => Ok(Value::Null),
+            [v] => Ok(Value::Real(num_f64(v).ok_or_else(|| need_num(v))?.log10())),
+            [b, v] => {
+                let base = num_f64(b).ok_or_else(|| need_num(b))?;
+                let x = num_f64(v).ok_or_else(|| need_num(v))?;
+                Ok(Value::Real(x.log(base)))
+            }
+            _ => Err(bad_arity()),
+        },
+        "atan2" => match args {
+            [Value::Null, _] | [_, Value::Null] => Ok(Value::Null),
+            [y, x] => {
+                let yy = num_f64(y).ok_or_else(|| need_num(y))?;
+                let xx = num_f64(x).ok_or_else(|| need_num(x))?;
+                Ok(Value::Real(yy.atan2(xx)))
+            }
+            _ => Err(bad_arity()),
+        },
+        // min/max ESCALARES (≥2 args): el parser deja los de 1 arg como agregados.
+        "min" | "max" => {
+            if args.len() < 2 {
+                return Err(bad_arity());
+            }
+            if args.iter().any(|v| matches!(v, Value::Null)) {
+                return Ok(Value::Null); // cualquier NULL ⇒ NULL (como SQLite)
+            }
+            let want_max = lname == "max";
+            let mut best = &args[0];
+            for v in &args[1..] {
+                if let Some(o) = cmp_values(v, best)?
+                    && ((want_max && o == Ordering::Greater) || (!want_max && o == Ordering::Less))
+                {
+                    best = v;
+                }
+            }
+            Ok(best.clone())
+        }
+        "concat" => {
+            if args.is_empty() {
+                return Err(bad_arity());
+            }
+            let mut s = String::new();
+            for v in args {
+                if matches!(v, Value::Null) {
+                    continue; // NULL ⇒ '' (estilo Postgres)
+                }
+                s.push_str(&value_text(v).ok_or_else(|| need_text(v))?);
+            }
+            Ok(Value::Text(s))
+        }
+        "concat_ws" => match args {
+            [] => Err(bad_arity()),
+            [Value::Null, ..] => Ok(Value::Null), // separador NULL ⇒ NULL
+            [sep, rest @ ..] => {
+                let sep = value_text(sep).ok_or_else(|| need_text(sep))?;
+                let parts = rest
+                    .iter()
+                    .filter(|v| !matches!(v, Value::Null))
+                    .map(|v| value_text(v).ok_or_else(|| need_text(v)))
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(Value::Text(parts.join(&sep)))
+            }
+        },
+        "lpad" | "rpad" => {
+            if matches!(args.first(), Some(Value::Null)) {
+                return Ok(Value::Null);
+            }
+            let (s, len, pad) = match args {
+                [s, Value::Integer(n)] => (s, *n, " ".to_string()),
+                [s, Value::Integer(n), p] => (s, *n, value_text(p).ok_or_else(|| need_text(p))?),
+                [_, v, ..] => return Err(need_num(v)),
+                _ => return Err(bad_arity()),
+            };
+            let s = value_text(s).ok_or_else(|| need_text(s))?;
+            Ok(Value::Text(pad_to(&s, len, &pad, lname == "lpad")))
+        }
+        "unicode" => match args {
+            [Value::Null] => Ok(Value::Null),
+            [Value::Text(s)] => Ok(s
+                .chars()
+                .next()
+                .map_or(Value::Null, |c| Value::Integer(c as i64))),
+            [v] => Err(need_text(v)),
+            _ => Err(bad_arity()),
+        },
+        "char" => {
+            let mut s = String::new();
+            for v in args {
+                match v {
+                    Value::Integer(n) => {
+                        let c =
+                            u32::try_from(*n)
+                                .ok()
+                                .and_then(char::from_u32)
+                                .ok_or_else(|| {
+                                    sql_err(format!("char(): punto de código inválido: {n}"))
+                                })?;
+                        s.push(c);
+                    }
+                    _ => return Err(need_num(v)),
+                }
+            }
+            Ok(Value::Text(s))
+        }
+        "quote" => match args {
+            [v] => Ok(Value::Text(sql_quote(v))),
+            _ => Err(bad_arity()),
+        },
+        "glob" => match args {
+            [Value::Null, _] | [_, Value::Null] => Ok(Value::Null),
+            [Value::Text(pat), Value::Text(s)] => {
+                let p: Vec<char> = pat.chars().collect();
+                let t: Vec<char> = s.chars().collect();
+                Ok(Value::Bool(glob_match(&p, &t)))
+            }
+            [_, _] => Err(sql_err("glob(patrón TEXT, texto TEXT)")),
+            _ => Err(bad_arity()),
+        },
+        "printf" | "format" => match args {
+            [] => Err(bad_arity()),
+            [Value::Null, ..] => Ok(Value::Null),
+            [fmt, rest @ ..] => {
+                let f = value_text(fmt).ok_or_else(|| need_text(fmt))?;
+                Ok(Value::Text(sql_printf(&f, rest)?))
+            }
+        },
+        // julianday/unixepoch: el tiempo interno es epoch ms (INTEGER).
+        "julianday" => match args {
+            [Value::Null] => Ok(Value::Null),
+            [Value::Integer(ms)] => Ok(Value::Real(*ms as f64 / 86_400_000.0 + 2_440_587.5)),
+            [v] => Err(sql_err(format!(
+                "julianday() espera epoch ms (INTEGER), no {}",
+                v.type_name()
+            ))),
+            _ => Err(bad_arity()),
+        },
+        "unixepoch" => match args {
+            [Value::Null] => Ok(Value::Null),
+            [Value::Integer(ms)] => Ok(Value::Integer(ms.div_euclid(1000))),
+            [v] => Err(sql_err(format!(
+                "unixepoch() espera epoch ms (INTEGER), no {}",
+                v.type_name()
+            ))),
+            _ => Err(bad_arity()),
+        },
         // Fecha/hora: el entero de tiempo de arkeion es **epoch en milisegundos**
         // (igual que los timestamps de auditoría), no el día juliano de SQLite.
         "now" => match args {
@@ -3982,6 +4158,210 @@ fn to_hex(bytes: &[u8]) -> String {
         let _ = write!(s, "{b:02X}");
     }
     s
+}
+
+/// Representación TEXT de un valor (misma regla que `CAST … AS TEXT`). `None` si
+/// no es representable como texto (NULL, o BLOB no-UTF8). La usan `concat`,
+/// `concat_ws`, `lpad/rpad`, `printf`, …
+fn value_text(v: &Value) -> Option<String> {
+    match cast_value(v.clone(), crate::catalog::ColType::Text) {
+        Ok(Value::Text(s)) => Some(s),
+        _ => None,
+    }
+}
+
+/// Rellena `s` a `len` caracteres con `pad` (por la izquierda o la derecha). Si
+/// `s` ya es más largo, lo trunca a `len` (estilo Postgres/MySQL).
+fn pad_to(s: &str, len: i64, pad: &str, left: bool) -> String {
+    let target = len.max(0) as usize;
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() >= target {
+        return chars[..target].iter().collect();
+    }
+    if pad.is_empty() {
+        return s.to_string(); // sin relleno posible
+    }
+    let padding: String = pad.chars().cycle().take(target - chars.len()).collect();
+    if left {
+        format!("{padding}{s}")
+    } else {
+        format!("{s}{padding}")
+    }
+}
+
+/// Literal SQL de un valor (para `quote()`): TEXT entre comillas con `'` doblada,
+/// BLOB como `X'…'`, NULL como `NULL`, números tal cual.
+fn sql_quote(v: &Value) -> String {
+    match v {
+        Value::Null => "NULL".to_string(),
+        Value::Integer(n) => n.to_string(),
+        Value::Real(f) => format!("{f:?}"),
+        Value::Bool(b) => if *b { "TRUE" } else { "FALSE" }.to_string(),
+        Value::Text(s) => format!("'{}'", s.replace('\'', "''")),
+        Value::Blob(b) => format!("X'{}'", to_hex(b)),
+    }
+}
+
+/// Emparejamiento estilo `GLOB`: `*` (cualquier secuencia), `?` (un carácter),
+/// `[abc]`/`[a-z]`/`[^…]` (clases). Sensible a mayúsculas (como SQLite).
+fn glob_match(pattern: &[char], s: &[char]) -> bool {
+    match pattern.first() {
+        None => s.is_empty(),
+        Some('*') => (0..=s.len()).any(|i| glob_match(&pattern[1..], &s[i..])),
+        Some('?') => !s.is_empty() && glob_match(&pattern[1..], &s[1..]),
+        Some('[') => {
+            if s.is_empty() {
+                return false;
+            }
+            let (matched, rest) = glob_class(&pattern[1..], s[0]);
+            matched && glob_match(rest, &s[1..])
+        }
+        Some(&c) => s.first() == Some(&c) && glob_match(&pattern[1..], &s[1..]),
+    }
+}
+
+/// Evalúa una clase `[...]` de `glob_match` contra `ch`. Devuelve si casa y el
+/// resto del patrón tras el `]` de cierre.
+fn glob_class(p: &[char], ch: char) -> (bool, &[char]) {
+    let mut i = 0;
+    let negate = p.first() == Some(&'^');
+    if negate {
+        i += 1;
+    }
+    let mut matched = false;
+    while i < p.len() && p[i] != ']' {
+        if i + 2 < p.len() && p[i + 1] == '-' && p[i + 2] != ']' {
+            if p[i] <= ch && ch <= p[i + 2] {
+                matched = true;
+            }
+            i += 3;
+        } else {
+            if p[i] == ch {
+                matched = true;
+            }
+            i += 1;
+        }
+    }
+    let rest = if i < p.len() { &p[i + 1..] } else { &p[i..] };
+    (matched ^ negate, rest)
+}
+
+/// `printf`/`format`: subconjunto C de SQLite. Flags `-`/`0`, anchura, `.precisión`
+/// y conversiones `d i s f x X o %`. `%%` es un `%` literal.
+fn sql_printf(fmt: &str, args: &[Value]) -> Result<String> {
+    let f: Vec<char> = fmt.chars().collect();
+    let mut out = String::new();
+    let mut ai = 0usize;
+    let mut i = 0usize;
+    while i < f.len() {
+        if f[i] != '%' {
+            out.push(f[i]);
+            i += 1;
+            continue;
+        }
+        i += 1;
+        if f.get(i) == Some(&'%') {
+            out.push('%');
+            i += 1;
+            continue;
+        }
+        // flags
+        let (mut left, mut zero) = (false, false);
+        while let Some(c) = f.get(i) {
+            match c {
+                '-' => left = true,
+                '0' => zero = true,
+                _ => break,
+            }
+            i += 1;
+        }
+        // anchura
+        let mut width = 0usize;
+        while let Some(d) = f.get(i).and_then(|c| c.to_digit(10)) {
+            width = width * 10 + d as usize;
+            i += 1;
+        }
+        // precisión
+        let mut prec: Option<usize> = None;
+        if f.get(i) == Some(&'.') {
+            i += 1;
+            let mut p = 0usize;
+            while let Some(d) = f.get(i).and_then(|c| c.to_digit(10)) {
+                p = p * 10 + d as usize;
+                i += 1;
+            }
+            prec = Some(p);
+        }
+        let conv = *f
+            .get(i)
+            .ok_or_else(|| sql_err("printf(): especificador incompleto"))?;
+        i += 1;
+        let arg = args
+            .get(ai)
+            .ok_or_else(|| sql_err("printf(): faltan argumentos para el formato"))?;
+        ai += 1;
+        let (body, numeric) = printf_one(conv, arg, prec)?;
+        out.push_str(&printf_pad(&body, width, left, zero && numeric));
+    }
+    Ok(out)
+}
+
+/// Convierte un argumento de `printf` según la conversión. Devuelve el texto y si
+/// es numérico (para decidir el relleno con ceros).
+fn printf_one(conv: char, arg: &Value, prec: Option<usize>) -> Result<(String, bool)> {
+    use crate::catalog::ColType;
+    let as_int = |v: &Value| -> Result<i64> {
+        match cast_value(v.clone(), ColType::Integer)? {
+            Value::Integer(n) => Ok(n),
+            _ => Ok(0),
+        }
+    };
+    Ok(match conv {
+        'd' | 'i' => (as_int(arg)?.to_string(), true),
+        'x' => (format!("{:x}", as_int(arg)? as u64), true),
+        'X' => (format!("{:X}", as_int(arg)? as u64), true),
+        'o' => (format!("{:o}", as_int(arg)? as u64), true),
+        'f' => {
+            let x = num_f64(arg).unwrap_or(0.0);
+            (format!("{:.*}", prec.unwrap_or(6), x), true)
+        }
+        's' => {
+            let s = value_text(arg).unwrap_or_default();
+            (
+                match prec {
+                    Some(p) => s.chars().take(p).collect(),
+                    None => s,
+                },
+                false,
+            )
+        }
+        other => {
+            return Err(sql_err(format!(
+                "printf(): conversión desconocida %{other}"
+            )));
+        }
+    })
+}
+
+/// Rellena `body` a `width` (a la izquierda/derecha; con ceros tras un signo si
+/// `zero`).
+fn printf_pad(body: &str, width: usize, left: bool, zero: bool) -> String {
+    let len = body.chars().count();
+    if len >= width {
+        return body.to_string();
+    }
+    let fill = width - len;
+    if left {
+        format!("{body}{}", " ".repeat(fill))
+    } else if zero {
+        if let Some(sign @ ('-' | '+')) = body.chars().next() {
+            format!("{sign}{}{}", "0".repeat(fill), &body[1..])
+        } else {
+            format!("{}{body}", "0".repeat(fill))
+        }
+    } else {
+        format!("{}{body}", " ".repeat(fill))
+    }
 }
 
 /// Valor numérico como `f64` (INTEGER o REAL), o `None` si no es numérico.

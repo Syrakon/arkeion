@@ -79,15 +79,24 @@ Agregados: `COUNT(*)`, `COUNT(col)`, `SUM`, `AVG`, `MIN`, `MAX`, `GROUP_CONCAT(x
 Admiten `DISTINCT` (`COUNT(DISTINCT x)`, `SUM(DISTINCT x)`, …). `SELECT DISTINCT`
 deduplica las filas ya proyectadas.
 
+`MIN`/`MAX` tienen además **forma escalar** con ≥2 argumentos (`MIN(a, b, …)` = el
+menor; con 1 argumento son agregados, como en SQLite).
+
 **Funciones escalares** (insensibles a mayúsculas; NULL propaga salvo donde se diga):
 - Texto: `UPPER`, `LOWER`, `LENGTH`/`CHAR_LENGTH`, `TRIM`/`LTRIM`/`RTRIM`,
-  `SUBSTR`/`SUBSTRING`, `REPLACE`, `INSTR`, `REVERSE`, `HEX`.
-- Numéricas: `ABS`, `ROUND`, `CEIL`/`CEILING`, `FLOOR`, `SQRT`, `POW`/`POWER`, `MOD`,
-  `SIGN`, `RANDOM` (no determinista).
-- Condicionales/NULL: `COALESCE`, `IFNULL`, `NULLIF`, `TYPEOF`.
-- Fecha/hora: `NOW`, `DATE`, `TIME`, `DATETIME`, `STRFTIME(fmt, ms)`. El entero de
-  tiempo es **epoch en milisegundos** UTC (igual que los timestamps de auditoría),
-  no el día juliano de SQLite.
+  `SUBSTR`/`SUBSTRING`, `REPLACE`, `INSTR`, `REVERSE`, `HEX`, `CONCAT`,
+  `CONCAT_WS(sep, …)`, `LPAD`/`RPAD(s, n[, pad])`, `UNICODE`, `CHAR(…)`, `QUOTE`,
+  `PRINTF`/`FORMAT(fmt, …)` (subconjunto C: flags `-`/`0`, anchura, `.precisión`,
+  conversiones `d i s f x X o %`), `GLOB(patrón, texto)` (comodines `*`/`?`/`[…]`).
+- Numéricas: `ABS`, `ROUND`, `CEIL`/`CEILING`, `FLOOR`, `TRUNC`, `SQRT`, `POW`/`POWER`,
+  `MOD`, `SIGN`, `EXP`, `LN`, `LOG`/`LOG10`/`LOG2`/`LOG(base, x)`, `SIN`/`COS`/`TAN`,
+  `ASIN`/`ACOS`/`ATAN`/`ATAN2(y, x)`, `PI()`, `RADIANS`/`DEGREES`, `RANDOM`
+  (no determinista).
+- Condicionales/NULL: `COALESCE`, `IFNULL`, `NULLIF`, `TYPEOF`, `IIF(c, a, b)`
+  (azúcar de `CASE WHEN c THEN a ELSE b END`).
+- Fecha/hora: `NOW`, `DATE`, `TIME`, `DATETIME`, `STRFTIME(fmt, ms)`,
+  `JULIANDAY(ms)`, `UNIXEPOCH(ms)` (→ segundos). El entero de tiempo es **epoch en
+  milisegundos** UTC (igual que los timestamps de auditoría), no el día juliano de SQLite.
 
 **Operadores/expresiones**: `||` (concat de texto), `CAST(x AS tipo)` (válvula del
 tipado estricto), `CASE WHEN … THEN … [ELSE …] END` (buscada y simple),
@@ -106,17 +115,28 @@ SELECT se guarda como texto en el catálogo y se materializa al consultarla (ref
 los datos actuales). Una vista sobre otra funciona; los nombres no colisionan con
 tablas. No recursivas.
 
-**Claves foráneas** (`col INTEGER REFERENCES padre [ON DELETE {RESTRICT|CASCADE|SET
-NULL}]`): v1 referencia siempre la **PK** del padre. Se comprueban en INSERT/UPDATE
-(el padre debe existir; FK `NULL` permitido) y el DELETE del padre aplica la acción
-(RESTRICT por defecto). Se permite auto-referencia (árboles).
+**Claves foráneas**: `col REFERENCES padre[(col)]` (en columna) o `FOREIGN KEY (a, b)
+REFERENCES padre (x, y)` (a nivel de tabla, **compuestas**), con `[ON DELETE acción]
+[ON UPDATE acción]` y acción `{RESTRICT|CASCADE|SET NULL}`. Las columnas referenciadas
+deben ser la **PK** del padre (referencia por rowid) o estar cubiertas por un índice
+`UNIQUE`. Se comprueban en INSERT/UPDATE (el padre debe existir; FK `NULL` permitido);
+el DELETE/UPDATE del padre aplica la acción (RESTRICT por defecto: en `ON UPDATE` se
+comprueba antes de escribir, y CASCADE/SET NULL después). Auto-referencia (árboles) ok.
 
-**Triggers** (`CREATE TRIGGER … {BEFORE|AFTER} {INSERT|UPDATE|DELETE} ON t BEGIN …
-END`): **row-level**, se disparan una vez por fila afectada. El cuerpo son sentencias
-`INSERT`/`UPDATE`/`DELETE` (re-parseadas al disparar) con `OLD.col`/`NEW.col` ligadas
-a los valores de la fila (`NEW` en INSERT/UPDATE, `OLD` en UPDATE/DELETE; en `AFTER
-INSERT`, `NEW.id` es el rowid asignado). Hay guarda de recursión (un trigger que
-dispara otra escritura). Buenos para **bitácoras de auditoría**.
+**Triggers** (`CREATE TRIGGER … {BEFORE|AFTER|INSTEAD OF} {INSERT|UPDATE|DELETE} ON t
+[FOR EACH {ROW|STATEMENT}] BEGIN … END`). El cuerpo son sentencias `INSERT`/`UPDATE`/
+`DELETE` (re-parseadas al disparar).
+- **`FOR EACH ROW`** (por defecto): una vez por fila afectada, con `OLD.col`/`NEW.col`
+  ligadas a los valores de la fila (`NEW` en INSERT/UPDATE, `OLD` en UPDATE/DELETE; en
+  `AFTER INSERT`, `NEW.id` es el rowid asignado).
+- **`FOR EACH STATEMENT`**: una sola vez por sentencia, aunque afecte a 0 o N filas
+  (sin `OLD`/`NEW`).
+- **`INSTEAD OF`** (solo en **vistas**, row-level): hace la vista **escribible** — la
+  escritura se reemplaza por el cuerpo, con `OLD`/`NEW` = filas de la vista, que el
+  cuerpo traduce a la(s) tabla(s) base.
+
+Hay guarda de recursión (un trigger que dispara otra escritura). Buenos para
+**bitácoras de auditoría**.
 
 `GROUP BY` / `HAVING` (post-M9): `SELECT … GROUP BY e1, e2 [HAVING cond]` agrupa por el
 valor de las expresiones (normalmente columnas) y emite una fila por grupo, plegando los

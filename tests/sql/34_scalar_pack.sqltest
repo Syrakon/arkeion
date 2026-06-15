@@ -1,0 +1,116 @@
+-- Pack de escalares/mates/string v1.x: iif, min/max escalares, mates, cadenas,
+-- glob, julianday/unixepoch. (Los flotantes se redondean para una salida estable.)
+
+-- iif(c, a, b) = azúcar de CASE WHEN c THEN a ELSE b END.
+> SELECT iif(1 < 2, 'si', 'no');
+si
+
+> SELECT iif(5 < 2, 'si', 'no');
+no
+
+> SELECT iif(NULL, 'si', 'no');
+no
+
+-- min/max ESCALARES (≥2 argumentos); con 1 argumento siguen siendo agregados.
+> SELECT min(3, 1, 2);
+1
+
+> SELECT max(3, 1, 2);
+3
+
+> SELECT min(2, NULL, 1);
+NULL
+
+> SELECT max('a', 'c', 'b');
+c
+
+-- Matemáticas.
+> SELECT CAST(round(degrees(pi())) AS INTEGER);
+180
+
+> SELECT round(pi(), 4);
+3.1416
+
+> SELECT trunc(3.9);
+3.0
+
+> SELECT trunc(-3.9);
+-3.0
+
+> SELECT CAST(round(log2(8.0)) AS INTEGER);
+3
+
+> SELECT CAST(round(log(2, 8)) AS INTEGER);
+3
+
+> SELECT round(exp(0.0), 1);
+1.0
+
+> SELECT round(sin(0.0), 1);
+0.0
+
+> SELECT round(atan2(0.0, 1.0), 1);
+0.0
+
+-- Cadenas.
+> SELECT concat('a', 'b', 'c');
+abc
+
+> SELECT concat('x', NULL, 'y');
+xy
+
+> SELECT concat_ws('-', 'a', 'b', 'c');
+a-b-c
+
+> SELECT concat_ws(',', 'a', NULL, 'c');
+a,c
+
+> SELECT lpad('7', 3, '0');
+007
+
+> SELECT rpad('7', 3, '*');
+7**
+
+> SELECT lpad('hello', 3);
+hel
+
+> SELECT unicode('A');
+65
+
+> SELECT char(72, 105);
+Hi
+
+> SELECT quote('a''b');
+'a''b'
+
+> SELECT printf('%05d', 42);
+00042
+
+> SELECT printf('%.2f', 3.14159);
+3.14
+
+> SELECT printf('%s=%d', 'x', 7);
+x=7
+
+-- glob(patrón, texto): comodines *, ?, clases [..]; sensible a mayúsculas.
+> SELECT glob('h*o', 'hello');
+TRUE
+
+> SELECT glob('h?llo', 'hello');
+TRUE
+
+> SELECT glob('[a-c]*', 'banana');
+TRUE
+
+> SELECT glob('[^a-c]*', 'banana');
+FALSE
+
+> SELECT glob('H*', 'hello');
+FALSE
+
+-- julianday/unixepoch: el tiempo interno es epoch ms (INTEGER).
+> SELECT unixepoch(1000);
+1
+
+> SELECT julianday(0);
+2440587.5

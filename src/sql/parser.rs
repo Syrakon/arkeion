@@ -1192,12 +1192,49 @@ impl<'a> Parser<'a> {
                 }
                 // `nombre(...)`: agregado o función escalar.
                 if self.eat(&Tok::LParen) {
-                    let agg = match name.to_ascii_uppercase().as_str() {
+                    let upper = name.to_ascii_uppercase();
+                    // MIN/MAX: con 1 argumento son AGREGADOS; con ≥2, funciones
+                    // ESCALARES (el menor/mayor de la lista, estilo SQLite).
+                    if upper == "MIN" || upper == "MAX" {
+                        let func = if upper == "MIN" {
+                            AggFunc::Min
+                        } else {
+                            AggFunc::Max
+                        };
+                        if self.eat_kw(Kw::Distinct) {
+                            let arg = Some(Box::new(self.expr()?));
+                            self.expect(&Tok::RParen, "')'")?;
+                            return Ok(Expr::Aggregate {
+                                func,
+                                arg,
+                                distinct: true,
+                                sep: None,
+                            });
+                        }
+                        let mut margs = Vec::new();
+                        if !matches!(self.peek(), Some(Tok::RParen)) {
+                            loop {
+                                margs.push(self.expr()?);
+                                if !self.eat(&Tok::Comma) {
+                                    break;
+                                }
+                            }
+                        }
+                        self.expect(&Tok::RParen, "')'")?;
+                        if margs.len() == 1 {
+                            return Ok(Expr::Aggregate {
+                                func,
+                                arg: Some(Box::new(margs.pop().expect("len 1"))),
+                                distinct: false,
+                                sep: None,
+                            });
+                        }
+                        return Ok(Expr::Function { name, args: margs });
+                    }
+                    let agg = match upper.as_str() {
                         "COUNT" => Some(AggFunc::Count),
                         "SUM" => Some(AggFunc::Sum),
                         "AVG" => Some(AggFunc::Avg),
-                        "MIN" => Some(AggFunc::Min),
-                        "MAX" => Some(AggFunc::Max),
                         "GROUP_CONCAT" => Some(AggFunc::GroupConcat),
                         _ => None,
                     };
@@ -1240,6 +1277,22 @@ impl<'a> Parser<'a> {
                         }
                     }
                     self.expect(&Tok::RParen, "')'")?;
+                    // `iif(c, a, b)` = azúcar de `CASE WHEN c THEN a ELSE b END`
+                    // (sin AST nuevo; hereda toda la semántica de CASE).
+                    if upper == "IIF" {
+                        if args.len() != 3 {
+                            return Err(err_at(pos, "iif() requiere exactamente 3 argumentos"));
+                        }
+                        let mut it = args.into_iter();
+                        let cond = it.next().expect("3 args");
+                        let yes = it.next().expect("3 args");
+                        let no = it.next().expect("3 args");
+                        return Ok(Expr::Case {
+                            operand: None,
+                            whens: vec![(cond, yes)],
+                            else_: Some(Box::new(no)),
+                        });
+                    }
                     return Ok(Expr::Function { name, args });
                 }
                 Ok(Expr::Column { table: None, name })

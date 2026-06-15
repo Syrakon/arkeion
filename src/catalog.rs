@@ -40,8 +40,9 @@ const CAT_TRIGGER: u8 = 0x06;
 // v3 añade el orden lógico de columnas (reorden de presentación) al final del
 // registro de esquema; v2 (sin él) se sigue leyendo como identidad.
 // v4 añade las claves foráneas al final del registro de esquema; v2/v3 (sin
-// ellas) se leen con `foreign_keys` vacío.
-const SCHEMA_VERSION: u8 = 4;
+// ellas) se leen con `foreign_keys` vacío. v5 añade el flag `dropped` por columna
+// (DROP COLUMN lógico); v<5 lo lee como `false`.
+const SCHEMA_VERSION: u8 = 5;
 const NO_ALIAS: u8 = 0xFF;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -201,6 +202,11 @@ pub struct ColumnDef {
     pub col_type: ColType,
     pub not_null: bool,
     pub default: Option<Value>,
+    /// `DROP COLUMN` lógico (tombstone): la columna deja de verse y de resolverse
+    /// por nombre, pero su **posición física se congela** (las filas no se
+    /// reescriben, time-travel intacto). Se excluye de `logical_order`; sus bytes
+    /// muertos los reclama el vacuum. Estilo Postgres (`attisdropped`).
+    pub dropped: bool,
 }
 
 /// Índice secundario sobre una o más columnas de una tabla (keyspace `0x02`).
@@ -370,6 +376,7 @@ fn encode_def(def: &TableDef) -> Vec<u8> {
                 out.extend_from_slice(&encoded);
             }
         }
+        out.push(u8::from(col.dropped)); // v5: tombstone de DROP COLUMN
     }
     // Índices (v2): id, unique, columnas y nombre por índice.
     put_varint(&mut out, def.indexes.len() as u64);
@@ -431,7 +438,7 @@ fn decode_def(name: &str, buf: &[u8]) -> Result<TableDef> {
     };
 
     let version = *take(&mut pos, 1)?.first().expect("len 1");
-    if !(2..=4).contains(&version) {
+    if !(2..=5).contains(&version) {
         return Err(bad("versión de esquema desconocida"));
     }
     let table_id = u32::from_le_bytes(
@@ -462,11 +469,14 @@ fn decode_def(name: &str, buf: &[u8]) -> Result<TableDef> {
             }
             _ => return Err(bad("marcador de default inválido")),
         };
+        // v5: flag `dropped`. v<5 ⇒ false (ninguna columna borrada lógicamente).
+        let dropped = version >= 5 && *take(&mut pos, 1)?.first().expect("len 1") != 0;
         columns.push(ColumnDef {
             name: cname,
             col_type,
             not_null,
             default,
+            dropped,
         });
     }
 
@@ -653,6 +663,7 @@ pub fn create_table<S: NodeStore>(
                 // El alias del rowid nunca es NULL por construcción.
                 not_null: c.not_null || c.primary_key,
                 default: c.default.clone(),
+                dropped: false,
             })
             .collect(),
         indexes: Vec::new(),
@@ -779,6 +790,69 @@ pub fn reorder_columns<S: NodeStore>(
         new_logical.push(phys);
     }
     def.logical_order = new_logical;
+    let root = btree::insert(s, root, &table_key(table_name), &encode_def(&def))?;
+    Ok((root, def))
+}
+
+/// Renombra una columna (`ALTER TABLE … RENAME COLUMN old TO new`). Solo cambia el
+/// nombre en el catálogo: posición física, índices y FKs (por posición) intactos.
+/// OJO: vistas/triggers que la nombren por texto quedan obsoletos.
+pub fn rename_column<S: NodeStore>(
+    s: &mut S,
+    root: PageId,
+    table_name: &str,
+    old: &str,
+    new: &str,
+) -> Result<(PageId, TableDef)> {
+    validate_name(new, "nombre de columna vacío o de más de 128 bytes")?;
+    let mut def = get_table(s, root, table_name)?.ok_or(Error::Constraint("tabla desconocida"))?;
+    let phys = def
+        .columns
+        .iter()
+        .position(|c| !c.dropped && c.name == old)
+        .ok_or(Error::Constraint("columna desconocida"))?;
+    if def.columns.iter().any(|c| !c.dropped && c.name == new) {
+        return Err(Error::Constraint("ya existe una columna con ese nombre"));
+    }
+    def.columns[phys].name = new.to_owned();
+    let root = btree::insert(s, root, &table_key(table_name), &encode_def(&def))?;
+    Ok((root, def))
+}
+
+/// `ALTER TABLE … DROP COLUMN` **lógico** (tombstone): marca la columna como
+/// borrada y la saca del orden lógico, sin tocar la posición física ni reescribir
+/// filas (time-travel intacto; los bytes muertos los reclama el vacuum). Falla con
+/// la PK, la última columna visible, o una columna en un índice o FK (bórralos
+/// antes).
+pub fn drop_column<S: NodeStore>(
+    s: &mut S,
+    root: PageId,
+    table_name: &str,
+    col: &str,
+) -> Result<(PageId, TableDef)> {
+    let mut def = get_table(s, root, table_name)?.ok_or(Error::Constraint("tabla desconocida"))?;
+    let phys = def
+        .columns
+        .iter()
+        .position(|c| !c.dropped && c.name == col)
+        .ok_or(Error::Constraint("columna desconocida"))?;
+    if def.rowid_alias == Some(phys) {
+        return Err(Error::Constraint("no se puede borrar la PRIMARY KEY"));
+    }
+    if def.columns.iter().filter(|c| !c.dropped).count() <= 1 {
+        return Err(Error::Constraint("una tabla necesita al menos una columna"));
+    }
+    if def.indexes.iter().any(|i| i.columns.contains(&phys)) {
+        return Err(Error::Constraint(
+            "la columna está en un índice (haz DROP INDEX primero)",
+        ));
+    }
+    if def.foreign_keys.iter().any(|fk| fk.column == phys) {
+        return Err(Error::Constraint("la columna tiene una clave foránea"));
+    }
+    // La columna se queda en `logical_order` (sigue siendo permutación de
+    // `0..ncols` ⇒ serialización intacta); la presentación la filtra por `dropped`.
+    def.columns[phys].dropped = true;
     let root = btree::insert(s, root, &table_key(table_name), &encode_def(&def))?;
     Ok((root, def))
 }
@@ -2044,38 +2118,46 @@ mod tests {
 
         let mut s = MemStore::new();
         let (_, def) = create_table(&mut s, NO_ROOT, &facturas_spec()).unwrap();
-        let n = def.columns.len();
 
-        // v4 (actual) de una tabla identidad sin FKs termina en [flag lógico 0][nº
-        // FKs 0]. Reconstruimos v3 y v2 quitando esos sufijos y bajando la versión.
-        let v4 = encode_def(&def);
-        assert_eq!(*v4.last().unwrap(), 0, "sin FKs ⇒ contador 0");
+        // Retrocompat: un esquema **v2** hecho a mano (sin orden lógico, sin FKs,
+        // sin flag `dropped`) decodifica con identidad, FKs vacías y `dropped=false`.
+        let v2 = [
+            2u8, // versión
+            1,
+            0,
+            0,
+            0,        // table_id = 1 (LE)
+            NO_ALIAS, // sin PK
+            1,        // ncols = 1
+            1,
+            b'x',                   // nombre "x"
+            ColType::Integer as u8, // tipo
+            0,                      // not_null = false
+            0,                      // default: ninguno
+            0,                      // nidx = 0
+        ];
+        let from_v2 = decode_def("t", &v2).unwrap();
+        assert_eq!(from_v2.columns.len(), 1);
+        assert_eq!(from_v2.columns[0].name, "x");
+        assert!(!from_v2.columns[0].dropped);
+        assert_eq!(from_v2.logical_order, vec![0]);
+        assert!(from_v2.foreign_keys.is_empty());
 
-        // v3 = v4 sin el contador de FKs, versión 3.
-        let mut v3 = v4.clone();
-        v3.pop();
-        v3[0] = 3;
-        assert_eq!(
-            decode_def("facturas", &v3).unwrap(),
-            decode_def("facturas", &v4).unwrap()
-        );
-
-        // v2 = v3 sin el flag de orden lógico, versión 2.
-        let mut v2 = v3.clone();
-        assert_eq!(*v2.last().unwrap(), 0, "tabla identidad ⇒ flag lógico 0");
-        v2.pop();
-        v2[0] = 2;
-        let from_v2 = decode_def("facturas", &v2).unwrap();
-        assert_eq!(from_v2.logical_order, (0..n).collect::<Vec<_>>());
-        assert_eq!(from_v2, decode_def("facturas", &v4).unwrap());
-
-        // Una permutación explícita hace round-trip exacto (flag 1 + entradas).
+        // v5: round-trip exacto de una permutación de orden lógico.
         let mut perm = def.clone();
         perm.logical_order = vec![2, 0, 4, 1, 3];
-        let bytes = encode_def(&perm);
-        let decoded = decode_def("facturas", &bytes).unwrap();
+        let decoded = decode_def("facturas", &encode_def(&perm)).unwrap();
         assert_eq!(decoded.logical_order, vec![2, 0, 4, 1, 3]);
         assert_eq!(decoded, perm);
+
+        // v5: round-trip del flag `dropped` (la columna se queda en logical_order;
+        // la presentación la filtra).
+        let mut dropped = def.clone();
+        dropped.columns[2].dropped = true;
+        let decoded = decode_def("facturas", &encode_def(&dropped)).unwrap();
+        assert!(decoded.columns[2].dropped);
+        assert_eq!(decoded.logical_order, dropped.logical_order); // intacto (5 entradas)
+        assert_eq!(decoded, dropped);
     }
 
     #[test]

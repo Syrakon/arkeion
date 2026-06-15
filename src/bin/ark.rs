@@ -436,6 +436,7 @@ fn print_schema(t: &TableDef) {
     let cols: Vec<String> = t
         .logical_order
         .iter()
+        .filter(|&&phys| !t.columns[phys].dropped) // las borradas no se muestran
         .map(|&phys| {
             let c = &t.columns[phys];
             let mut s = format!("{} {}", c.name, c.col_type.name());

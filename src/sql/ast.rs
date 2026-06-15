@@ -82,6 +82,17 @@ pub enum Stmt {
         table: String,
         order: Vec<String>,
     },
+    /// `ALTER TABLE t RENAME [COLUMN] old TO new` — solo metadato (nombre).
+    AlterTableRenameColumn {
+        table: String,
+        old: String,
+        new: String,
+    },
+    /// `ALTER TABLE t DROP [COLUMN] col` — DROP lógico (tombstone), no reescribe filas.
+    AlterTableDropColumn {
+        table: String,
+        column: String,
+    },
     Update {
         table: String,
         sets: Vec<(String, Expr)>,

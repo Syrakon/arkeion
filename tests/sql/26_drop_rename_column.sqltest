@@ -1,0 +1,69 @@
+-- ALTER TABLE RENAME/DROP COLUMN. RENAME = metadato (nombre). DROP = lógico
+-- (tombstone): la columna deja de verse y de resolverse, pero su posición física
+-- se congela — las filas NO se reescriben (time-travel intacto), los bytes muertos
+-- los reclama el vacuum.
+
+> CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, c INTEGER);
+ok
+
+> INSERT INTO t (a, b, c) VALUES (10, 20, 30);
+affected 1
+
+-- RENAME COLUMN: el nuevo nombre resuelve, el viejo no.
+> ALTER TABLE t RENAME COLUMN b TO middle;
+ok
+
+> SELECT id, a, middle, c FROM t;
+1|10|20|30
+
+> SELECT b FROM t;
+error columna desconocida
+
+-- DROP COLUMN (lógico): desaparece de `*` y no resuelve por nombre; el resto
+-- intacto (la fila no se reescribió).
+> ALTER TABLE t DROP COLUMN middle;
+ok
+
+> SELECT * FROM t;
+1|10|30
+
+> SELECT middle FROM t;
+error columna desconocida
+
+> SELECT id, a, c FROM t;
+1|10|30
+
+-- INSERT por nombre: la columna borrada no se puede nombrar.
+> INSERT INTO t (a, c) VALUES (50, 70);
+affected 1
+
+> SELECT * FROM t ORDER BY id;
+1|10|30
+2|50|70
+
+-- INSERT posicional cuenta columnas VISIBLES (id, a, c = 3); id NULL = auto.
+> INSERT INTO t VALUES (NULL, 88, 99);
+affected 1
+
+> SELECT a, c FROM t WHERE a = 88;
+88|99
+
+> INSERT INTO t VALUES (1, 2, 3, 4);
+error 3 columnas pero se dieron 4
+
+-- Errores de DROP/RENAME.
+> ALTER TABLE t DROP COLUMN id;
+error PRIMARY KEY
+
+> ALTER TABLE t DROP COLUMN nope;
+error columna desconocida
+
+> ALTER TABLE t RENAME COLUMN a TO c;
+error ya existe una columna
+
+-- Una columna en un índice no se puede borrar (quita el índice primero).
+> CREATE INDEX ia ON t (a);
+ok
+
+> ALTER TABLE t DROP COLUMN a;
+error índice

@@ -1667,6 +1667,22 @@ impl WriteTx {
         Ok(())
     }
 
+    /// Renombra una columna (`ALTER TABLE … RENAME COLUMN`).
+    pub fn rename_column(&mut self, table: &str, old: &str, new: &str) -> Result<()> {
+        self.schema_cache.clear();
+        let (root, _) = catalog::rename_column(&mut self.ts, self.data_root, table, old, new)?;
+        self.data_root = root;
+        Ok(())
+    }
+
+    /// DROP COLUMN lógico (tombstone).
+    pub fn drop_column(&mut self, table: &str, col: &str) -> Result<()> {
+        self.schema_cache.clear();
+        let (root, _) = catalog::drop_column(&mut self.ts, self.data_root, table, col)?;
+        self.data_root = root;
+        Ok(())
+    }
+
     /// Inserta y devuelve el rowid (automático o explícito vía columna alias).
     /// El contador de rowid se cachea en la tx y se vuelca en el commit, así que
     /// solo se escribe la hoja de la fila (no la del contador) por inserción.

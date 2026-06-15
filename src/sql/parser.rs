@@ -404,9 +404,23 @@ impl<'a> Parser<'a> {
             self.expect(&Tok::RParen, "')'")?;
             return Ok(Stmt::AlterTableReorderColumns { table, order });
         }
+        if self.eat_kw(Kw::Rename) {
+            // RENAME [COLUMN] old TO new.
+            let _ = self.eat_kw(Kw::Column); // COLUMN opcional
+            let old = self.ident("un nombre de columna")?;
+            self.expect_kw(Kw::To, "TO")?;
+            let new = self.ident("un nombre de columna")?;
+            return Ok(Stmt::AlterTableRenameColumn { table, old, new });
+        }
+        if self.eat_kw(Kw::Drop) {
+            // DROP [COLUMN] col.
+            let _ = self.eat_kw(Kw::Column); // COLUMN opcional
+            let column = self.ident("un nombre de columna")?;
+            return Ok(Stmt::AlterTableDropColumn { table, column });
+        }
         Err(err_at(
             self.pos(),
-            "se esperaba ADD, MOVE o REORDER tras ALTER TABLE",
+            "se esperaba ADD, DROP, RENAME, MOVE o REORDER tras ALTER TABLE",
         ))
     }
 

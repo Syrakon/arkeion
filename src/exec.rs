@@ -192,14 +192,19 @@ impl QuerySchema {
                     .def
                     .columns
                     .iter()
-                    .position(|c| c.name == name)
+                    .position(|c| !c.dropped && c.name == name)
                     .ok_or_else(|| sql_err(format!("columna desconocida: {q}.{name}")))?;
                 Ok(t.offset + i)
             }
             None => {
                 let mut found = None;
                 for t in &self.tables {
-                    if let Some(i) = t.def.columns.iter().position(|c| c.name == name) {
+                    if let Some(i) = t
+                        .def
+                        .columns
+                        .iter()
+                        .position(|c| !c.dropped && c.name == name)
+                    {
                         if found.is_some() {
                             return Err(sql_err(format!("columna ambigua: {name}")));
                         }
@@ -446,6 +451,7 @@ pub fn run_execute(tx: &mut WriteTx, stmt: &Stmt, params: &[Value]) -> Result<us
                     col_type: column.col_type,
                     not_null: column.not_null,
                     default,
+                    dropped: false,
                 },
             )?;
             Ok(0)
@@ -456,6 +462,14 @@ pub fn run_execute(tx: &mut WriteTx, stmt: &Stmt, params: &[Value]) -> Result<us
         }
         Stmt::AlterTableReorderColumns { table, order } => {
             tx.reorder_columns(table, order)?;
+            Ok(0)
+        }
+        Stmt::AlterTableRenameColumn { table, old, new } => {
+            tx.rename_column(table, old, new)?;
+            Ok(0)
+        }
+        Stmt::AlterTableDropColumn { table, column } => {
+            tx.drop_column(table, column)?;
             Ok(0)
         }
         Stmt::Update {
@@ -863,19 +877,24 @@ fn insert_values_into(
         // columnas con NULL que el usuario no escribió — para nombrar un
         // subconjunto está la forma `INSERT … (col, …) VALUES …`.
         None => {
-            if exprs.len() != def.columns.len() {
+            // Un valor por cada columna **visible** (orden lógico, sin las borradas);
+            // las posiciones físicas borradas quedan NULL.
+            let visible: Vec<usize> = def
+                .logical_order
+                .iter()
+                .copied()
+                .filter(|&p| !def.columns[p].dropped)
+                .collect();
+            if exprs.len() != visible.len() {
                 return Err(sql_err(format!(
                     "la tabla tiene {} columnas pero se dieron {} valores",
-                    def.columns.len(),
+                    visible.len(),
                     exprs.len()
                 )));
             }
-            // El i-ésimo valor va a la i-ésima columna **lógica** = posición física
-            // `logical_order[i]`. Con orden identidad, `out[i]` = valor i (idéntico
-            // al comportamiento anterior).
             out.resize(def.columns.len(), Value::Null);
             for (i, e) in exprs.iter().enumerate() {
-                out[def.logical_order[i]] = eval_const(e, params)?;
+                out[visible[i]] = eval_const(e, params)?;
             }
             Ok(())
         }
@@ -907,7 +926,7 @@ fn insert_values_into(
 fn col_index(def: &TableDef, name: &str) -> Result<usize> {
     def.columns
         .iter()
-        .position(|c| c.name == name)
+        .position(|c| !c.dropped && c.name == name)
         .ok_or_else(|| sql_err(format!("columna desconocida: {name}")))
 }
 
@@ -1188,6 +1207,9 @@ pub fn run_select(src: &impl DataSource, stmt: &SelectStmt, params: &[Value]) ->
     let mut base = 0;
     for t in &schema.tables {
         for &phys in &t.def.logical_order {
+            if t.def.columns[phys].dropped {
+                continue; // columna borrada lógicamente: no aparece en `*`
+            }
             star_map.push(base + phys);
         }
         base += t.def.columns.len();
@@ -1202,6 +1224,9 @@ pub fn run_select(src: &impl DataSource, stmt: &SelectStmt, params: &[Value]) ->
             SelectItem::Star => {
                 for t in &schema.tables {
                     for &phys in &t.def.logical_order {
+                        if t.def.columns[phys].dropped {
+                            continue;
+                        }
                         columns.push(t.def.columns[phys].name.clone());
                     }
                 }
@@ -1550,6 +1575,7 @@ fn synthetic_cte_def(name: &str, columns: &[String], idx: usize) -> TableDef {
             col_type: ColType::Integer, // relleno: no se consulta en lectura
             not_null: false,
             default: None,
+            dropped: false,
         })
         .collect();
     let n = cols.len();
@@ -1891,7 +1917,11 @@ pub fn stream_select(
         match item {
             SelectItem::Star => {
                 // Orden LÓGICO de presentación; `cols` mapea salida→posición física.
+                // Las columnas borradas no aparecen.
                 for &phys in &def.logical_order {
+                    if def.columns[phys].dropped {
+                        continue;
+                    }
                     columns.push(def.columns[phys].name.clone());
                     cols.push(phys);
                 }
@@ -1903,8 +1933,12 @@ pub fn stream_select(
                 if table.as_deref().is_some_and(|q| q != qualifier) {
                     return Ok(None); // calificador ajeno: que el camino normal dé su error
                 }
-                let Some(c) = def.columns.iter().position(|col| col.name == *name) else {
-                    return Ok(None); // columna desconocida: ídem
+                let Some(c) = def
+                    .columns
+                    .iter()
+                    .position(|col| !col.dropped && col.name == *name)
+                else {
+                    return Ok(None); // columna desconocida (o borrada): camino normal
                 };
                 columns.push(alias.clone().unwrap_or_else(|| name.clone()));
                 cols.push(c);
@@ -3529,6 +3563,7 @@ mod tests {
                 col_type: ColType::Integer,
                 not_null: false,
                 default: None,
+                dropped: false,
             }],
             indexes: Vec::new(),
             logical_order: vec![0],
@@ -3583,6 +3618,7 @@ mod tests {
                 col_type: ColType::Integer,
                 not_null: false,
                 default: None,
+                dropped: false,
             }],
             indexes: Vec::new(),
             logical_order: vec![0],

@@ -484,6 +484,31 @@ impl Connection {
                 drop(tx); // soltar la transacción ES el rollback
                 Ok(0)
             }
+            // SAVEPOINT/RELEASE/ROLLBACK TO actúan sobre la transacción abierta.
+            Stmt::Savepoint(name) => {
+                self.open_tx
+                    .borrow_mut()
+                    .as_mut()
+                    .ok_or_else(|| sql_err("SAVEPOINT requiere una transacción abierta (BEGIN)"))?
+                    .savepoint(name);
+                Ok(0)
+            }
+            Stmt::ReleaseSavepoint(name) => {
+                self.open_tx
+                    .borrow_mut()
+                    .as_mut()
+                    .ok_or_else(|| sql_err("RELEASE sin transacción abierta"))?
+                    .release_savepoint(name)?;
+                Ok(0)
+            }
+            Stmt::RollbackTo(name) => {
+                self.open_tx
+                    .borrow_mut()
+                    .as_mut()
+                    .ok_or_else(|| sql_err("ROLLBACK TO sin transacción abierta"))?
+                    .rollback_to_savepoint(name)?;
+                Ok(0)
+            }
             stmt => match self.open_tx.borrow_mut().as_mut() {
                 // Dentro de BEGIN: ejecutar sin publicar.
                 Some(tx) => exec::run_execute(tx, stmt, params),

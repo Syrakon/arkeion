@@ -185,11 +185,28 @@ impl<'a> Parser<'a> {
             }
             Some(Tok::Kw(Kw::Rollback)) => {
                 self.i += 1;
-                Ok(Stmt::Rollback)
+                // `ROLLBACK TO [SAVEPOINT] nombre` vs `ROLLBACK` (transacción entera).
+                if self.eat_kw(Kw::To) {
+                    let _ = self.eat_kw(Kw::Savepoint); // SAVEPOINT opcional
+                    Ok(Stmt::RollbackTo(self.ident("un nombre de savepoint")?))
+                } else {
+                    Ok(Stmt::Rollback)
+                }
+            }
+            Some(Tok::Kw(Kw::Savepoint)) => {
+                self.i += 1;
+                Ok(Stmt::Savepoint(self.ident("un nombre de savepoint")?))
+            }
+            Some(Tok::Kw(Kw::Release)) => {
+                self.i += 1;
+                let _ = self.eat_kw(Kw::Savepoint); // SAVEPOINT opcional
+                Ok(Stmt::ReleaseSavepoint(
+                    self.ident("un nombre de savepoint")?,
+                ))
             }
             _ => Err(err_at(
                 self.pos(),
-                "se esperaba CREATE, DROP, INSERT, SELECT, UPDATE, DELETE, BEGIN, COMMIT o ROLLBACK",
+                "se esperaba CREATE, DROP, INSERT, SELECT, UPDATE, DELETE, BEGIN, COMMIT, ROLLBACK, SAVEPOINT o RELEASE",
             )),
         }
     }

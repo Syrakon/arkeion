@@ -335,6 +335,7 @@ impl Store {
             values_buf: Vec::new(),
             schema_cache: HashMap::new(),
             trigger_depth: 0,
+            savepoints: Vec::new(),
         })
     }
 
@@ -1474,6 +1475,23 @@ pub struct WriteTx {
     /// Profundidad de triggers en curso (un trigger puede disparar otra escritura
     /// que dispare más triggers): guarda contra recursión infinita.
     trigger_depth: usize,
+    /// Pila de `SAVEPOINT`s: nombre + `data_root` + contadores de rowid en ese
+    /// punto. Como el árbol es CoW (append-only), restaurar `data_root` revierte
+    /// al subárbol anterior sin tocar el archivo (las páginas posteriores quedan
+    /// inalcanzables; el vacuum las recupera).
+    savepoints: Vec<Savepoint>,
+}
+
+/// Punto de retorno dentro de una transacción (`SAVEPOINT`). Captura el estado
+/// del `TxStore` (las páginas sucias, que el b-tree CoW puede mutar **en sitio**
+/// dentro de la tx, así que no basta con guardar `data_root`) y los contadores.
+struct Savepoint {
+    name: String,
+    data_root: PageId,
+    rowid_cache: HashMap<u32, i64>,
+    dirty: HashMap<PageId, PageBuf>,
+    freed: Vec<PageId>,
+    alloc_next: u64,
 }
 
 impl Drop for WriteTx {
@@ -1576,6 +1594,57 @@ impl WriteTx {
 
     pub fn exit_trigger(&mut self) {
         self.trigger_depth -= 1;
+    }
+
+    /// `SAVEPOINT nombre`: captura el estado actual como punto de retorno.
+    pub fn savepoint(&mut self, name: &str) {
+        self.savepoints.push(Savepoint {
+            name: name.to_string(),
+            data_root: self.data_root,
+            rowid_cache: self.rowid_cache.clone(),
+            dirty: self.ts.dirty.clone(),
+            freed: self.ts.freed.clone(),
+            alloc_next: self.ts.alloc_next,
+        });
+    }
+
+    /// `ROLLBACK TO nombre`: revierte al savepoint (que **sigue activo**) y
+    /// descarta los savepoints internos. Falla si el nombre no existe.
+    pub fn rollback_to_savepoint(&mut self, name: &str) -> Result<()> {
+        let pos = self
+            .savepoints
+            .iter()
+            .rposition(|s| s.name == name)
+            .ok_or(Error::InvalidInput("savepoint desconocido"))?;
+        let sp = &self.savepoints[pos];
+        let (data_root, rowid_cache, dirty, freed, alloc_next) = (
+            sp.data_root,
+            sp.rowid_cache.clone(),
+            sp.dirty.clone(),
+            sp.freed.clone(),
+            sp.alloc_next,
+        );
+        self.data_root = data_root;
+        self.rowid_cache = rowid_cache;
+        self.ts.dirty = dirty;
+        self.ts.freed = freed;
+        self.ts.alloc_next = alloc_next;
+        self.ts.append_cursor = None; // el cursor de append pudo quedar obsoleto
+        self.schema_cache.clear(); // el esquema pudo cambiar desde el savepoint
+        self.savepoints.truncate(pos + 1); // conserva el savepoint, quita los internos
+        Ok(())
+    }
+
+    /// `RELEASE nombre`: descarta el savepoint y los internos (sus cambios quedan
+    /// para el COMMIT o el rollback de un ámbito exterior). Falla si no existe.
+    pub fn release_savepoint(&mut self, name: &str) -> Result<()> {
+        let pos = self
+            .savepoints
+            .iter()
+            .rposition(|s| s.name == name)
+            .ok_or(Error::InvalidInput("savepoint desconocido"))?;
+        self.savepoints.truncate(pos);
+        Ok(())
     }
 
     /// Crea un índice secundario sobre `columns` (posiciones) de `table` (M10.5).

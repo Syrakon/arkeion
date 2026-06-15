@@ -61,7 +61,14 @@ SELECT [DISTINCT] lista | *                  -- FROM opcional: sin él, evalúa
 
 -- Transacciones
 BEGIN; COMMIT; ROLLBACK;
+SAVEPOINT s;  ROLLBACK TO [SAVEPOINT] s;  RELEASE [SAVEPOINT] s;   -- dentro de un BEGIN
 ```
+
+**Savepoints** (`SAVEPOINT`/`ROLLBACK TO`/`RELEASE`) son puntos de retorno **dentro de
+una transacción** (requieren un `BEGIN` abierto). `ROLLBACK TO s` revierte los cambios
+posteriores al savepoint pero lo mantiene activo (y restaura el contador de rowid);
+`RELEASE s` lo descarta conservando sus cambios. Anidan. Aprovechan que el árbol es
+CoW: el savepoint guarda las páginas sucias de su instante y el rollback las restaura.
 
 `MOVE COLUMN` / `REORDER COLUMNS` reordenan columnas de forma **lógica** (solo el
 orden de presentación: la expansión de `*` y el `INSERT` posicional). La posición

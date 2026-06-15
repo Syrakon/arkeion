@@ -593,9 +593,14 @@ pub fn run_execute(tx: &mut WriteTx, stmt: &Stmt, params: &[Value]) -> Result<us
             returning.as_deref(),
         )?
         .0),
-        // La conexión intercepta estas tres antes de llegar aquí (api.rs).
-        Stmt::Begin | Stmt::Commit | Stmt::Rollback => Err(sql_err(
-            "BEGIN/COMMIT/ROLLBACK los gestiona la conexión, no el ejecutor",
+        // La conexión intercepta las de transacción/savepoint antes de llegar aquí.
+        Stmt::Begin
+        | Stmt::Commit
+        | Stmt::Rollback
+        | Stmt::Savepoint(_)
+        | Stmt::ReleaseSavepoint(_)
+        | Stmt::RollbackTo(_) => Err(sql_err(
+            "las sentencias de transacción/savepoint las gestiona la conexión",
         )),
         Stmt::Select(_) => Err(sql_err("SELECT devuelve filas: usa query, no execute")),
     }

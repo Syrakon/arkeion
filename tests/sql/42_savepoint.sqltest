@@ -1,0 +1,81 @@
+-- SAVEPOINT / ROLLBACK TO / RELEASE: puntos de retorno dentro de una transacción.
+
+> CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER);
+ok
+
+> BEGIN;
+ok
+
+> INSERT INTO t (n) VALUES (1);
+affected 1
+
+> SAVEPOINT sp1;
+ok
+
+> INSERT INTO t (n) VALUES (2);
+affected 1
+
+> SELECT COUNT(*) FROM t;
+2
+
+-- ROLLBACK TO descarta lo posterior al savepoint, sin cerrar la transacción.
+> ROLLBACK TO sp1;
+ok
+
+> SELECT COUNT(*) FROM t;
+1
+
+-- Tras revertir, se puede seguir; el contador de rowid también se restauró.
+> INSERT INTO t (n) VALUES (3);
+affected 1
+
+> SELECT n FROM t ORDER BY n;
+1
+3
+
+-- Savepoints anidados + RELEASE (conserva los cambios, no los revierte).
+> SAVEPOINT outer_sp;
+ok
+
+> INSERT INTO t (n) VALUES (4);
+affected 1
+
+> SAVEPOINT inner_sp;
+ok
+
+> INSERT INTO t (n) VALUES (5);
+affected 1
+
+> RELEASE inner_sp;
+ok
+
+> SELECT COUNT(*) FROM t;
+4
+
+-- ROLLBACK TO un savepoint exterior descarta ambos inserts (4 y 5).
+> ROLLBACK TO outer_sp;
+ok
+
+> SELECT COUNT(*) FROM t;
+2
+
+> COMMIT;
+ok
+
+> SELECT n FROM t ORDER BY n;
+1
+3
+
+-- Un savepoint inexistente es un error.
+> BEGIN;
+ok
+
+> ROLLBACK TO nope;
+error savepoint desconocido
+
+> ROLLBACK;
+ok
+
+-- SAVEPOINT sin transacción abierta es un error.
+> SAVEPOINT x;
+error requiere una transacción

@@ -135,6 +135,12 @@ pub enum Stmt {
     Begin,
     Commit,
     Rollback,
+    /// `SAVEPOINT nombre`: punto de retorno dentro de una transacción.
+    Savepoint(String),
+    /// `RELEASE [SAVEPOINT] nombre`: descarta el savepoint (los cambios quedan).
+    ReleaseSavepoint(String),
+    /// `ROLLBACK TO [SAVEPOINT] nombre`: revierte al savepoint (que sigue activo).
+    RollbackTo(String),
 }
 
 /// Origen de las filas de un `INSERT`: literal (`VALUES`) o una consulta.

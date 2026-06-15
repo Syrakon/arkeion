@@ -211,3 +211,32 @@ fn column_reorder_is_logical_and_time_travel_safe() {
         vec![Value::Integer(10), Value::Integer(20), Value::Integer(30)],
     );
 }
+
+/// `DROP COLUMN` es **lógico** (tombstone): la fila no se reescribe, así que un
+/// `AS OF` anterior al DROP sigue viendo la columna con sus valores.
+#[test]
+fn drop_column_is_time_travel_safe() {
+    let (_dir, db) = fresh();
+    let conn = db.connect().unwrap();
+    conn.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER)",
+        &[],
+    )
+    .unwrap();
+    conn.execute("INSERT INTO t (a, b) VALUES (10, 20)", &[])
+        .unwrap();
+    let before = conn.version();
+
+    conn.execute("ALTER TABLE t DROP COLUMN b", &[]).unwrap();
+
+    // Head: `b` ya no aparece — `*` = id, a.
+    assert_eq!(
+        star_row(&conn, "SELECT * FROM t"),
+        vec![Value::Integer(1), Value::Integer(10)],
+    );
+    // AS OF antes del DROP: `b` sigue ahí (catálogo versionado, fila no reescrita).
+    assert_eq!(
+        star_row(&conn, &format!("SELECT * FROM t AS OF VERSION {before}")),
+        vec![Value::Integer(1), Value::Integer(10), Value::Integer(20)],
+    );
+}

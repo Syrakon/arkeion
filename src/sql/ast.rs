@@ -201,6 +201,10 @@ pub enum SetOp {
     Union,
     /// `UNION ALL`: une conservando duplicados.
     UnionAll,
+    /// `INTERSECT`: filas en ambos lados, deduplicadas.
+    Intersect,
+    /// `EXCEPT`: filas del acumulado que no están en el derecho, deduplicadas.
+    Except,
 }
 
 /// Un núcleo SELECT encadenado con un operador de conjunto.

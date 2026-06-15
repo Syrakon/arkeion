@@ -1817,14 +1817,31 @@ fn run_compound(src: &impl DataSource, stmt: &SelectStmt, params: &[Value]) -> R
         let part = run_select(src, &cu.select, params)?;
         if part.columns.len() != columns.len() {
             return Err(sql_err(format!(
-                "UNION: los SELECT tienen distinto número de columnas ({} vs {})",
+                "operador de conjunto: los SELECT tienen distinto número de columnas ({} vs {})",
                 columns.len(),
                 part.columns.len()
             )));
         }
-        rows.extend(part.rows);
-        if cu.op == SetOp::Union {
-            rows = dedup_preserving(rows); // dedup del acumulado (asociativo por la izquierda)
+        // Combinación asociativa por la izquierda. UNION/INTERSECT/EXCEPT deduplican;
+        // UNION ALL conserva duplicados.
+        match cu.op {
+            SetOp::UnionAll => rows.extend(part.rows),
+            SetOp::Union => {
+                rows.extend(part.rows);
+                rows = dedup_preserving(rows);
+            }
+            SetOp::Intersect => {
+                rows = dedup_preserving(rows)
+                    .into_iter()
+                    .filter(|r| part.rows.contains(r))
+                    .collect();
+            }
+            SetOp::Except => {
+                rows = dedup_preserving(rows)
+                    .into_iter()
+                    .filter(|r| !part.rows.contains(r))
+                    .collect();
+            }
         }
     }
 

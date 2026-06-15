@@ -1,0 +1,45 @@
+-- INTERSECT (filas en ambos lados, deduplicadas) y EXCEPT (filas del izquierdo que
+-- no están en el derecho, deduplicadas). Asociativos por la izquierda, misma
+-- precedencia que UNION (estilo SQLite).
+
+> CREATE TABLE a (id INTEGER PRIMARY KEY, v INTEGER);
+ok
+
+> CREATE TABLE b (id INTEGER PRIMARY KEY, v INTEGER);
+ok
+
+> INSERT INTO a (v) VALUES (1), (2), (3), (3);
+affected 4
+
+> INSERT INTO b (v) VALUES (2), (3), (4);
+affected 3
+
+-- INTERSECT: {2, 3} (deduplicado pese al 3 repetido en a).
+> SELECT v FROM a INTERSECT SELECT v FROM b ORDER BY v;
+2
+3
+
+-- EXCEPT: a menos b = {1}.
+> SELECT v FROM a EXCEPT SELECT v FROM b ORDER BY v;
+1
+
+-- EXCEPT al revés: b menos a = {4}.
+> SELECT v FROM b EXCEPT SELECT v FROM a ORDER BY v;
+4
+
+-- Sin FROM.
+> SELECT 1 INTERSECT SELECT 1;
+1
+
+> SELECT 1 EXCEPT SELECT 1;
+empty
+
+-- Cadena mixta asociativa por la izquierda: (a UNION b) EXCEPT {3} = {1,2,4}.
+> SELECT v FROM a UNION SELECT v FROM b EXCEPT SELECT 3 ORDER BY v;
+1
+2
+4
+
+-- Número de columnas distinto → error.
+> SELECT v FROM a INTERSECT SELECT id, v FROM b;
+error distinto número de columnas

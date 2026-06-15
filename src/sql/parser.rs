@@ -679,12 +679,22 @@ impl<'a> Parser<'a> {
     /// al conjunto entero y las lleva el núcleo líder.
     fn select(&mut self) -> Result<SelectStmt> {
         let mut lead = self.select_core()?;
+        // Operadores de conjunto encadenados (asociativos por la izquierda, misma
+        // precedencia, como SQLite).
         let mut compound = Vec::new();
-        while self.eat_kw(Kw::Union) {
-            let op = if self.eat_kw(Kw::All) {
-                SetOp::UnionAll
+        loop {
+            let op = if self.eat_kw(Kw::Union) {
+                if self.eat_kw(Kw::All) {
+                    SetOp::UnionAll
+                } else {
+                    SetOp::Union
+                }
+            } else if self.eat_kw(Kw::Intersect) {
+                SetOp::Intersect
+            } else if self.eat_kw(Kw::Except) {
+                SetOp::Except
             } else {
-                SetOp::Union
+                break;
             };
             compound.push(CompoundSelect {
                 op,

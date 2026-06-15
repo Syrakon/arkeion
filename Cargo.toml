@@ -7,7 +7,7 @@ members = ["arkeion-proto"]
 
 [package]
 name = "arkeion"
-version = "0.10.0"
+version = "0.11.0"
 edition = "2024"
 rust-version = "1.89"
 description = "Embedded, versioned, auditable database engine — as if SQLite and Git had a child, born in Europe."
@@ -16,9 +16,10 @@ repository = "https://gitlab.com/syrakon/arkeion"
 license = "MIT OR Apache-2.0"
 keywords = ["database", "embedded", "versioning", "audit", "sqlite"]
 categories = ["database-implementations", "database"]
-# La versión menor sigue los hitos (0.10 = M0–M10 completados, docs/06 y docs/09);
-# 1.0.0 significará formato en disco congelado.
-exclude = ["docs/sesiones/"]
+# La versión menor sigue los hitos: 0.10 = M0–M10 (docs/06 y docs/09); 0.11 añade
+# una expansión SQL grande (subconsultas, CTEs, UNION, vistas, FKs, triggers y la
+# familia ALTER COLUMN lógica, ver docs/04). 1.0.0 = formato en disco congelado.
+exclude = ["docs/sesiones/", "arkeion-proto/"]
 
 # Supply chain mínima y justificada (docs/05-decisiones.md, D8):
 #   sha2      — SHA-256 (FIPS 180-4): tags de integridad y hash chain. RustCrypto, Rust puro.

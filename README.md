@@ -73,9 +73,9 @@ assert_eq!(before.next().unwrap()?.get::<i64>(0)?, 1); // only the invoice befor
 dialect (subqueries, CTEs, `UNION`, views, foreign keys, triggers, logical `ALTER TABLE`),
 implemented and tested** (272 tests, `clippy -D warnings`, `#![forbid(unsafe_code)]`). **Pre-1.0**:
 the format may change and there is no production release yet. The
-[crates.io](https://crates.io/crates/arkeion) version starts at **0.10.x** because it reflects the
-completed milestones (M0–M10); `1.0.0` will mean exactly one thing: **on-disk format frozen**. The
-full specification lives in [`docs/`](docs/):
+[crates.io](https://crates.io/crates/arkeion) version is at **0.11.x** (0.10 = milestones M0–M10;
+0.11 adds the broad SQL dialect above); `1.0.0` will mean exactly one thing: **on-disk format
+frozen**. The full specification lives in [`docs/`](docs/):
 
 | Doc | Contents |
 |---|---|

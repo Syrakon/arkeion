@@ -15,8 +15,8 @@ use crate::catalog::{
 use crate::error::{Error, Result};
 use crate::record::Value;
 use crate::sql::ast::{
-    AggFunc, BinOp, ColumnAst, Cte, Expr, InsertSource, JoinKind, OnConflict, OrderBy, SelectItem,
-    SelectStmt, SetOp, Stmt, TableRef, UnOp, WindowFunc,
+    AggFunc, BinOp, ColumnAst, Cte, Expr, FrameBound, InsertSource, JoinKind, OnConflict, OrderBy,
+    SelectItem, SelectStmt, SetOp, Stmt, TableRef, UnOp, WindowFrame, WindowFunc,
 };
 use crate::sql::json;
 use crate::tx::{Snapshot, WriteTx};
@@ -1404,11 +1404,13 @@ fn subst_expr(
             args,
             partition_by,
             order_by,
+            frame,
         } => Expr::Window {
             func: *func,
             args: args.iter().map(r).collect::<Result<_>>()?,
             partition_by: partition_by.iter().map(r).collect::<Result<_>>()?,
             order_by: order_by.clone(),
+            frame: *frame,
         },
     })
 }
@@ -2830,11 +2832,13 @@ fn resolve_expr(
             args,
             partition_by,
             order_by,
+            frame,
         } => Expr::Window {
             func: *func,
             args: args.iter().map(res).collect::<Result<_>>()?,
             partition_by: partition_by.iter().map(res).collect::<Result<_>>()?,
             order_by: order_by.clone(),
+            frame: *frame,
         },
     })
 }
@@ -2931,11 +2935,13 @@ fn subst_outer_expr(e: &Expr, schema: &QuerySchema, row: &[Value]) -> Result<Exp
             args,
             partition_by,
             order_by,
+            frame,
         } => Expr::Window {
             func: *func,
             args: args.iter().map(r).collect::<Result<_>>()?,
             partition_by: partition_by.iter().map(r).collect::<Result<_>>()?,
             order_by: order_by.clone(),
+            frame: *frame,
         },
     })
 }
@@ -3073,11 +3079,13 @@ fn resolve_correlated_expr(
             args,
             partition_by,
             order_by,
+            frame,
         } => Expr::Window {
             func: *func,
             args: args.iter().map(rec).collect::<Result<_>>()?,
             partition_by: partition_by.iter().map(rec).collect::<Result<_>>()?,
             order_by: order_by.clone(),
+            frame: *frame,
         },
     })
 }
@@ -4037,6 +4045,7 @@ fn compute_window(
         args,
         partition_by,
         order_by,
+        frame,
     } = w
     else {
         unreachable!("compute_window recibe un Window")
@@ -4097,6 +4106,7 @@ fn compute_window(
         window_partition(
             *func,
             args,
+            frame.as_ref(),
             &order_keys,
             has_order,
             part,
@@ -4109,12 +4119,48 @@ fn compute_window(
     Ok(result)
 }
 
+/// Rango `[inicio, fin]` (inclusive, índices dentro de la partición) del marco para
+/// la fila `k` de una partición de tamaño `m`. `None` si el marco está vacío. Sin
+/// marco explícito: desde el inicio a la fila actual (con ORDER BY) o a toda la
+/// partición (sin ORDER BY).
+fn frame_range(
+    frame: Option<&WindowFrame>,
+    k: usize,
+    m: usize,
+    has_order: bool,
+) -> Option<(usize, usize)> {
+    let (start_b, end_b) = match frame {
+        Some(f) => (f.start, f.end),
+        None if has_order => (FrameBound::UnboundedPreceding, FrameBound::CurrentRow),
+        None => (
+            FrameBound::UnboundedPreceding,
+            FrameBound::UnboundedFollowing,
+        ),
+    };
+    let (k, m) = (k as isize, m as isize);
+    let bound = |b: FrameBound, is_start: bool| -> isize {
+        match b {
+            FrameBound::UnboundedPreceding if is_start => 0,
+            FrameBound::UnboundedPreceding => -1, // como fin ⇒ vacío
+            FrameBound::Preceding(n) => k - n as isize,
+            FrameBound::CurrentRow => k,
+            FrameBound::Following(n) => k + n as isize,
+            FrameBound::UnboundedFollowing if is_start => m, // como inicio ⇒ vacío
+            FrameBound::UnboundedFollowing => m - 1,
+        }
+    };
+    let start = bound(start_b, true).max(0);
+    let end = bound(end_b, false).min(m - 1);
+    (start <= end).then_some((start as usize, end as usize))
+}
+
 /// Aplica la función de ventana dentro de UNA partición ya ordenada (`part` son
 /// los índices de fila en orden de ventana), escribiendo en `result`.
 #[allow(clippy::too_many_arguments)]
 fn window_partition(
     func: WindowFunc,
     args: &[Expr],
+    frame: Option<&WindowFrame>,
     order_keys: &[Vec<Value>],
     has_order: bool,
     part: &[usize],
@@ -4193,14 +4239,17 @@ fn window_partition(
         }
         WindowFunc::FirstValue | WindowFunc::LastValue => {
             for (k, &i) in part.iter().enumerate() {
-                // Marco por defecto: del inicio de la partición a la fila actual (con
-                // ORDER BY) o a toda la partición (sin ORDER BY).
-                let target = match func {
-                    WindowFunc::FirstValue => 0,
-                    _ if has_order => k,
-                    _ => m - 1,
+                result[i] = match frame_range(frame, k, m, has_order) {
+                    Some((s, e)) => {
+                        let target = if matches!(func, WindowFunc::FirstValue) {
+                            s
+                        } else {
+                            e
+                        };
+                        arg0(target)?
+                    }
+                    None => Value::Null, // marco vacío
                 };
-                result[i] = arg0(target)?;
             }
         }
         WindowFunc::Sum
@@ -4209,8 +4258,11 @@ fn window_partition(
         | WindowFunc::Min
         | WindowFunc::Max => {
             for (k, &i) in part.iter().enumerate() {
-                let end = if has_order { k } else { m - 1 };
-                result[i] = window_aggregate(func, args, &part[0..=end], schema, rows, params)?;
+                let frame_slice: &[usize] = match frame_range(frame, k, m, has_order) {
+                    Some((s, e)) => &part[s..=e],
+                    None => &[],
+                };
+                result[i] = window_aggregate(func, args, frame_slice, schema, rows, params)?;
             }
         }
     }

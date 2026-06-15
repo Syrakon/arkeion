@@ -98,9 +98,12 @@ menor; con 1 argumento son agregados, como en SQLite).
 `PARTITION BY` y ordenado por el `ORDER BY` de la ventana, antes del `ORDER BY`/`LIMIT`
 externos. Disponibles: `ROW_NUMBER()`, `RANK()`, `DENSE_RANK()`, `NTILE(k)`,
 `LAG(x[, off[, def]])`, `LEAD(…)`, `FIRST_VALUE(x)`, `LAST_VALUE(x)`, y los agregados
-`SUM`/`COUNT`/`AVG`/`MIN`/`MAX` como ventana. Marco por defecto (sin `ROWS BETWEEN`, no
-soportado): toda la partición sin `ORDER BY`; «desde el inicio hasta la fila actual» con
-`ORDER BY` — por eso `LAST_VALUE … ORDER BY` devuelve la **fila actual** (gotcha estándar).
+`SUM`/`COUNT`/`AVG`/`MIN`/`MAX` como ventana. Marco **explícito** `ROWS BETWEEN inicio AND
+fin` (o la forma corta `ROWS inicio` = `… AND CURRENT ROW`), con extremos `UNBOUNDED
+{PRECEDING|FOLLOWING}`, `N {PRECEDING|FOLLOWING}` y `CURRENT ROW` (solo `ROWS`, físico; no
+`RANGE`). Sin marco, el por defecto es toda la partición sin `ORDER BY`, o «del inicio a la
+fila actual» con `ORDER BY` — por eso `LAST_VALUE … ORDER BY` devuelve la **fila actual**
+(gotcha estándar; con `ROWS … UNBOUNDED FOLLOWING` se obtiene el último real).
 
 **Funciones escalares** (insensibles a mayúsculas; NULL propaga salvo donde se diga):
 - Texto: `UPPER`, `LOWER`, `LENGTH`/`CHAR_LENGTH`, `TRIM`/`LTRIM`/`RTRIM`,

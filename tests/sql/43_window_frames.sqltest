@@ -1,0 +1,63 @@
+-- Marcos de ventana físicos: ROWS BETWEEN inicio AND fin (y la forma corta ROWS N).
+
+> CREATE TABLE s (id INTEGER PRIMARY KEY, v INTEGER);
+ok
+
+> INSERT INTO s (v) VALUES (10), (20), (30), (40), (50);
+affected 5
+
+-- Suma acumulada explícita (= marco por defecto con ORDER BY).
+> SELECT v, sum(v) OVER (ORDER BY v ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS run FROM s ORDER BY v;
+10|10
+20|30
+30|60
+40|100
+50|150
+
+-- Media/suma móvil de 3 (anterior, actual y siguiente).
+> SELECT v, sum(v) OVER (ORDER BY v ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) AS w FROM s ORDER BY v;
+10|30
+20|60
+30|90
+40|120
+50|90
+
+-- Fila actual y las dos siguientes.
+> SELECT v, sum(v) OVER (ORDER BY v ROWS BETWEEN CURRENT ROW AND 2 FOLLOWING) AS w FROM s ORDER BY v;
+10|60
+20|90
+30|120
+40|90
+50|50
+
+-- Forma corta: ROWS N PRECEDING = BETWEEN N PRECEDING AND CURRENT ROW.
+> SELECT v, sum(v) OVER (ORDER BY v ROWS 1 PRECEDING) AS w FROM s ORDER BY v;
+10|10
+20|30
+30|50
+40|70
+50|90
+
+-- LAST_VALUE con marco hasta el final = el último de la partición (anula el gotcha).
+> SELECT v, last_value(v) OVER (ORDER BY v ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS lv FROM s ORDER BY v;
+10|50
+20|50
+30|50
+40|50
+50|50
+
+-- FIRST_VALUE sobre un marco de 1 precedente.
+> SELECT v, first_value(v) OVER (ORDER BY v ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS fv FROM s ORDER BY v;
+10|10
+20|10
+30|20
+40|30
+50|40
+
+-- Marco vacío (fin antes que inicio): COUNT → 0.
+> SELECT v, count(*) OVER (ORDER BY v ROWS BETWEEN 2 FOLLOWING AND 1 FOLLOWING) AS c FROM s ORDER BY v;
+10|0
+20|0
+30|0
+40|0
+50|0

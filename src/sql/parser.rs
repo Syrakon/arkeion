@@ -1039,13 +1039,65 @@ impl<'a> Parser<'a> {
         } else {
             Vec::new()
         };
+        let frame = self.window_frame()?;
         self.expect(&Tok::RParen, "')'")?;
         Ok(Expr::Window {
             func,
             args,
             partition_by,
             order_by,
+            frame,
         })
+    }
+
+    /// Marco de ventana: `ROWS BETWEEN inicio AND fin` o `ROWS inicio` (= BETWEEN
+    /// inicio AND CURRENT ROW). Solo `ROWS` (físico); `RANGE` queda fuera.
+    fn window_frame(&mut self) -> Result<Option<WindowFrame>> {
+        if !self.eat_kw(Kw::Rows) {
+            return Ok(None);
+        }
+        let (start, end) = if self.eat_kw(Kw::Between) {
+            let start = self.frame_bound()?;
+            self.expect_kw(Kw::And, "AND")?;
+            let end = self.frame_bound()?;
+            (start, end)
+        } else {
+            // `ROWS inicio` = `BETWEEN inicio AND CURRENT ROW`.
+            (self.frame_bound()?, FrameBound::CurrentRow)
+        };
+        Ok(Some(WindowFrame { start, end }))
+    }
+
+    /// Un extremo de marco: `UNBOUNDED {PRECEDING|FOLLOWING} | CURRENT ROW |
+    /// N {PRECEDING|FOLLOWING}`.
+    fn frame_bound(&mut self) -> Result<FrameBound> {
+        if self.eat_kw(Kw::Unbounded) {
+            if self.eat_kw(Kw::Preceding) {
+                return Ok(FrameBound::UnboundedPreceding);
+            }
+            self.expect_kw(Kw::Following, "FOLLOWING")?;
+            return Ok(FrameBound::UnboundedFollowing);
+        }
+        if self.eat_kw(Kw::Current) {
+            self.expect_kw(Kw::Row, "ROW")?;
+            return Ok(FrameBound::CurrentRow);
+        }
+        let n = match self.next() {
+            Some(Tok::Int(n)) if n >= 0 => n as usize,
+            _ => {
+                return Err(err_at(
+                    self.pos(),
+                    "se esperaba un entero, UNBOUNDED o CURRENT",
+                ));
+            }
+        };
+        if self.eat_kw(Kw::Preceding) {
+            Ok(FrameBound::Preceding(n))
+        } else if self.eat_kw(Kw::Following) {
+            Ok(FrameBound::Following(n))
+        } else {
+            Err(err_at(self.pos(), "se esperaba PRECEDING o FOLLOWING"))
+        }
     }
 
     /// `AS OF VERSION n | AS OF TIMESTAMP 'rfc3339'`, al cierre de un SELECT

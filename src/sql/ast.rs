@@ -403,15 +403,34 @@ pub enum Expr {
         query: Box<SelectStmt>,
         negated: bool,
     },
-    /// Función de **ventana**: `func(args) OVER ([PARTITION BY …] [ORDER BY …])`.
-    /// Se evalúa sobre el conjunto de filas (tras `WHERE`), particionado y ordenado;
-    /// no es un agregado de grupo. `args` vacío para `ROW_NUMBER()`/`COUNT(*)`.
+    /// Función de **ventana**: `func(args) OVER ([PARTITION BY …] [ORDER BY …]
+    /// [ROWS …])`. Se evalúa sobre el conjunto de filas (tras `WHERE`), particionado
+    /// y ordenado; no es un agregado de grupo. `args` vacío para `ROW_NUMBER()`/
+    /// `COUNT(*)`. `frame` = marco `ROWS` explícito (si no, el marco por defecto).
     Window {
         func: WindowFunc,
         args: Vec<Expr>,
         partition_by: Vec<Expr>,
         order_by: Vec<OrderBy>,
+        frame: Option<WindowFrame>,
     },
+}
+
+/// Marco de ventana `ROWS BETWEEN inicio AND fin` (físico, por número de filas).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WindowFrame {
+    pub start: FrameBound,
+    pub end: FrameBound,
+}
+
+/// Extremo de un marco de ventana `ROWS`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrameBound {
+    UnboundedPreceding,
+    Preceding(usize),
+    CurrentRow,
+    Following(usize),
+    UnboundedFollowing,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

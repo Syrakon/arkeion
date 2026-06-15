@@ -775,6 +775,133 @@ impl Connection {
             None => self.store.snapshot_on(&self.branch)?.views(),
         }
     }
+
+    /// Abre un **lector a nivel motor** sobre `table`, saltándose el
+    /// parser/planner/ejecutor SQL: va directo al catálogo + b-tree y conserva
+    /// versionado, índices, cifrado y la cadena de auditoría. Toma un **snapshot
+    /// consistente** de la cabeza de la rama (o del instante fijado, si la conexión
+    /// está anclada con [`snapshot`](Connection::snapshot)) en el momento de
+    /// crearse: ve un estado confirmado y estable, **no** las escrituras de una
+    /// transacción abierta. Para escribir a nivel motor, ver
+    /// [`bulk_insert`](Connection::bulk_insert).
+    ///
+    /// ```
+    /// use arkeion::{Database, Options, Value};
+    ///
+    /// let dir = tempfile::tempdir().unwrap();
+    /// let db = Database::open(dir.path().join("t.arkeion"), Options::default()).unwrap();
+    /// let conn = db.connect().unwrap();
+    /// conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER NOT NULL)", &[]).unwrap();
+    /// conn.bulk_insert("t", (1..=100i64).map(|i| [Value::Integer(i), Value::Integer(i * 2)])).unwrap();
+    ///
+    /// let t = conn.table("t").unwrap();
+    /// assert_eq!(t.get(7).unwrap(), Some(vec![Value::Integer(7), Value::Integer(14)]));
+    /// assert_eq!(t.count().unwrap(), 100);
+    /// ```
+    pub fn table(&self, name: &str) -> Result<TableReader> {
+        let snap = match &self.pinned {
+            Some(s) => s.clone(),
+            None => self.store.snapshot_on(&self.branch)?,
+        };
+        let def = snap
+            .table(name)?
+            .ok_or_else(|| sql_err(format!("tabla desconocida: {name}")))?;
+        Ok(TableReader { snap, def })
+    }
+}
+
+/// Lector a nivel motor de una tabla (sin SQL), abierto con [`Connection::table`].
+/// Lee el snapshot tomado al crearse: una vista confirmada y estable.
+pub struct TableReader {
+    snap: Snapshot,
+    def: crate::catalog::TableDef,
+}
+
+impl TableReader {
+    /// Lee la fila de clave primaria (rowid) `rowid`: todos sus valores en orden
+    /// físico de columnas, o `None` si no existe. Un descenso del b-tree + decode
+    /// del registro, sin parser ni planner.
+    pub fn get(&self, rowid: i64) -> Result<Option<Vec<Value>>> {
+        self.snap.get_row(&self.def, rowid)
+    }
+
+    /// Recorre todas las filas por rowid ascendente, cada una `(rowid, valores)`.
+    /// Materializa un `Vec` por fila (como `SELECT *`); para sumar/proyectar sin
+    /// asignar por fila usa [`scan_columns`](TableReader::scan_columns).
+    pub fn scan(&self) -> Result<impl Iterator<Item = Result<(i64, Vec<Value>)>> + '_> {
+        self.snap.scan_table(&self.def)
+    }
+
+    /// Scan **proyectado y sin asignación por fila**: decodifica SOLO las columnas
+    /// de `cols` (índices físicos de columna) reutilizando buffers internos. Cada
+    /// [`ProjectedScan::next`] presta `&[Value]` válido hasta la siguiente llamada.
+    /// Es el camino de lectura más rápido del motor.
+    pub fn scan_columns(&self, cols: &[usize]) -> Result<ProjectedScan> {
+        Ok(ProjectedScan {
+            proj: crate::catalog::ScanProjection::new(&self.def, cols),
+            state: self.snap.table_scan_state(&self.def)?,
+            snap: self.snap.clone(),
+            def: self.def.clone(),
+            out: Vec::new(),
+            scratch: Vec::new(),
+        })
+    }
+
+    /// Número de filas (recorre el rango de la tabla; O(filas), sin decodificar
+    /// columnas).
+    pub fn count(&self) -> Result<u64> {
+        let mut scan = self.scan_columns(&[])?;
+        let mut n = 0u64;
+        while scan.next()?.is_some() {
+            n += 1;
+        }
+        Ok(n)
+    }
+
+    /// Índice físico de la columna `name`, o `None` si no existe o está borrada.
+    /// Útil para [`scan_columns`](TableReader::scan_columns).
+    pub fn column_index(&self, name: &str) -> Option<usize> {
+        self.def
+            .columns
+            .iter()
+            .position(|c| !c.dropped && c.name == name)
+    }
+
+    /// Versión (número de commit) del snapshot que lee este lector.
+    pub fn version(&self) -> u64 {
+        self.snap.version()
+    }
+}
+
+/// Scan proyectado sin asignación por fila (ver [`TableReader::scan_columns`]).
+/// Iterador *prestador*: [`next`](ProjectedScan::next) devuelve `&[Value]` válido
+/// hasta la siguiente llamada, así que no implementa [`Iterator`].
+pub struct ProjectedScan {
+    snap: Snapshot,
+    def: crate::catalog::TableDef,
+    proj: crate::catalog::ScanProjection,
+    state: crate::catalog::ScanState,
+    out: Vec<Value>,
+    scratch: Vec<Option<Value>>,
+}
+
+impl ProjectedScan {
+    /// Próxima fila proyectada (`&[Value]` en el orden de `cols`), o `None` al
+    /// final. Los valores se prestan de un buffer interno reutilizado.
+    #[allow(clippy::should_implement_trait)]
+    pub fn next(&mut self) -> Result<Option<&[Value]>> {
+        if self.state.next_into(
+            &self.snap,
+            &self.def,
+            &self.proj,
+            &mut self.out,
+            &mut self.scratch,
+        )? {
+            Ok(Some(&self.out))
+        } else {
+            Ok(None)
+        }
+    }
 }
 
 /// Sentencia preparada por [`Connection::prepare`]. Respeta el modo de la

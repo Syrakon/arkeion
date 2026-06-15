@@ -124,6 +124,41 @@ al iterar — solo las columnas proyectadas, sin materializar el resultado. El
 resto de consultas va por el executor clásico; el resultado es indistinguible
 salvo en coste.
 
+## API de motor (sin SQL)
+
+Acceso de **filas tipado** que se salta el parser/planner/ejecutor SQL y va
+directo al catálogo + b-tree, **conservando todas las garantías** (versionado,
+índices, cifrado y la cadena de auditoría). `Connection::table` toma un snapshot
+consistente al crearse (lectura estable, no ve transacciones abiertas); la
+**escritura** a nivel motor es [`bulk_insert`](#).
+
+```rust
+impl Connection {
+    pub fn table(&self, name: &str) -> Result<TableReader>;  // snapshot al crearse
+}
+
+impl TableReader {
+    pub fn get(&self, rowid: i64) -> Result<Option<Vec<Value>>>;     // point lookup por PK
+    pub fn scan(&self) -> Result<impl Iterator<Item = Result<(i64, Vec<Value>)>>>;
+    pub fn scan_columns(&self, cols: &[usize]) -> Result<ProjectedScan>; // proyectado, sin alloc/fila
+    pub fn count(&self) -> Result<u64>;
+    pub fn column_index(&self, name: &str) -> Option<usize>;
+    pub fn version(&self) -> u64;
+}
+
+impl ProjectedScan { // iterador prestador: next() presta &[Value] hasta la próxima llamada
+    pub fn next(&mut self) -> Result<Option<&[Value]>>;
+}
+```
+
+**Para qué**: throughput y control cuando no hace falta SQL (ledgers/event-stores
+embebidos, índices a medida). **Medido** (mismo motor, mismos datos): el point
+lookup por PK va **~3,7× más rápido** que `SELECT … WHERE id=?` (se ahorra el
+parse/plan/validación por llamada); el **full scan** apenas gana **~1,1×** porque
+la vía SQL de scan *ya* usa el mismo camino proyectado en streaming — el coste lo
+domina el decode del registro por fila, no la capa SQL. Es decir: la ganancia del
+motor está en el **acceso aleatorio/puntual**, no en el barrido.
+
 ## Filas y parámetros
 
 ```rust

@@ -56,7 +56,8 @@ mod branch;
 mod error;
 
 pub use api::{
-    ColIndex, Connection, Database, FromValue, Options, Row, Rows, Statement, Transaction,
+    ColIndex, Connection, Database, FromValue, Options, ProjectedScan, Row, Rows, Statement,
+    TableReader, Transaction,
 };
 pub use branch::{ChangeKind, Diff, RowChange, SchemaChange};
 pub use commit::{AuditAnchor, AuditReport};

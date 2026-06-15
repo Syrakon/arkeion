@@ -23,6 +23,7 @@ supply chain (4 runtime dependencies, all pure-Rust except the FIPS primitives).
 | **Packaging** | A single file per tenant — backup = copy the file |
 | **Storage** | Append-only *copy-on-write* B-tree: the file **is** the WAL; nodes with a pointer array (binary search) |
 | **Bulk load** | `bulk_insert`: the whole batch in one transaction, no per-row executor, indexes in bulk — 2.5M rows/s |
+| **Engine API** | `Connection::table` → typed row access without SQL (`get`/`scan`/`scan_columns`), same guarantees — point lookups ~3.7× the SQL path |
 | **Reads** | Simple SELECT in **streaming** (lazy decode: only the projected columns, straight from the page) |
 | **Durability** | ACID, tail-scan recovery, a single `fsync` per commit |
 | **Time-travel** | `SELECT … AS OF <version/timestamp>`; `history()` / `diff_versions()` / `changes()` |

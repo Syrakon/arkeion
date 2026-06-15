@@ -304,6 +304,84 @@ fn run_arkeion(durable_n: i64, bulk_n: i64, scan_reps: i64) -> Vec<(&'static str
     out
 }
 
+// --- API de MOTOR vs vía SQL (mismos datos, mismo motor arkeion) ---
+//
+// Mide cuánto se gana saltándose el parser/planner/ejecutor SQL: point lookup
+// (`TableReader::get` vs `SELECT … WHERE id=?`) y full scan (`scan_columns` con
+// buffers reutilizados vs `SELECT n`). Devuelve (operación, ops/s SQL, ops/s motor).
+fn run_engine(bulk_n: i64, scan_reps: i64) -> Vec<(&'static str, f64, f64)> {
+    let dir = bench_dir();
+    let db = Database::open(dir.path().join("e.arkeion"), Options::default()).unwrap();
+    let conn = db.connect().unwrap();
+    conn.execute(CREATE, &[]).unwrap();
+    conn.bulk_insert(
+        "t",
+        (1..=bulk_n).map(|i| [Value::Integer(i), Value::Integer(i * 2)]),
+    )
+    .unwrap();
+
+    let mut out = Vec::new();
+
+    // 1) Point lookup por PK: SQL preparado vs motor `get` (ambos preparan/abren una
+    // vez fuera del cronómetro; acceso disperso idéntico).
+    let sel = conn.prepare("SELECT n FROM t WHERE id = ?1").unwrap();
+    let sql_pk = median_of(READ_REPS, || {
+        let t = Instant::now();
+        let mut checksum = 0i64;
+        for k in 0..bulk_n {
+            let id = scattered(k, bulk_n);
+            let row = sel.query(&params![id]).unwrap().next().unwrap().unwrap();
+            checksum ^= row.get::<i64>(0).unwrap();
+        }
+        std::hint::black_box(checksum);
+        ops(bulk_n, t.elapsed())
+    });
+    let reader = conn.table("t").unwrap();
+    let n_col = reader.column_index("n").unwrap();
+    let eng_pk = median_of(READ_REPS, || {
+        let t = Instant::now();
+        let mut checksum = 0i64;
+        for k in 0..bulk_n {
+            let id = scattered(k, bulk_n);
+            let row = reader.get(id).unwrap().unwrap();
+            if let Value::Integer(v) = row[n_col] {
+                checksum ^= v;
+            }
+        }
+        std::hint::black_box(checksum);
+        ops(bulk_n, t.elapsed())
+    });
+    out.push(("point lookup por PK", sql_pk, eng_pk));
+
+    // 2) Full scan de una columna: SQL en streaming vs motor proyectado (decodifica
+    // solo `n`, reutiliza buffers — sin `Vec<Value>` por fila).
+    let scan = conn.prepare("SELECT n FROM t").unwrap();
+    let sql_scan = median_of(scan_reps as usize, || {
+        let t = Instant::now();
+        let mut sum = 0i64;
+        for row in scan.query(&[]).unwrap() {
+            sum = sum.wrapping_add(row.unwrap().get::<i64>(0).unwrap());
+        }
+        std::hint::black_box(sum);
+        ops(bulk_n, t.elapsed())
+    });
+    let eng_scan = median_of(scan_reps as usize, || {
+        let t = Instant::now();
+        let mut sum = 0i64;
+        let mut proj = reader.scan_columns(&[n_col]).unwrap();
+        while let Some(row) = proj.next().unwrap() {
+            if let Value::Integer(v) = row[0] {
+                sum = sum.wrapping_add(v);
+            }
+        }
+        std::hint::black_box(sum);
+        ops(bulk_n, t.elapsed())
+    });
+    out.push(("full scan de 1 columna", sql_scan, eng_scan));
+
+    out
+}
+
 // --- SQLite (rusqlite, bundled), tras la feature `bench-sqlite` ---
 
 #[cfg(feature = "bench-sqlite")]
@@ -669,6 +747,27 @@ fn main() {
     }
     println!();
     println!("ratio = arkeion / sqlite  (>1 ⇒ arkeion más rápido en esa operación). Mediana de N.");
+
+    // API de motor (sin SQL) vs vía SQL, mismo motor: cuánto se gana saltándose el
+    // parser/planner/ejecutor.
+    let eng = run_engine(bulk_n, scan_reps);
+    println!();
+    println!("— API de MOTOR (sin SQL) vs vía SQL (mismo motor arkeion) —");
+    println!(
+        "{:<24} {:>12} {:>12} {:>9}",
+        "operación", "SQL", "motor", "speedup"
+    );
+    println!("{}", "-".repeat(60));
+    for (op, sql_ops, eng_ops) in &eng {
+        println!(
+            "{:<24} {:>12} {:>12} {:>8.2}x",
+            op,
+            human(*sql_ops),
+            human(*eng_ops),
+            eng_ops / sql_ops
+        );
+    }
+    println!("speedup = motor / SQL  (>1 ⇒ saltarse SQL es más rápido).");
 
     // Comparación justa: SQLite con las garantías de arkeion (historia + hash chain).
     #[cfg(feature = "bench-sqlite")]

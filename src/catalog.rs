@@ -41,8 +41,9 @@ const CAT_TRIGGER: u8 = 0x06;
 // registro de esquema; v2 (sin él) se sigue leyendo como identidad.
 // v4 añade las claves foráneas al final del registro de esquema; v2/v3 (sin
 // ellas) se leen con `foreign_keys` vacío. v5 añade el flag `dropped` por columna
-// (DROP COLUMN lógico); v<5 lo lee como `false`.
-const SCHEMA_VERSION: u8 = 7;
+// (DROP COLUMN lógico); v<5 lo lee como `false`. v7 añade los predicados CHECK de
+// tabla. v8 añade los índices FTS al final del registro; v<8 los lee vacíos.
+const SCHEMA_VERSION: u8 = 8;
 const NO_ALIAS: u8 = 0xFF;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -294,6 +295,21 @@ pub struct IndexDef {
     pub unique: bool,
 }
 
+/// Índice full-text sobre una o más columnas de texto (keyspace `0x03`).
+///
+/// A diferencia de `IndexDef`, indexa **por término** (tras tokenizar) en vez de
+/// por valor completo, y guarda el nombre del tokenizer con el que se construyó:
+/// el mismo debe usarse al consultar `MATCH`. Ver `docs/12-fts.md`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FtsIndexDef {
+    pub name: String,
+    pub fts_id: u32,
+    /// Posiciones de las columnas indexadas (en `TableDef.columns`).
+    pub columns: Vec<usize>,
+    /// Nombre del tokenizer (`unicode`, `ascii`, …); ver `crate::fts::tokenizer_for`.
+    pub tokenizer: String,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct TableDef {
     pub name: String,
@@ -304,6 +320,9 @@ pub struct TableDef {
     pub columns: Vec<ColumnDef>,
     /// Índices secundarios de la tabla (se mantienen en cada insert/update/delete).
     pub indexes: Vec<IndexDef>,
+    /// Índices full-text de la tabla (keyspace `0x03`); mismo ciclo de
+    /// mantenimiento que `indexes`. Vacío salvo `CREATE FULLTEXT INDEX`.
+    pub fts_indexes: Vec<FtsIndexDef>,
     /// Orden **lógico** (de presentación) de las columnas: `logical_order[i]` es la
     /// posición **física** de la i-ésima columna lógica — una permutación de
     /// `0..columns.len()`. Físicamente las columnas y las filas **nunca** se mueven
@@ -504,6 +523,20 @@ fn encode_def(def: &TableDef) -> Vec<u8> {
         put_varint(&mut out, c.len() as u64);
         out.extend_from_slice(c.as_bytes());
     }
+    // Índices FTS (v8): cuenta, y por cada uno: fts_id, columnas, nombre y
+    // tokenizer. v2..v7 no los llevan ⇒ se leen vacíos.
+    put_varint(&mut out, def.fts_indexes.len() as u64);
+    for fts in &def.fts_indexes {
+        out.extend_from_slice(&fts.fts_id.to_le_bytes());
+        put_varint(&mut out, fts.columns.len() as u64);
+        for &c in &fts.columns {
+            put_varint(&mut out, c as u64);
+        }
+        put_varint(&mut out, fts.name.len() as u64);
+        out.extend_from_slice(fts.name.as_bytes());
+        put_varint(&mut out, fts.tokenizer.len() as u64);
+        out.extend_from_slice(fts.tokenizer.as_bytes());
+    }
     out
 }
 
@@ -532,7 +565,7 @@ fn decode_def(name: &str, buf: &[u8]) -> Result<TableDef> {
     };
 
     let version = *take(&mut pos, 1)?.first().expect("len 1");
-    if !(2..=7).contains(&version) {
+    if !(2..=8).contains(&version) {
         return Err(bad("versión de esquema desconocida"));
     }
     let table_id = u32::from_le_bytes(
@@ -694,6 +727,39 @@ fn decode_def(name: &str, buf: &[u8]) -> Result<TableDef> {
         }
     }
 
+    // Índices FTS (v8). v2..v7 no los llevan ⇒ vacío.
+    let mut fts_indexes = Vec::new();
+    if version >= 8 {
+        let nfts = take_varint(buf, &mut pos).ok_or(bad("esquema truncado"))? as usize;
+        for _ in 0..nfts {
+            let fts_id = u32::from_le_bytes(take(&mut pos, 4)?.try_into().expect("rango fijo"));
+            let icols = take_varint(buf, &mut pos).ok_or(bad("esquema truncado"))? as usize;
+            if icols == 0 || icols > MAX_COLUMNS {
+                return Err(bad("número de columnas de índice FTS inválido"));
+            }
+            let mut idx_cols = Vec::with_capacity(icols);
+            for _ in 0..icols {
+                let c = take_varint(buf, &mut pos).ok_or(bad("esquema truncado"))? as usize;
+                if c >= columns.len() {
+                    return Err(bad("columna de índice FTS fuera de rango"));
+                }
+                idx_cols.push(c);
+            }
+            let nlen = take_varint(buf, &mut pos).ok_or(bad("esquema truncado"))? as usize;
+            let name = String::from_utf8(take(&mut pos, nlen)?.to_vec())
+                .map_err(|_| bad("nombre de índice FTS no UTF-8"))?;
+            let tlen = take_varint(buf, &mut pos).ok_or(bad("esquema truncado"))? as usize;
+            let tokenizer = String::from_utf8(take(&mut pos, tlen)?.to_vec())
+                .map_err(|_| bad("nombre de tokenizer no UTF-8"))?;
+            fts_indexes.push(FtsIndexDef {
+                name,
+                fts_id,
+                columns: idx_cols,
+                tokenizer,
+            });
+        }
+    }
+
     if pos != buf.len() {
         return Err(bad("bytes sobrantes tras el esquema"));
     }
@@ -708,6 +774,7 @@ fn decode_def(name: &str, buf: &[u8]) -> Result<TableDef> {
         rowid_alias,
         columns,
         indexes,
+        fts_indexes,
         logical_order,
         foreign_keys,
         checks,
@@ -919,6 +986,7 @@ pub fn create_table<S: NodeStore>(
             })
             .collect(),
         indexes: Vec::new(),
+        fts_indexes: Vec::new(),
         logical_order: (0..spec.columns.len()).collect(),
         foreign_keys,
         checks,
@@ -2233,6 +2301,51 @@ mod tests {
             uniques: Vec::new(),
             checks: Vec::new(),
         }
+    }
+
+    #[test]
+    fn fts_index_schema_roundtrip() {
+        let mut s = MemStore::new();
+        let (_, def) = create_table(&mut s, NO_ROOT, &facturas_spec()).unwrap();
+
+        // Sin índices FTS: el bloque v8 está presente pero vacío.
+        assert!(def.fts_indexes.is_empty());
+        assert_eq!(decode_def(&def.name, &encode_def(&def)).unwrap(), def);
+
+        // Con dos índices FTS sobre columnas y tokenizers distintos.
+        let mut d = def.clone();
+        d.fts_indexes.push(FtsIndexDef {
+            name: "fts_estado".into(),
+            fts_id: 1,
+            columns: vec![2],
+            tokenizer: "unicode".into(),
+        });
+        d.fts_indexes.push(FtsIndexDef {
+            name: "fts_multi".into(),
+            fts_id: 2,
+            columns: vec![2, 4],
+            tokenizer: "ascii".into(),
+        });
+        let back = decode_def(&d.name, &encode_def(&d)).unwrap();
+        assert_eq!(back, d);
+        assert_eq!(back.fts_indexes[0].tokenizer, "unicode");
+        assert_eq!(back.fts_indexes[1].columns, vec![2, 4]);
+    }
+
+    #[test]
+    fn schema_v7_decodes_with_empty_fts() {
+        // Compatibilidad hacia atrás: un esquema v7 (sin bloque FTS) debe seguir
+        // leyéndose. Degradamos un v8 con 0 índices FTS quitando su byte de count
+        // y marcando la versión 7.
+        let mut s = MemStore::new();
+        let (_, def) = create_table(&mut s, NO_ROOT, &facturas_spec()).unwrap();
+        let mut bytes = encode_def(&def);
+        assert_eq!(bytes[0], 8);
+        assert_eq!(*bytes.last().unwrap(), 0, "count FTS = 0 al final");
+        bytes.pop();
+        bytes[0] = 7;
+        let back = decode_def(&def.name, &bytes).unwrap();
+        assert!(back.fts_indexes.is_empty());
     }
 
     #[test]

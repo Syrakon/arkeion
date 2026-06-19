@@ -502,6 +502,14 @@ pub fn run_execute(tx: &mut WriteTx, stmt: &Stmt, params: &[Value]) -> Result<us
             }
             Ok(0)
         }
+        // La ejecución real de los índices FTS (backfill, postings, stats) llega
+        // en la fase 2c; aquí solo se parsea la sentencia (fase 2b).
+        Stmt::CreateFtsIndex { .. } => Err(sql_err(
+            "CREATE FULLTEXT INDEX: ejecución pendiente (fase 2c)".to_string(),
+        )),
+        Stmt::DropFtsIndex { .. } => Err(sql_err(
+            "DROP FULLTEXT INDEX: ejecución pendiente (fase 2c)".to_string(),
+        )),
         Stmt::Insert {
             table,
             columns,

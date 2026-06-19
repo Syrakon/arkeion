@@ -78,6 +78,20 @@ pub enum Stmt {
         if_exists: bool,
         name: String,
     },
+    /// `CREATE FULLTEXT INDEX [IF NOT EXISTS] nombre ON tabla (col, …) [USING tok]`.
+    CreateFtsIndex {
+        if_not_exists: bool,
+        name: String,
+        table: String,
+        columns: Vec<String>,
+        /// Tokenizer (`USING <name>`); `None` ⇒ `unicode` por defecto.
+        tokenizer: Option<String>,
+    },
+    /// `DROP FULLTEXT INDEX [IF EXISTS] nombre` (nombre global, como `DropIndex`).
+    DropFtsIndex {
+        if_exists: bool,
+        name: String,
+    },
     Insert {
         table: String,
         columns: Option<Vec<String>>,

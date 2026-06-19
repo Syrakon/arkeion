@@ -214,7 +214,9 @@ impl<'a> Parser<'a> {
     /// `CREATE` → tabla, índice o vista según lo que siga.
     fn create(&mut self) -> Result<Stmt> {
         self.expect_kw(Kw::Create, "CREATE")?;
-        if matches!(self.peek(), Some(Tok::Kw(Kw::Unique | Kw::Index))) {
+        if matches!(self.peek(), Some(Tok::Kw(Kw::Fulltext))) {
+            self.create_fts_index()
+        } else if matches!(self.peek(), Some(Tok::Kw(Kw::Unique | Kw::Index))) {
             self.create_index()
         } else if matches!(self.peek(), Some(Tok::Kw(Kw::View))) {
             self.create_view()
@@ -308,7 +310,9 @@ impl<'a> Parser<'a> {
     /// `DROP` → tabla, índice o vista.
     fn drop(&mut self) -> Result<Stmt> {
         self.expect_kw(Kw::Drop, "DROP")?;
-        if matches!(self.peek(), Some(Tok::Kw(Kw::Index))) {
+        if matches!(self.peek(), Some(Tok::Kw(Kw::Fulltext))) {
+            self.drop_fts_index()
+        } else if matches!(self.peek(), Some(Tok::Kw(Kw::Index))) {
             self.drop_index()
         } else if matches!(self.peek(), Some(Tok::Kw(Kw::View))) {
             self.expect_kw(Kw::View, "VIEW")?;
@@ -468,6 +472,47 @@ impl<'a> Parser<'a> {
         let if_exists = self.if_exists()?;
         let name = self.ident("un nombre de índice")?;
         Ok(Stmt::DropIndex { if_exists, name })
+    }
+
+    /// Tras consumir `CREATE`: `FULLTEXT INDEX [IF NOT EXISTS] nombre ON tabla
+    /// (col, …) [USING tokenizer]`. Sin `USING` ⇒ tokenizer por defecto.
+    fn create_fts_index(&mut self) -> Result<Stmt> {
+        self.expect_kw(Kw::Fulltext, "FULLTEXT")?;
+        self.expect_kw(Kw::Index, "INDEX")?;
+        let if_not_exists = self.if_not_exists()?;
+        let name = self.ident("un nombre de índice")?;
+        self.expect_kw(Kw::On, "ON")?;
+        let table = self.ident("un nombre de tabla")?;
+        self.expect(&Tok::LParen, "'('")?;
+        let mut columns = Vec::new();
+        loop {
+            columns.push(self.ident("un nombre de columna")?);
+            if !self.eat(&Tok::Comma) {
+                break;
+            }
+        }
+        self.expect(&Tok::RParen, "')'")?;
+        let tokenizer = if self.eat_kw(Kw::Using) {
+            Some(self.ident("un nombre de tokenizer")?)
+        } else {
+            None
+        };
+        Ok(Stmt::CreateFtsIndex {
+            if_not_exists,
+            name,
+            table,
+            columns,
+            tokenizer,
+        })
+    }
+
+    /// Tras consumir `DROP`: `FULLTEXT INDEX [IF EXISTS] nombre`.
+    fn drop_fts_index(&mut self) -> Result<Stmt> {
+        self.expect_kw(Kw::Fulltext, "FULLTEXT")?;
+        self.expect_kw(Kw::Index, "INDEX")?;
+        let if_exists = self.if_exists()?;
+        let name = self.ident("un nombre de índice")?;
+        Ok(Stmt::DropFtsIndex { if_exists, name })
     }
 
     fn alter_table(&mut self) -> Result<Stmt> {
@@ -1609,6 +1654,71 @@ mod tests {
             table: None,
             name: name.into(),
         }
+    }
+
+    #[test]
+    fn create_fts_index_parses() {
+        let stmt =
+            parse("CREATE FULLTEXT INDEX fts_mail ON mail (subject, body) USING unicode").unwrap();
+        let Stmt::CreateFtsIndex {
+            if_not_exists,
+            name,
+            table,
+            columns,
+            tokenizer,
+        } = stmt
+        else {
+            panic!("se esperaba CreateFtsIndex")
+        };
+        assert!(!if_not_exists);
+        assert_eq!(name, "fts_mail");
+        assert_eq!(table, "mail");
+        assert_eq!(columns, ["subject", "body"]);
+        assert_eq!(tokenizer.as_deref(), Some("unicode"));
+    }
+
+    #[test]
+    fn create_fts_index_defaults_and_if_not_exists() {
+        let stmt = parse("CREATE FULLTEXT INDEX IF NOT EXISTS fx ON docs (body)").unwrap();
+        let Stmt::CreateFtsIndex {
+            if_not_exists,
+            columns,
+            tokenizer,
+            ..
+        } = stmt
+        else {
+            panic!("se esperaba CreateFtsIndex")
+        };
+        assert!(if_not_exists);
+        assert_eq!(columns, ["body"]);
+        assert_eq!(tokenizer, None); // sin USING ⇒ tokenizer por defecto
+    }
+
+    #[test]
+    fn drop_fts_index_parses() {
+        let Stmt::DropFtsIndex { if_exists, name } =
+            parse("DROP FULLTEXT INDEX IF EXISTS fx").unwrap()
+        else {
+            panic!("se esperaba DropFtsIndex")
+        };
+        assert!(if_exists);
+        assert_eq!(name, "fx");
+    }
+
+    #[test]
+    fn fulltext_dispatch_no_rompe_index_normal() {
+        assert!(matches!(
+            parse("CREATE INDEX i ON t (a)").unwrap(),
+            Stmt::CreateIndex { unique: false, .. }
+        ));
+        assert!(matches!(
+            parse("CREATE UNIQUE INDEX i ON t (a)").unwrap(),
+            Stmt::CreateIndex { unique: true, .. }
+        ));
+        assert!(matches!(
+            parse("DROP INDEX i").unwrap(),
+            Stmt::DropIndex { .. }
+        ));
     }
 
     #[test]

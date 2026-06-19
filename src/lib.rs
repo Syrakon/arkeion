@@ -88,6 +88,8 @@ pub mod exec;
 #[doc(hidden)]
 pub mod format;
 #[doc(hidden)]
+pub mod fts;
+#[doc(hidden)]
 pub mod io;
 #[doc(hidden)]
 pub mod keyenc;

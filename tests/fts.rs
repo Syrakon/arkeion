@@ -4,7 +4,7 @@
 //! negación y combinación con predicados normales). La corrección de postings y
 //! stats BM25 se prueba a nivel de catálogo (`src/catalog.rs`).
 
-use arkeion::{Connection, Database, Error, Options, params};
+use arkeion::{Connection, Database, Error, Options, Retention, params};
 
 fn db() -> (tempfile::TempDir, Database) {
     let dir = tempfile::tempdir().unwrap();
@@ -314,6 +314,75 @@ fn match_on_unindexed_column_errors() {
         .query("SELECT id FROM mail WHERE folder MATCH 'inbox'", &[])
         .and_then(|rows| rows.map(|r| r.map(|_| ())).collect::<Result<Vec<()>, _>>());
     assert!(matches!(result, Err(Error::Sql { .. })));
+}
+
+#[test]
+fn match_searches_the_past_with_as_of() {
+    let (_d, db) = db();
+    let conn = db.connect().unwrap();
+    conn.execute("CREATE TABLE mail (id INTEGER PRIMARY KEY, body TEXT)", &[])
+        .unwrap();
+    conn.execute("CREATE FULLTEXT INDEX f ON mail (body)", &[])
+        .unwrap();
+    conn.execute("INSERT INTO mail (body) VALUES ('hola mundo')", &[])
+        .unwrap();
+    let v1 = conn.version(); // solo 'hola mundo' existe
+    conn.execute("INSERT INTO mail (body) VALUES ('adios planeta')", &[])
+        .unwrap();
+
+    // Estado actual: ambos términos casan.
+    assert_eq!(
+        ids(&conn, "SELECT id FROM mail WHERE body MATCH 'mundo'"),
+        vec![1]
+    );
+    assert_eq!(
+        ids(&conn, "SELECT id FROM mail WHERE body MATCH 'planeta'"),
+        vec![2]
+    );
+
+    // AS OF la versión 1: 'planeta' aún no existía (índice versionado) ⇒ vacío;
+    // 'mundo' sí estaba. El índice FTS busca en el pasado.
+    assert!(
+        ids(
+            &conn,
+            &format!("SELECT id FROM mail WHERE body MATCH 'planeta' AS OF VERSION {v1}")
+        )
+        .is_empty()
+    );
+    assert_eq!(
+        ids(
+            &conn,
+            &format!("SELECT id FROM mail WHERE body MATCH 'mundo' AS OF VERSION {v1}")
+        ),
+        vec![1]
+    );
+}
+
+#[test]
+fn match_survives_vacuum() {
+    let (_d, db) = db();
+    let conn = db.connect().unwrap();
+    conn.execute("CREATE TABLE mail (id INTEGER PRIMARY KEY, body TEXT)", &[])
+        .unwrap();
+    conn.execute("CREATE FULLTEXT INDEX f ON mail (body)", &[])
+        .unwrap();
+    conn.execute("INSERT INTO mail (body) VALUES ('hola mundo')", &[])
+        .unwrap();
+    conn.execute("INSERT INTO mail (body) VALUES ('mundo cruel')", &[])
+        .unwrap();
+    // Compacta el fichero; el índice FTS (keyspace 0x03) va en el mismo árbol.
+    db.vacuum(Retention::KeepAll).unwrap();
+    assert_eq!(
+        ids(&conn, "SELECT id FROM mail WHERE body MATCH 'mundo'"),
+        vec![1, 2]
+    );
+    // Los inserts posteriores al vacuum se mantienen.
+    conn.execute("INSERT INTO mail (body) VALUES ('mundo nuevo')", &[])
+        .unwrap();
+    assert_eq!(
+        ids(&conn, "SELECT id FROM mail WHERE body MATCH 'mundo'"),
+        vec![1, 2, 3]
+    );
 }
 
 #[test]

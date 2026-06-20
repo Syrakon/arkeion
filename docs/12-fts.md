@@ -1,6 +1,6 @@
 # 12 — Full-text search (FTS): `MATCH` + índice invertido (diseño + plan)
 
-> **Estado: EN CURSO — F1–F5 hechas (búsqueda + ranking + extractos).** En
+> **Estado: COMPLETO — F1–F6 hechas y testeadas.** En
 > `feat/fts`, testeado: F1 tokenizer, F2 índice invertido + stats BM25 +
 > `CREATE/DROP FULLTEXT INDEX` con mantenimiento en insert/update/delete/bulk,
 > F3 operador `MATCH` + parser del mini-lenguaje, F4 evaluación (`fts_search`
@@ -10,10 +10,13 @@
 > precomputadas en `run_select` y colgadas del `QuerySchema`) **+ `snippet()` /
 > `highlight()`** (extractos con términos resaltados, mismo tokenizer del índice).
 > `SELECT id, snippet(body,'a'), bm25(body,'a') FROM t WHERE body MATCH 'a' ORDER
-> BY bm25(body,'a') DESC` funciona. Falta: F6 bordes (`MATCH … AS OF`, vacuum) +
-> tokenizer email-aware + merge a main. Paridad funcional con FTS5 de SQLite,
-> pero **nativo** (no virtual table) y **versionado/auditable**: el índice vive en
-> el mismo árbol copy-on-write ⇒ `… MATCH 'x' AS OF VERSION n` busca en el pasado.
+> BY bm25(body,'a') DESC` funciona. **F6 bordes verificados: `MATCH … AS OF
+> VERSION n` busca en el pasado y el índice sobrevive al `vacuum`** —ambos *gratis*
+> porque vive en el árbol versionado copy-on-write, sin código extra
+> (`tests/fts.rs`). Paridad funcional con FTS5 de SQLite, pero **nativo** (no
+> virtual table) y **versionado/auditable**. Pendiente (opcional): tokenizer
+> email-aware. (FTS implementado en `feat/fts`; F5/F6 y vectores conviven en
+> `feat/vectors`, que sale de `feat/fts`.)
 
 Primer consumidor real: **papaya** (correo del usuario) para la búsqueda de
 mensajes. La migración del store de papaya a Arkeion **no** depende de esto; FTS

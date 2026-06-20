@@ -52,11 +52,30 @@ LIMIT 10;                                                  -- top-K vecinos
 El `ORDER BY … LIMIT` recorre las filas calculando la distancia (full scan
 exacto) y se queda con los K mejores — KNN exacto, sin estructura nueva.
 
-## Híbrido (futuro)
+## Híbrido (HECHO — se compone solo)
 
-Con BM25 (docs/12) + coseno disponibles, el ranking híbrido es combinar scores en
-el `ORDER BY` (p. ej. `0.5*bm25(...) + 0.5*(1 - cosine_distance(...))`), o un
-re-rank en dos fases. Lo ideal para búsqueda de correo.
+Con BM25 (docs/12) + coseno disponibles, la búsqueda **híbrida** (léxica +
+semántica) **funciona sin código nuevo**: se expresa con SQL ya existente (CTE +
+window functions). El método robusto es **RRF (Reciprocal Rank Fusion)** — fusiona
+por *rango* en cada ranking, así evita el problema de escalas (BM25 no acotado vs
+coseno ∈ [0,2]):
+
+```sql
+WITH ranked AS (
+  SELECT id,
+    ROW_NUMBER() OVER (ORDER BY bm25(body, 'rust') DESC)                       AS lex,
+    ROW_NUMBER() OVER (ORDER BY cosine_distance(emb, vector(1.0,0.0,0.0)) ASC) AS sem
+  FROM docs
+)
+SELECT id FROM ranked ORDER BY 1.0/(60+lex) + 1.0/(60+sem) DESC LIMIT 10;
+```
+
+El doc bueno en **ambas** señales gana al mejor de cada una por separado — justo
+lo que quieres en correo. Único cambio que hizo falta: que `bm25()` se precompute
+también cuando aparece dentro de una window function (`collect_bm25` recurre en
+`Expr::Window`). Probado en `tests/hybrid.rs`. *(Alternativa más simple pero
+sensible a escala: `ORDER BY w1*bm25(…) + w2*(1 - cosine_distance(…))` con scores
+normalizados.)*
 
 ## Slicing
 

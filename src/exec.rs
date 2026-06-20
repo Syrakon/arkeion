@@ -1002,6 +1002,16 @@ fn collect_bm25<'a>(e: &'a Expr, out: &mut Vec<(&'a Expr, &'a Expr)>) {
             }
         }
         Expr::Aggregate { arg: Some(a), .. } => collect_bm25(a, out),
+        Expr::Window {
+            args,
+            partition_by,
+            order_by,
+            ..
+        } => {
+            args.iter().for_each(|a| collect_bm25(a, out));
+            partition_by.iter().for_each(|a| collect_bm25(a, out));
+            order_by.iter().for_each(|o| collect_bm25(&o.expr, out));
+        }
         _ => {}
     }
 }

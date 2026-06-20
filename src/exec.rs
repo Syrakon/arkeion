@@ -10,7 +10,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::catalog::{
     self, ColType, ColumnDef, ColumnSpec, FtsIndexDef, IndexDef, TableDef, TableSpec, TriggerDef,
-    TriggerEvent, TriggerForEach, TriggerTiming,
+    TriggerEvent, TriggerForEach, TriggerTiming, VectorIndexDef, VectorMetric,
 };
 use crate::error::{Error, Result};
 use crate::record::Value;
@@ -57,6 +57,14 @@ pub trait DataSource {
     /// Stats BM25 de una consulta: `df` por término (en orden) + globales
     /// `(N docs, Σ tokens)`.
     fn fts_stats(&self, fts_id: u32, terms: &[String]) -> Result<(Vec<u64>, u64, u64)>;
+    /// rowids candidatos del índice vectorial IVF (los `nprobe` clusters más
+    /// cercanos a `query`).
+    fn vector_search(
+        &self,
+        vidx: &VectorIndexDef,
+        query: &[f32],
+        nprobe: usize,
+    ) -> Result<Vec<i64>>;
 }
 
 impl DataSource for Snapshot {
@@ -109,6 +117,15 @@ impl DataSource for Snapshot {
     fn fts_stats(&self, fts_id: u32, terms: &[String]) -> Result<(Vec<u64>, u64, u64)> {
         Snapshot::fts_stats(self, fts_id, terms)
     }
+
+    fn vector_search(
+        &self,
+        vidx: &VectorIndexDef,
+        query: &[f32],
+        nprobe: usize,
+    ) -> Result<Vec<i64>> {
+        Snapshot::vector_search(self, vidx, query, nprobe)
+    }
 }
 
 impl DataSource for WriteTx {
@@ -160,6 +177,15 @@ impl DataSource for WriteTx {
 
     fn fts_stats(&self, fts_id: u32, terms: &[String]) -> Result<(Vec<u64>, u64, u64)> {
         WriteTx::fts_stats(self, fts_id, terms)
+    }
+
+    fn vector_search(
+        &self,
+        vidx: &VectorIndexDef,
+        query: &[f32],
+        nprobe: usize,
+    ) -> Result<Vec<i64>> {
+        WriteTx::vector_search(self, vidx, query, nprobe)
     }
 }
 
@@ -988,6 +1014,67 @@ fn fts_plan(
     let q = crate::fts::parse_query(&q_str)?;
     let mut rows = Vec::new();
     for rowid in src.fts_search(def, fts, &q)? {
+        if let Some(row) = src.get_row(def, rowid)? {
+            rows.push(row);
+        }
+    }
+    Ok(Some(rows))
+}
+
+/// Plan vectorial (ANN) para `run_select`: si la consulta es un KNN
+/// —`ORDER BY cosine_distance|l2_distance(col, qvec) [ASC] LIMIT k`, sin WHERE—
+/// sobre una columna con índice IVF de la misma métrica, devuelve los candidatos
+/// de los `nprobe` clusters más cercanos. El `ORDER BY`/`LIMIT` los rankea exacto
+/// después. Sin índice apto ⇒ `None` (cae al full scan = KNN exacto).
+fn vector_plan(
+    src: &impl DataSource,
+    def: &TableDef,
+    stmt: &SelectStmt,
+    params: &[Value],
+) -> Result<Option<Vec<Vec<Value>>>> {
+    if stmt.where_clause.is_some() || stmt.limit.is_none() || stmt.order_by.len() != 1 {
+        return Ok(None);
+    }
+    let ob = &stmt.order_by[0];
+    if ob.desc {
+        return Ok(None); // distancia: menor = más cercano ⇒ ASC
+    }
+    let Expr::Function { name, args } = &ob.expr else {
+        return Ok(None);
+    };
+    let metric = match name.as_str() {
+        "cosine_distance" => VectorMetric::Cosine,
+        "l2_distance" => VectorMetric::L2,
+        _ => return Ok(None),
+    };
+    if args.len() != 2 {
+        return Ok(None);
+    }
+    let Expr::Column { name: col, .. } = &args[0] else {
+        return Ok(None);
+    };
+    let Some(col_pos) = def
+        .columns
+        .iter()
+        .position(|c| !c.dropped && c.name == *col)
+    else {
+        return Ok(None);
+    };
+    let Some(vidx) = def
+        .vector_indexes
+        .iter()
+        .find(|v| v.column == col_pos && v.metric == metric)
+    else {
+        return Ok(None);
+    };
+    let Value::Blob(qb) = eval_const(&args[1], params)? else {
+        return Ok(None);
+    };
+    let query = crate::vector::to_f32(&qb)?;
+    // nprobe por defecto: ~10% de los clusters (mínimo 1). Más recall ⇒ más listas.
+    let nprobe = (vidx.lists as usize).div_ceil(10).max(1);
+    let mut rows = Vec::new();
+    for rowid in src.vector_search(vidx, &query, nprobe)? {
         if let Some(row) = src.get_row(def, rowid)? {
             rows.push(row);
         }
@@ -2203,6 +2290,10 @@ pub fn run_select(src: &impl DataSource, stmt: &SelectStmt, params: &[Value]) ->
             // Narrowing FTS: un `MATCH` no negado de nivel superior usa el índice
             // en vez del full scan. El WHERE completo se re-aplica por fila.
             fts_rows
+        } else if let Some(vec_rows) = vector_plan(src, &from_def, stmt, params)? {
+            // KNN por índice IVF (ANN): candidatos de los clusters más cercanos;
+            // el ORDER BY/LIMIT los rankea exacto después.
+            vec_rows
         } else {
             src.scan_rows(&from_def)?
         }
@@ -2640,6 +2731,15 @@ impl DataSource for CteSource<'_> {
     fn fts_stats(&self, fts_id: u32, terms: &[String]) -> Result<(Vec<u64>, u64, u64)> {
         self.inner.fts_stats(fts_id, terms)
     }
+
+    fn vector_search(
+        &self,
+        vidx: &VectorIndexDef,
+        query: &[f32],
+        nprobe: usize,
+    ) -> Result<Vec<i64>> {
+        self.inner.vector_search(vidx, query, nprobe)
+    }
 }
 
 // --- vistas (`CREATE VIEW`): SELECT con nombre, materializado bajo demanda ---
@@ -2780,6 +2880,15 @@ impl DataSource for ViewSource<'_> {
 
     fn fts_stats(&self, fts_id: u32, terms: &[String]) -> Result<(Vec<u64>, u64, u64)> {
         self.inner.fts_stats(fts_id, terms)
+    }
+
+    fn vector_search(
+        &self,
+        vidx: &VectorIndexDef,
+        query: &[f32],
+        nprobe: usize,
+    ) -> Result<Vec<i64>> {
+        self.inner.vector_search(vidx, query, nprobe)
     }
 }
 

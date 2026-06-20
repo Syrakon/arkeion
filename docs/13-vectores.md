@@ -86,9 +86,15 @@ normalizados.)*
   de tag (`0x00` f32 / `0x01` int8 = escala + bytes int8); ~4× menos storage. Las
   distancias desempaquetan ambos formatos transparentemente (query f32 vs
   almacenado int8 funciona). Cuantización simétrica por vector (`max|v|/127`).
-- **V3 — IVF** (ANN opt-in): centroides k-means como **datos versionados**
-  (evento discreto, no muta por-insert), postings por cluster (mismo patrón que el
-  FTS), `nprobe` clusters escaneados. Compatible con copy-on-write; HNSW NO.
+- **V3 — IVF (ANN) — HECHO y usable por SQL.** `CREATE VECTOR INDEX vi ON docs(emb)
+  [USING cosine|l2] [LISTS k]` entrena k-means (núcleo `src/ivf.rs`), persiste
+  centroides + postings por cluster en keyspace `0x04` (esquema catálogo v9),
+  mantiene el índice en insert/update/delete/bulk. El planner enruta
+  `ORDER BY cosine_distance(col, ?) LIMIT k` (sin WHERE) al índice: escanea
+  `nprobe` clusters (~10% por defecto) y el `ORDER BY`/`LIMIT` rankea exacto los
+  candidatos. Centroides como datos versionados (evento discreto, no muta
+  por-insert) ⇒ compatible con copy-on-write; HNSW NO. **Pendiente:** `nprobe`
+  configurable, `REBUILD`, métrica en el plan vs híbrido.
 
 ## Decisiones
 

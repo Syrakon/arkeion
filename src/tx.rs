@@ -17,7 +17,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use sha2::{Digest, Sha256};
 
 use crate::btree::{self, Body, Cursor, NodeSource, NodeStore};
-use crate::catalog::{self, FtsIndexDef, IndexDef, TableDef, TableScan, TableSpec};
+use crate::catalog::{self, FtsIndexDef, IndexDef, TableDef, TableScan, TableSpec, VectorIndexDef};
 use crate::commit::{self, COMMIT_FLAG_CHECKPOINT, CommitHeader, Head};
 use crate::compress::{Compressor, Densa};
 use crate::crypto::Key;
@@ -1498,6 +1498,17 @@ impl Snapshot {
     pub fn fts_stats(&self, fts_id: u32, terms: &[String]) -> Result<(Vec<u64>, u64, u64)> {
         catalog::fts_query_stats(self, self.data_root, fts_id, terms)
     }
+
+    /// rowids candidatos del índice vectorial IVF (los `nprobe` clusters más
+    /// cercanos a `query`).
+    pub fn vector_search(
+        &self,
+        vidx: &VectorIndexDef,
+        query: &[f32],
+        nprobe: usize,
+    ) -> Result<Vec<i64>> {
+        catalog::vector_search(self, self.data_root, vidx, query, nprobe)
+    }
 }
 
 // --- estado de páginas de una transacción ---
@@ -2005,6 +2016,17 @@ impl WriteTx {
     /// Stats BM25 de una consulta: `df` por término + globales `(N, Σ tokens)`.
     pub fn fts_stats(&self, fts_id: u32, terms: &[String]) -> Result<(Vec<u64>, u64, u64)> {
         catalog::fts_query_stats(&self.ts, self.data_root, fts_id, terms)
+    }
+
+    /// rowids candidatos del índice vectorial IVF (los `nprobe` clusters más
+    /// cercanos a `query`).
+    pub fn vector_search(
+        &self,
+        vidx: &VectorIndexDef,
+        query: &[f32],
+        nprobe: usize,
+    ) -> Result<Vec<i64>> {
+        catalog::vector_search(&self.ts, self.data_root, vidx, query, nprobe)
     }
 
     pub fn drop_table(&mut self, name: &str) -> Result<bool> {

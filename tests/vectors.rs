@@ -131,6 +131,58 @@ fn create_drop_vector_index_via_sql() {
 }
 
 #[test]
+fn knn_routes_through_ivf_index() {
+    let (_d, db) = db();
+    let conn = db.connect().unwrap();
+    conn.execute("CREATE TABLE docs (id INTEGER PRIMARY KEY, emb BLOB)", &[])
+        .unwrap();
+    // Cluster A≈(1,0): rowids 1-3. Cluster B≈(0,1): rowids 4-6.
+    for vals in [
+        "1.0, 0.0",
+        "0.95, 0.05",
+        "0.9, 0.1",
+        "0.0, 1.0",
+        "0.05, 0.95",
+        "0.1, 0.9",
+    ] {
+        conn.execute(
+            &format!("INSERT INTO docs (emb) VALUES (vector({vals}))"),
+            &[],
+        )
+        .unwrap();
+    }
+    conn.execute(
+        "CREATE VECTOR INDEX vi ON docs (emb) USING cosine LISTS 2",
+        &[],
+    )
+    .unwrap();
+
+    // KNN vía el índice: los 3 vecinos de (1,0) son el cluster A; el primero es
+    // la identidad (rowid 1).
+    let knn = ids_ordered(
+        &conn,
+        "SELECT id FROM docs ORDER BY cosine_distance(emb, vector(1.0, 0.0)) LIMIT 3",
+    );
+    assert_eq!(knn[0], 1);
+    let mut sorted = knn.clone();
+    sorted.sort_unstable();
+    assert_eq!(sorted, vec![1, 2, 3]);
+
+    // PRUEBA de que va por el índice (nprobe=1 escanea solo 1 cluster = 3 docs):
+    // aunque pidamos LIMIT 4, el índice solo tiene 3 candidatos. Un full scan
+    // habría devuelto 4.
+    let four = ids_ordered(
+        &conn,
+        "SELECT id FROM docs ORDER BY cosine_distance(emb, vector(1.0, 0.0)) LIMIT 4",
+    );
+    assert_eq!(
+        four.len(),
+        3,
+        "el IVF acota a 1 cluster (nprobe=1) = 3 docs"
+    );
+}
+
+#[test]
 fn vector_index_errors() {
     let (_d, db) = db();
     let conn = db.connect().unwrap();

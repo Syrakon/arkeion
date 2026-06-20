@@ -1,16 +1,29 @@
-//! Integración — full-text search (FTS), fase 2: plomería SQL de
-//! `CREATE/DROP FULLTEXT INDEX` y mantenimiento del índice en
-//! insert/update/delete. La corrección de los postings y las stats BM25 se prueba
-//! a nivel de catálogo (`src/catalog.rs`); aquí se valida la ruta
-//! SQL → exec → tx y el manejo de errores. La verificación por **resultados de
-//! búsqueda** llegará con `MATCH` (fases 3–4).
+//! Integración — full-text search (FTS): `CREATE/DROP FULLTEXT INDEX`,
+//! mantenimiento del índice en insert/update/delete/bulk, y **búsqueda `MATCH`**
+//! con resultados reales (booleanos, prefijo, frase, NEAR, filtro de columna,
+//! negación y combinación con predicados normales). La corrección de postings y
+//! stats BM25 se prueba a nivel de catálogo (`src/catalog.rs`).
 
-use arkeion::{Database, Error, Options, params};
+use arkeion::{Connection, Database, Error, Options, params};
 
 fn db() -> (tempfile::TempDir, Database) {
     let dir = tempfile::tempdir().unwrap();
     let db = Database::open(dir.path().join("t.arkeion"), Options::default()).unwrap();
     (dir, db)
+}
+
+/// ids (col 0) de una consulta, ordenados.
+fn ids(conn: &Connection, sql: &str) -> Vec<i64> {
+    let mut v: Vec<i64> = conn
+        .query(sql, &[])
+        .unwrap()
+        .map(|r| {
+            let id: i64 = r.unwrap().get(0).unwrap();
+            id
+        })
+        .collect();
+    v.sort_unstable();
+    v
 }
 
 #[test]
@@ -99,29 +112,118 @@ fn bulk_insert_maintains_fts() {
     assert_eq!(conn.bulk_insert("docs", rows).unwrap(), 2);
 }
 
-#[test]
-fn match_is_a_clean_error_until_phase4() {
-    let (_d, db) = db();
-    let conn = db.connect().unwrap();
-    conn.execute("CREATE TABLE mail (id INTEGER PRIMARY KEY, body TEXT)", &[])
-        .unwrap();
-    conn.execute("CREATE FULLTEXT INDEX f ON mail (body)", &[])
-        .unwrap();
+/// Corpus de correo con un índice FTS sobre (subject, body).
+fn mail_corpus(conn: &Connection) {
     conn.execute(
-        "INSERT INTO mail (body) VALUES (?1)",
-        &params!["hola mundo"],
+        "CREATE TABLE mail (id INTEGER PRIMARY KEY, subject TEXT, body TEXT, folder TEXT)",
+        &[],
     )
     .unwrap();
-    // MATCH parsea y se evalúa con un error SQL controlado (no pánico ni datos
-    // incorrectos) hasta que llegue la ejecución por índice (fase 4).
-    let err = match conn.query("SELECT id FROM mail WHERE body MATCH 'mundo'", &[]) {
-        Err(e) => e,
-        Ok(rows) => rows
-            .map(|r| r.map(|_| ()))
-            .collect::<Result<Vec<()>, _>>()
-            .expect_err("MATCH debería fallar de forma controlada"),
-    };
-    assert!(matches!(err, Error::Sql { .. }));
+    conn.execute("CREATE FULLTEXT INDEX fts ON mail (subject, body)", &[])
+        .unwrap();
+    let rows = [
+        ("hola mundo", "el mundo es grande", "inbox"),
+        ("adios planeta", "mundo cruel y frio", "spam"),
+        ("noticias", "el planeta tierra", "inbox"),
+    ];
+    for (s, b, f) in rows {
+        conn.execute(
+            "INSERT INTO mail (subject, body, folder) VALUES (?1, ?2, ?3)",
+            &params![s, b, f],
+        )
+        .unwrap();
+    }
+}
+
+#[test]
+fn match_boolean_prefix_and_negation() {
+    let (_d, db) = db();
+    let conn = db.connect().unwrap();
+    mail_corpus(&conn);
+    let q = |sql: &str| ids(&conn, sql);
+    // MATCH busca en todo el índice (subject + body).
+    assert_eq!(
+        q("SELECT id FROM mail WHERE body MATCH 'mundo'"),
+        vec![1, 2]
+    );
+    assert_eq!(
+        q("SELECT id FROM mail WHERE body MATCH 'planeta'"),
+        vec![2, 3]
+    );
+    assert_eq!(
+        q("SELECT id FROM mail WHERE body MATCH 'mundo AND planeta'"),
+        vec![2]
+    );
+    assert_eq!(
+        q("SELECT id FROM mail WHERE body MATCH 'mundo OR planeta'"),
+        vec![1, 2, 3]
+    );
+    assert_eq!(
+        q("SELECT id FROM mail WHERE body MATCH 'mundo NOT planeta'"),
+        vec![1]
+    );
+    assert_eq!(q("SELECT id FROM mail WHERE body MATCH 'mun*'"), vec![1, 2]);
+    // NOT MATCH: filas que NO casan (ni en subject ni en body).
+    assert_eq!(
+        q("SELECT id FROM mail WHERE body NOT MATCH 'mundo'"),
+        vec![3]
+    );
+}
+
+#[test]
+fn match_phrase_near_and_column() {
+    let (_d, db) = db();
+    let conn = db.connect().unwrap();
+    mail_corpus(&conn);
+    let q = |sql: &str| ids(&conn, sql);
+    assert_eq!(
+        q("SELECT id FROM mail WHERE body MATCH '\"el mundo\"'"),
+        vec![1]
+    );
+    assert_eq!(
+        q("SELECT id FROM mail WHERE body MATCH 'NEAR(mundo grande, 5)'"),
+        vec![1]
+    );
+    assert!(q("SELECT id FROM mail WHERE body MATCH 'NEAR(mundo grande, 1)'").is_empty());
+    // Filtro por columna dentro de la consulta.
+    assert_eq!(
+        q("SELECT id FROM mail WHERE body MATCH 'subject:mundo'"),
+        vec![1]
+    );
+    assert_eq!(
+        q("SELECT id FROM mail WHERE body MATCH 'body:planeta'"),
+        vec![3]
+    );
+}
+
+#[test]
+fn match_combines_with_normal_predicates() {
+    let (_d, db) = db();
+    let conn = db.connect().unwrap();
+    mail_corpus(&conn);
+    let q = |sql: &str| ids(&conn, sql);
+    // MATCH ANDado con un filtro normal.
+    assert_eq!(
+        q("SELECT id FROM mail WHERE body MATCH 'mundo' AND folder = 'inbox'"),
+        vec![1]
+    );
+    // MATCH dentro de un OR (el eval per-fila lo maneja en cualquier posición).
+    assert_eq!(
+        q("SELECT id FROM mail WHERE body MATCH 'planeta' OR folder = 'spam'"),
+        vec![2, 3]
+    );
+}
+
+#[test]
+fn match_on_unindexed_column_errors() {
+    let (_d, db) = db();
+    let conn = db.connect().unwrap();
+    mail_corpus(&conn);
+    // `folder` no está en ningún índice FULLTEXT.
+    let result = conn
+        .query("SELECT id FROM mail WHERE folder MATCH 'inbox'", &[])
+        .and_then(|rows| rows.map(|r| r.map(|_| ())).collect::<Result<Vec<()>, _>>());
+    assert!(matches!(result, Err(Error::Sql { .. })));
 }
 
 #[test]

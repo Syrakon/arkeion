@@ -2381,6 +2381,162 @@ pub fn fts_search<S: NodeSource>(
     eval_query(src, root, table, fts, tk.as_ref(), query, None)
 }
 
+// --- evaluación de MATCH contra una sola fila (sin índice): el planner re-aplica
+// el WHERE por fila, y así `MATCH` funciona en cualquier posición (OR/NOT). El
+// índice queda como optimización de narrowing aparte. ---
+
+/// `true` si algún token del documento `(token, field, pos)` casa el término
+/// (exacto o por prefijo), respetando el filtro de columna.
+fn doc_has_term(doc: &[(String, u8, u32)], term: &str, prefix: bool, field: Option<u8>) -> bool {
+    doc.iter().any(|(t, f, _)| {
+        field.is_none_or(|ff| ff == *f)
+            && if prefix {
+                t.starts_with(term)
+            } else {
+                t == term
+            }
+    })
+}
+
+/// `true` si los tokens aparecen adyacentes y en orden en el mismo field (frase).
+fn doc_has_phrase(doc: &[(String, u8, u32)], tokens: &[String], field: Option<u8>) -> bool {
+    if tokens.is_empty() {
+        return false;
+    }
+    if tokens.len() == 1 {
+        return doc_has_term(doc, &tokens[0], false, field);
+    }
+    doc.iter().any(|(t, f, p)| {
+        if t != &tokens[0] || field.is_some_and(|ff| ff != *f) {
+            return false;
+        }
+        tokens[1..].iter().enumerate().all(|(k, tok)| {
+            p.checked_add(k as u32 + 1).is_some_and(|want| {
+                doc.iter()
+                    .any(|(t2, f2, p2)| t2 == tok && f2 == f && *p2 == want)
+            })
+        })
+    })
+}
+
+/// `true` si todos los tokens aparecen en un mismo field dentro de una ventana de
+/// `distance` posiciones (NEAR).
+fn doc_has_near(
+    doc: &[(String, u8, u32)],
+    tokens: &[String],
+    distance: u32,
+    field: Option<u8>,
+) -> bool {
+    if tokens.len() < 2 {
+        return false;
+    }
+    let mut fields: Vec<u8> = doc
+        .iter()
+        .map(|(_, f, _)| *f)
+        .filter(|f| field.is_none_or(|ff| ff == *f))
+        .collect();
+    fields.sort_unstable();
+    fields.dedup();
+    fields.into_iter().any(|f| {
+        let groups: Vec<Vec<u32>> = tokens
+            .iter()
+            .map(|tok| {
+                doc.iter()
+                    .filter(|(t, ff, _)| t == tok && *ff == f)
+                    .map(|(_, _, p)| *p)
+                    .collect()
+            })
+            .collect();
+        min_window_span(&groups).is_some_and(|s| s <= distance)
+    })
+}
+
+/// Evalúa un `Query` AST contra un documento en memoria (los tokens de una fila),
+/// devolviendo si casa. `field` restringe a una columna; `columns` mapea nombre →
+/// field para los filtros `col:`.
+fn eval_doc(
+    q: &crate::fts::Query,
+    doc: &[(String, u8, u32)],
+    columns: &[(String, u8)],
+    tk: &dyn crate::fts::Tokenizer,
+    field: Option<u8>,
+) -> Result<bool> {
+    use crate::fts::Query;
+    match q {
+        Query::Term { text, prefix } => {
+            let toks = tokenize_all(tk, text);
+            Ok(match toks.len() {
+                0 => false,
+                1 => doc_has_term(doc, &toks[0], *prefix, field),
+                _ => doc_has_phrase(doc, &toks, field),
+            })
+        }
+        Query::Phrase(words) => {
+            let mut toks = Vec::new();
+            for w in words {
+                toks.extend(tokenize_all(tk, w));
+            }
+            Ok(doc_has_phrase(doc, &toks, field))
+        }
+        Query::Near { terms, distance } => {
+            let mut toks = Vec::new();
+            for t in terms {
+                toks.extend(tokenize_all(tk, t));
+            }
+            Ok(doc_has_near(doc, &toks, *distance, field))
+        }
+        Query::Column { column, query } => {
+            let f = columns
+                .iter()
+                .find(|(n, _)| n == column)
+                .map(|(_, f)| *f)
+                .ok_or_else(|| Error::Sql {
+                    msg: format!("la columna «{column}» no está en el índice FTS"),
+                    pos: None,
+                })?;
+            eval_doc(query, doc, columns, tk, Some(f))
+        }
+        Query::And(a, b) => {
+            Ok(eval_doc(a, doc, columns, tk, field)? && eval_doc(b, doc, columns, tk, field)?)
+        }
+        Query::Or(a, b) => {
+            Ok(eval_doc(a, doc, columns, tk, field)? || eval_doc(b, doc, columns, tk, field)?)
+        }
+        Query::Not(a, b) => {
+            Ok(eval_doc(a, doc, columns, tk, field)? && !eval_doc(b, doc, columns, tk, field)?)
+        }
+    }
+}
+
+/// `true` si la fila casa la consulta `MATCH` para el índice `fts`. Tokeniza las
+/// columnas indexadas de `row` (valores locales de la tabla) y evalúa el `Query`
+/// contra ese documento, con el **mismo** tokenizer con que se indexó.
+pub fn fts_row_matches(
+    def: &TableDef,
+    fts: &FtsIndexDef,
+    row: &[Value],
+    query: &crate::fts::Query,
+) -> Result<bool> {
+    let tk = crate::fts::tokenizer_for(&fts.tokenizer)?;
+    let mut doc: Vec<(String, u8, u32)> = Vec::new();
+    let mut buf = Vec::new();
+    for &col in &fts.columns {
+        buf.clear();
+        if let Some(Value::Text(text)) = row.get(col) {
+            tk.tokenize(text, &mut buf);
+        }
+        for tok in &buf {
+            doc.push((tok.text.clone(), col as u8, tok.position));
+        }
+    }
+    let columns: Vec<(String, u8)> = fts
+        .columns
+        .iter()
+        .map(|&c| (def.columns[c].name.clone(), c as u8))
+        .collect();
+    eval_doc(query, &doc, &columns, tk.as_ref(), None)
+}
+
 /// rowids cuyas columnas indexadas valen exactamente `values` (igualdad). El
 /// planificador lo usa para `WHERE col = const`; luego `get_row` por cada rowid.
 pub fn index_scan_eq<S: NodeSource>(

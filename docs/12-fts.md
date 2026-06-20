@@ -1,13 +1,17 @@
 # 12 — Full-text search (FTS): `MATCH` + índice invertido (diseño + plan)
 
-> **Estado: EN CURSO (Fase 2 de 6 completa).** Hechas y testeadas en `feat/fts`:
-> F1 tokenizer, F2 índice invertido + stats BM25 + `CREATE/DROP FULLTEXT INDEX`
-> end-to-end por SQL con mantenimiento consistente en insert/update/delete/bulk.
-> Falta: F3 operador `MATCH` + parser de query, F4 planner, F5 ranking `bm25` y
-> auxiliares `snippet`/`highlight`, F6 bordes. Paridad funcional con FTS5 de
-> SQLite, pero **nativo** (no virtual table — Arkeion no tiene vtabs) y
-> **versionado/auditable**: el índice vive en el mismo árbol copy-on-write que los
-> datos ⇒ `... WHERE col MATCH 'x' AS OF VERSION n` busca en el pasado.
+> **Estado: EN CURSO — `MATCH` ya BUSCA (F1–F4 hechas).** En `feat/fts`,
+> testeado: F1 tokenizer, F2 índice invertido + stats BM25 + `CREATE/DROP
+> FULLTEXT INDEX` con mantenimiento en insert/update/delete/bulk, F3 operador
+> `MATCH` + parser del mini-lenguaje de consulta, F4 evaluación (`fts_search`
+> contra el índice **+** eval per-fila para que `MATCH` funcione en cualquier
+> posición del WHERE —OR/NOT/combinado—). `SELECT … WHERE col MATCH 'a AND b'`
+> **devuelve filas**. Falta: **narrowing** (que el planner use el índice para no
+> hacer full scan), F5 ranking `bm25` + `snippet`/`highlight`, F6 bordes
+> (`AS OF`, vacuum). Paridad funcional con FTS5 de SQLite, pero **nativo** (no
+> virtual table — Arkeion no tiene vtabs) y **versionado/auditable**: el índice
+> vive en el mismo árbol copy-on-write ⇒ `… MATCH 'x' AS OF VERSION n` busca en
+> el pasado.
 
 Primer consumidor real: **papaya** (correo del usuario) para la búsqueda de
 mensajes. La migración del store de papaya a Arkeion **no** depende de esto; FTS

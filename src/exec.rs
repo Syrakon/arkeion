@@ -218,6 +218,45 @@ impl QuerySchema {
             }
         }
     }
+
+    /// Como [`resolve`](Self::resolve) pero devuelve la tabla dueña de la columna
+    /// (su `def`), la posición **local** de la columna en esa tabla y el offset de
+    /// la tabla en la fila combinada. Lo usa la evaluación de `MATCH`.
+    fn owner_of(&self, table: Option<&str>, name: &str) -> Result<(&TableDef, usize, usize)> {
+        match table {
+            Some(q) => {
+                let t = self
+                    .tables
+                    .iter()
+                    .find(|t| t.qualifier == q)
+                    .ok_or_else(|| sql_err(format!("tabla desconocida en la consulta: {q}")))?;
+                let i = t
+                    .def
+                    .columns
+                    .iter()
+                    .position(|c| !c.dropped && c.name == name)
+                    .ok_or_else(|| sql_err(format!("columna desconocida: {q}.{name}")))?;
+                Ok((&t.def, i, t.offset))
+            }
+            None => {
+                let mut found = None;
+                for t in &self.tables {
+                    if let Some(i) = t
+                        .def
+                        .columns
+                        .iter()
+                        .position(|c| !c.dropped && c.name == name)
+                    {
+                        if found.is_some() {
+                            return Err(sql_err(format!("columna ambigua: {name}")));
+                        }
+                        found = Some((&t.def, i, t.offset));
+                    }
+                }
+                found.ok_or_else(|| sql_err(format!("columna desconocida: {name}")))
+            }
+        }
+    }
 }
 
 /// Valida que toda columna referenciada exista, aunque no haya filas que
@@ -4752,10 +4791,40 @@ fn eval(e: &Expr, row: Option<(&QuerySchema, &[Value])>, params: &[Value]) -> Re
             let is_null = matches!(eval(expr, row, params)?, Value::Null);
             Ok(Value::Bool(is_null != *negated))
         }
-        Expr::Match { .. } => Err(sql_err(
-            "MATCH se resuelve vía el índice FTS; aún no es ejecutable por fila (fase 4)"
-                .to_string(),
-        )),
+        Expr::Match {
+            column,
+            query,
+            negated,
+        } => {
+            let Expr::Column { table: tq, name } = column.as_ref() else {
+                return Err(sql_err(
+                    "MATCH requiere una columna indexada a la izquierda".to_string(),
+                ));
+            };
+            let Some((schema, full_row)) = row else {
+                return Err(sql_err(
+                    "MATCH no puede evaluarse fuera de una fila".to_string(),
+                ));
+            };
+            let (def, local_pos, offset) = schema.owner_of(tq.as_deref(), name)?;
+            let fts = def
+                .fts_indexes
+                .iter()
+                .find(|f| f.columns.contains(&local_pos))
+                .ok_or_else(|| {
+                    sql_err(format!("la columna «{name}» no tiene un índice FULLTEXT"))
+                })?;
+            match eval(query, row, params)? {
+                Value::Null => Ok(Value::Null),
+                Value::Text(q_str) => {
+                    let q = crate::fts::parse_query(&q_str)?;
+                    let local = &full_row[offset..offset + def.columns.len()];
+                    let matched = crate::catalog::fts_row_matches(def, fts, local, &q)?;
+                    Ok(Value::Bool(matched != *negated))
+                }
+                _ => Err(sql_err("la consulta MATCH debe ser texto".to_string())),
+            }
+        }
         Expr::Like {
             expr,
             pattern,

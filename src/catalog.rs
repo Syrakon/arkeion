@@ -2912,6 +2912,78 @@ pub fn vector_search<S: NodeSource>(
     Ok(rowids)
 }
 
+/// Índice del centroide más cercano a `v` (argmin L2).
+fn nearest_centroid(centroids: &[Vec<f32>], v: &[f32]) -> usize {
+    let mut best = 0;
+    let mut best_d = f32::INFINITY;
+    for (i, c) in centroids.iter().enumerate() {
+        let d = vec_l2_sq(c, v);
+        if d < best_d {
+            best_d = d;
+            best = i;
+        }
+    }
+    best
+}
+
+/// Añade (`add`) o quita el posting de una fila en un índice vectorial: la asigna
+/// al centroide existente más cercano. Los centroides **no** se reentrenan por
+/// insert (eso sería un `REBUILD` discreto); las filas nuevas caen en su cluster
+/// más cercano. NULL/no-blob ⇒ no se indexa.
+fn apply_vector_row<S: NodeStore>(
+    s: &mut S,
+    root: PageId,
+    vidx: &VectorIndexDef,
+    rowid: i64,
+    record: &[Value],
+    add: bool,
+) -> Result<PageId> {
+    let Some(v) = row_vector(record, vidx.column, vidx.metric)? else {
+        return Ok(root);
+    };
+    let centroids = read_centroids(s, root, vidx.vidx_id)?;
+    if centroids.is_empty() {
+        return Ok(root); // índice sin centroides (build vacío): nada que mantener
+    }
+    let cid = nearest_centroid(&centroids, &v) as u16;
+    let key = vec_posting_key(vidx.vidx_id, cid, rowid);
+    if add {
+        btree::insert(s, root, &key, &[])
+    } else {
+        Ok(btree::delete(s, root, &key)?.0)
+    }
+}
+
+/// Inserta los postings vectoriales de una fila (todos los índices vectoriales).
+pub fn insert_vector_entries<S: NodeStore>(
+    s: &mut S,
+    root: PageId,
+    table: &TableDef,
+    rowid: i64,
+    record: &[Value],
+) -> Result<PageId> {
+    let mut root = root;
+    for vidx in &table.vector_indexes {
+        root = apply_vector_row(s, root, vidx, rowid, record, true)?;
+    }
+    Ok(root)
+}
+
+/// Borra los postings vectoriales de una fila (todos los índices vectoriales).
+pub fn delete_vector_entries<S: NodeStore>(
+    s: &mut S,
+    root: PageId,
+    table: &TableDef,
+    rowid: i64,
+    record: &[Value],
+) -> Result<PageId> {
+    let mut root = root;
+    for vidx in &table.vector_indexes {
+        root = apply_vector_row(s, root, vidx, rowid, record, false)?;
+    }
+    Ok(root)
+}
+
 /// rowids cuyas columnas indexadas valen exactamente `values` (igualdad). El
 /// planificador lo usa para `WHERE col = const`; luego `get_row` por cada rowid.
 pub fn index_scan_eq<S: NodeSource>(
@@ -3145,6 +3217,9 @@ pub(crate) fn put_row<S: NodeStore>(
     if !table.fts_indexes.is_empty() {
         root = insert_fts_entries(s, root, table, rowid, &record)?;
     }
+    if !table.vector_indexes.is_empty() {
+        root = insert_vector_entries(s, root, table, rowid, &record)?;
+    }
     Ok(root)
 }
 
@@ -3160,15 +3235,14 @@ pub(crate) fn put_row_buffered<S: NodeStore>(
     rec_buf: &mut Vec<Value>,
     enc_buf: &mut Vec<u8>,
 ) -> Result<PageId> {
-    if table.indexes.is_empty() && table.fts_indexes.is_empty() {
+    if table.indexes.is_empty() && table.fts_indexes.is_empty() && table.vector_indexes.is_empty() {
         // Sin índices (el caso del bulk-load típico): valida y codifica en una
         // pasada sobre los valores prestados, sin clonar texto/blob por fila
         // ni materializar el registro (M10-perf, fase 2).
         return put_row_data(s, root, table, rowid, values, enc_buf);
     }
-    // Con índices (normales o FTS): las entradas necesitan el registro
-    // materializado (claves de índice, dup-check UNIQUE, tokens FTS); se
-    // reutilizan los buffers.
+    // Con índices (normales, FTS o vectoriales): las entradas necesitan el
+    // registro materializado; se reutilizan los buffers.
     validate_record_into(table, values, rec_buf)?;
     record::encode_values_into(rec_buf, enc_buf);
     let mut root = btree::insert(s, root, &row_key(table.table_id, rowid), enc_buf)?;
@@ -3177,6 +3251,9 @@ pub(crate) fn put_row_buffered<S: NodeStore>(
     }
     if !table.fts_indexes.is_empty() {
         root = insert_fts_entries(s, root, table, rowid, rec_buf.as_slice())?;
+    }
+    if !table.vector_indexes.is_empty() {
+        root = insert_vector_entries(s, root, table, rowid, rec_buf.as_slice())?;
     }
     Ok(root)
 }
@@ -3301,14 +3378,21 @@ pub fn update_row<S: NodeStore>(
     };
     let record = validated_record(table, values)?;
     let mut root = root;
-    // Quita las entradas (índice y FTS) de la fila vieja antes de sobrescribir.
-    if !table.indexes.is_empty() || !table.fts_indexes.is_empty() {
+    // Quita las entradas (índice, FTS y vectorial) de la fila vieja antes de
+    // sobrescribir.
+    if !table.indexes.is_empty()
+        || !table.fts_indexes.is_empty()
+        || !table.vector_indexes.is_empty()
+    {
         let old = finish_row(table, rowid, record::decode_values(&old_bytes)?)?;
         if !table.indexes.is_empty() {
             root = delete_index_entries(s, root, table, rowid, &old)?;
         }
         if !table.fts_indexes.is_empty() {
             root = delete_fts_entries(s, root, table, rowid, &old)?;
+        }
+        if !table.vector_indexes.is_empty() {
+            root = delete_vector_entries(s, root, table, rowid, &old)?;
         }
     }
     root = btree::insert(s, root, &key, &record::encode_values(&record))?;
@@ -3317,6 +3401,9 @@ pub fn update_row<S: NodeStore>(
     }
     if !table.fts_indexes.is_empty() {
         root = insert_fts_entries(s, root, table, rowid, &record)?;
+    }
+    if !table.vector_indexes.is_empty() {
+        root = insert_vector_entries(s, root, table, rowid, &record)?;
     }
     Ok((root, true))
 }
@@ -3344,10 +3431,10 @@ pub fn delete_row<S: NodeStore>(
     rowid: i64,
 ) -> Result<(PageId, bool)> {
     let key = row_key(table.table_id, rowid);
-    if table.indexes.is_empty() && table.fts_indexes.is_empty() {
+    if table.indexes.is_empty() && table.fts_indexes.is_empty() && table.vector_indexes.is_empty() {
         return btree::delete(s, root, &key);
     }
-    // Con índices (normales o FTS): hay que leer la fila para quitar sus entradas.
+    // Con índices: hay que leer la fila para quitar sus entradas.
     let Some(bytes) = btree::get(s, root, &key)? else {
         return Ok((root, false));
     };
@@ -3358,6 +3445,9 @@ pub fn delete_row<S: NodeStore>(
     }
     if !table.fts_indexes.is_empty() {
         root = delete_fts_entries(s, root, table, rowid, &record)?;
+    }
+    if !table.vector_indexes.is_empty() {
+        root = delete_vector_entries(s, root, table, rowid, &record)?;
     }
     Ok((root, true))
 }
@@ -3728,6 +3818,72 @@ mod tests {
             vector_search(&s, root, &vidx, &[0.05, 0.05], 2)
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn vector_index_maintained_on_row_ops() {
+        let mut s = MemStore::new();
+        let spec = TableSpec {
+            name: "docs".into(),
+            columns: vec![
+                ColumnSpec {
+                    primary_key: true,
+                    ..col("id", ColType::Integer)
+                },
+                col("emb", ColType::Blob),
+            ],
+            foreign_keys: Vec::new(),
+            uniques: Vec::new(),
+            checks: Vec::new(),
+        };
+        let (mut root, def) = create_table(&mut s, NO_ROOT, &spec).unwrap();
+        // Corpus inicial: cluster A≈(0,0) (rowids 1-2), B≈(10,10) (rowids 3-4).
+        for v in [
+            vec![0.0, 0.0],
+            vec![0.1, 0.0],
+            vec![10.0, 10.0],
+            vec![10.0, 9.9],
+        ] {
+            root = insert_row(
+                &mut s,
+                root,
+                &def,
+                &[Value::Null, Value::Blob(crate::vector::pack_f32(&v))],
+            )
+            .unwrap()
+            .0;
+        }
+        root = create_vector_index(&mut s, root, "docs", "v", 1, 2, VectorMetric::L2).unwrap();
+        let def = get_table(&s, root, "docs").unwrap().unwrap();
+        let vidx = def.vector_indexes[0].clone();
+
+        // INSERT una fila nueva cerca de A: el hook la asigna al cluster A.
+        let (r, rid) = insert_row(
+            &mut s,
+            root,
+            &def,
+            &[
+                Value::Null,
+                Value::Blob(crate::vector::pack_f32(&[0.05, 0.05])),
+            ],
+        )
+        .unwrap();
+        root = r;
+        assert!(
+            vector_search(&s, root, &vidx, &[0.05, 0.05], 1)
+                .unwrap()
+                .contains(&rid),
+            "la fila nueva debería caer en el cluster A"
+        );
+
+        // DELETE la quita del cluster.
+        let (root, ok) = delete_row(&mut s, root, &def, rid).unwrap();
+        assert!(ok);
+        assert!(
+            !vector_search(&s, root, &vidx, &[0.05, 0.05], 1)
+                .unwrap()
+                .contains(&rid)
         );
     }
 

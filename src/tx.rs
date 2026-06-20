@@ -2141,6 +2141,18 @@ impl WriteTx {
                     &mut self.rec_buf,
                 )?;
             }
+            // Vectorial en línea también (asigna a cluster por fila). Un BLOB no se
+            // coacciona, así que los valores crudos sirven (un DEFAULT en columna
+            // vectorial es inexistente en la práctica).
+            if !def.vector_indexes.is_empty() {
+                self.data_root = catalog::insert_vector_entries(
+                    &mut self.ts,
+                    self.data_root,
+                    &def,
+                    rowid,
+                    values,
+                )?;
+            }
             n += 1;
         }
         self.rowid_cache.insert(def.table_id, next);

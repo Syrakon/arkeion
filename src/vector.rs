@@ -1,35 +1,77 @@
 //! Búsqueda vectorial — KNN exacto.
 //!
-//! Un vector = **BLOB de `f32` little-endian**. Aquí viven solo las operaciones
-//! puras (empaquetado y distancias); el KNN es `ORDER BY <distancia> LIMIT k` en
-//! SQL normal (full scan exacto). Cero dependencias. Ver `docs/13-vectores.md`.
+//! Un vector es un BLOB con un byte de **tag** de formato + payload:
+//! - `0x00` **f32**: `dim` floats little-endian (4·dim bytes) — `vector()`.
+//! - `0x01` **int8** (quantizado): `escala` f32 LE + `dim` bytes int8 — `vector_i8()`.
+//!   ~4× menos storage; cada componente ≈ `escala · q`. Pérdida de precisión
+//!   pequeña (cuantización simétrica por vector).
 //!
-//! Las distancias acumulan en `f64` por precisión. `cosine_distance` y
-//! `l2_distance` ordenan de menor (más parecido) a mayor; `dot` al revés (mayor =
-//! más parecido).
+//! Las distancias **desempaquetan ambos formatos transparentemente** (un f32 y un
+//! int8 se comparan sin problema) y acumulan en `f64`. `cosine_distance` y
+//! `l2_distance` ordenan de menor (más parecido) a mayor; `dot` al revés. El KNN
+//! es `ORDER BY <distancia> LIMIT k` en SQL normal. Cero dependencias. Ver
+//! `docs/13-vectores.md`.
 
 use crate::error::{Error, Result};
 
-/// Empaqueta floats como un BLOB de `f32` little-endian (el constructor `vector()`).
+const TAG_F32: u8 = 0x00;
+const TAG_I8: u8 = 0x01;
+
+/// Empaqueta floats como un BLOB f32 (tag `0x00`). El constructor `vector()`.
 pub fn pack_f32(vals: &[f32]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(vals.len() * 4);
+    let mut out = Vec::with_capacity(1 + vals.len() * 4);
+    out.push(TAG_F32);
     for &v in vals {
         out.extend_from_slice(&v.to_le_bytes());
     }
     out
 }
 
-/// Desempaqueta un BLOB de `f32` little-endian. Error si la longitud no es
-/// múltiplo de 4.
-fn unpack(b: &[u8]) -> Result<Vec<f32>> {
-    if !b.len().is_multiple_of(4) {
-        return Err(Error::InvalidInput(
-            "BLOB de vector con longitud no múltiplo de 4",
-        ));
+/// Empaqueta floats como un BLOB int8 quantizado (tag `0x01`): escala simétrica
+/// `max|v|/127` + cada componente redondeado a int8. El constructor `vector_i8()`.
+pub fn pack_i8(vals: &[f32]) -> Vec<u8> {
+    let max = vals.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
+    let scale = max / 127.0;
+    let mut out = Vec::with_capacity(1 + 4 + vals.len());
+    out.push(TAG_I8);
+    out.extend_from_slice(&scale.to_le_bytes());
+    for &v in vals {
+        let q = if scale > 0.0 {
+            (v / scale).round().clamp(-127.0, 127.0) as i8
+        } else {
+            0
+        };
+        out.push(q as u8);
     }
-    Ok(b.chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-        .collect())
+    out
+}
+
+/// Desempaqueta cualquier formato (f32 o int8) a `Vec<f32>`.
+fn unpack(b: &[u8]) -> Result<Vec<f32>> {
+    match b.split_first() {
+        Some((&TAG_F32, rest)) => {
+            if !rest.len().is_multiple_of(4) {
+                return Err(Error::InvalidInput("BLOB de vector f32 mal formado"));
+            }
+            Ok(rest
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect())
+        }
+        Some((&TAG_I8, rest)) => {
+            let scale_bytes = rest
+                .get(0..4)
+                .ok_or(Error::InvalidInput("BLOB de vector int8 sin escala"))?;
+            let scale = f32::from_le_bytes([
+                scale_bytes[0],
+                scale_bytes[1],
+                scale_bytes[2],
+                scale_bytes[3],
+            ]);
+            Ok(rest[4..].iter().map(|&q| q as i8 as f32 * scale).collect())
+        }
+        _ => Err(Error::InvalidInput("BLOB de vector con tag desconocido")),
+    }
 }
 
 /// Desempaqueta ambos vectores y valida que tengan la misma dimensión.
@@ -137,10 +179,31 @@ mod tests {
             dot(&v(&[1.0, 2.0]), &v(&[1.0])),
             Err(Error::InvalidInput(_))
         ));
-        // 5 bytes no es múltiplo de 4.
+        // tag f32 (0x00) + 2 bytes de payload: no es múltiplo de 4.
         assert!(matches!(
-            l2_distance(&[0u8; 5], &[0u8; 5]),
+            l2_distance(&[0x00, 1, 2], &[0x00, 1, 2]),
             Err(Error::InvalidInput(_))
         ));
+    }
+
+    #[test]
+    fn int8_quantization_roundtrips_and_compares_with_f32() {
+        let vals = [0.9, -0.4, 0.1, 0.5];
+        // El blob int8 es mucho más corto que el f32 (~4× para dim grande).
+        let q = pack_i8(&vals);
+        let f = pack_f32(&vals);
+        assert!(q.len() < f.len());
+        // Desempaqueta aproximando los valores originales.
+        let back = unpack(&q).unwrap();
+        for (a, b) in back.iter().zip(&vals) {
+            assert!((a - b).abs() < 0.02, "{a} vs {b}");
+        }
+        // Distancias cruzadas (un f32 vs un int8) funcionan y son ≈ las exactas.
+        let a = pack_f32(&[1.0, 0.0, 0.0]);
+        let b_f = pack_f32(&[0.9, 0.1, 0.0]);
+        let b_q = pack_i8(&[0.9, 0.1, 0.0]);
+        let exact = cosine_distance(&a, &b_f).unwrap();
+        let approx = cosine_distance(&a, &b_q).unwrap();
+        assert!((exact - approx).abs() < 0.01, "{exact} vs {approx}");
     }
 }

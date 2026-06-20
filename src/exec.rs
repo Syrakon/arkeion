@@ -6055,8 +6055,9 @@ fn call_function(name: &str, args: &[Value]) -> Result<Value> {
             _ => Err(bad_arity()),
         },
         // --- búsqueda vectorial: el vector es un BLOB de f32 (docs/13) ---
-        "vector" => {
-            // Constructor: empaqueta los argumentos numéricos como f32 LE.
+        "vector" | "vector_i8" => {
+            // Constructores: empaquetan los argumentos numéricos como un vector
+            // f32 (`vector`) o int8 quantizado (`vector_i8`, ~4× menos storage).
             let mut vals = Vec::with_capacity(args.len());
             for v in args {
                 match v {
@@ -6066,7 +6067,12 @@ fn call_function(name: &str, args: &[Value]) -> Result<Value> {
                     _ => return Err(need_num(v)),
                 }
             }
-            Ok(Value::Blob(crate::vector::pack_f32(&vals)))
+            let blob = if lname == "vector_i8" {
+                crate::vector::pack_i8(&vals)
+            } else {
+                crate::vector::pack_f32(&vals)
+            };
+            Ok(Value::Blob(blob))
         }
         "cosine_distance" | "l2_distance" | "dot" => match args {
             [Value::Null, _] | [_, Value::Null] => Ok(Value::Null),

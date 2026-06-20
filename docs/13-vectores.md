@@ -82,7 +82,10 @@ normalizados.)*
 - **V1 — KNN exacto** (este corte): `src/vector.rs` (pack/unpack + cosine/l2/dot,
   property-tested) + registro en `call_function` + test de integración KNN por
   SQL. Núcleo algorítmico primero (como `keyenc`/tokenizer).
-- **V2 — quantization** (int8): 4× storage y velocidad de la fuerza bruta.
+- **V2 — quantization int8 (HECHO):** constructor `vector_i8()`; formato con byte
+  de tag (`0x00` f32 / `0x01` int8 = escala + bytes int8); ~4× menos storage. Las
+  distancias desempaquetan ambos formatos transparentemente (query f32 vs
+  almacenado int8 funciona). Cuantización simétrica por vector (`max|v|/127`).
 - **V3 — IVF** (ANN opt-in): centroides k-means como **datos versionados**
   (evento discreto, no muta por-insert), postings por cluster (mismo patrón que el
   FTS), `nprobe` clusters escaneados. Compatible con copy-on-write; HNSW NO.

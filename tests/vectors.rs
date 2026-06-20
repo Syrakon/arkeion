@@ -73,6 +73,28 @@ fn knn_l2_and_dot() {
 }
 
 #[test]
+fn int8_quantized_storage_knn() {
+    let (_d, db) = db();
+    let conn = db.connect().unwrap();
+    conn.execute("CREATE TABLE docs (id INTEGER PRIMARY KEY, emb BLOB)", &[])
+        .unwrap();
+    // Vectores almacenados quantizados (int8) → ~4× menos storage.
+    for vals in ["1.0, 0.0, 0.0", "0.0, 1.0, 0.0", "0.9, 0.1, 0.0"] {
+        conn.execute(
+            &format!("INSERT INTO docs (emb) VALUES (vector_i8({vals}))"),
+            &[],
+        )
+        .unwrap();
+    }
+    // Query f32 contra almacenados int8 (formatos cruzados): mismo orden KNN.
+    let knn = ids_ordered(
+        &conn,
+        "SELECT id FROM docs ORDER BY cosine_distance(emb, vector(1.0, 0.0, 0.0)) LIMIT 2",
+    );
+    assert_eq!(knn, vec![1, 3]);
+}
+
+#[test]
 fn dimension_mismatch_errors() {
     let (_d, db) = db();
     let conn = db.connect().unwrap();

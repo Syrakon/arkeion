@@ -809,11 +809,53 @@ fn candidate_rows(
             return Ok(out);
         }
     }
+    // FTS narrowing: un `MATCH` no negado como conjunto de nivel superior usa el
+    // índice full-text para acotar candidatos (evita el full scan). El WHERE
+    // completo —incluido el propio MATCH— se re-aplica por fila en el caller, así
+    // que basta con devolver un superconjunto exacto.
+    if let Some(m) = where_clause.and_then(find_match_conjunct)
+        && let Expr::Match {
+            column,
+            query,
+            negated,
+        } = m
+        && !*negated
+        && let Expr::Column { name, .. } = column.as_ref()
+        && let Some(local_pos) = def
+            .columns
+            .iter()
+            .position(|c| !c.dropped && c.name == *name)
+        && let Some(fts) = def
+            .fts_indexes
+            .iter()
+            .find(|f| f.columns.contains(&local_pos))
+        && let Value::Text(q_str) = eval_const(query, params)?
+    {
+        let q = crate::fts::parse_query(&q_str)?;
+        let mut out = Vec::new();
+        for rowid in tx.fts_search(def, fts, &q)? {
+            if let Some(row) = tx.get_row(def, rowid)? {
+                out.push((rowid, row));
+            }
+        }
+        return Ok(out);
+    }
     let mut all = Vec::new();
     for item in tx.scan_table(def)? {
         all.push(item?);
     }
     Ok(all)
+}
+
+/// El primer `MATCH` accesible a través de ANDs de nivel superior del WHERE (un
+/// conjunto): se puede usar el índice para acotar. Un `MATCH` bajo `OR`/`NOT` no
+/// aparece aquí ⇒ cae al full scan (el eval per-fila lo resuelve correctamente).
+fn find_match_conjunct(e: &Expr) -> Option<&Expr> {
+    match e {
+        Expr::Match { .. } => Some(e),
+        Expr::Binary(a, BinOp::And, b) => find_match_conjunct(a).or_else(|| find_match_conjunct(b)),
+        _ => None,
+    }
 }
 
 /// Re-parsea los predicados `CHECK` de una tabla (guardados como texto) a `Expr`,

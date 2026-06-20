@@ -17,7 +17,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use sha2::{Digest, Sha256};
 
 use crate::btree::{self, Body, Cursor, NodeSource, NodeStore};
-use crate::catalog::{self, IndexDef, TableDef, TableScan, TableSpec};
+use crate::catalog::{self, FtsIndexDef, IndexDef, TableDef, TableScan, TableSpec};
 use crate::commit::{self, COMMIT_FLAG_CHECKPOINT, CommitHeader, Head};
 use crate::compress::{Compressor, Densa};
 use crate::crypto::Key;
@@ -1938,6 +1938,17 @@ impl WriteTx {
         hi: Option<(&Value, bool)>,
     ) -> Result<Vec<i64>> {
         catalog::index_scan_range(&self.ts, self.data_root, idx, lo, hi)
+    }
+
+    /// rowids que casan una consulta `MATCH` vía el índice full-text (sin full
+    /// scan). El WHERE completo se re-aplica por fila después.
+    pub fn fts_search(
+        &self,
+        def: &TableDef,
+        fts: &FtsIndexDef,
+        query: &crate::fts::Query,
+    ) -> Result<Vec<i64>> {
+        catalog::fts_search(&self.ts, self.data_root, def, fts, query)
     }
 
     pub fn drop_table(&mut self, name: &str) -> Result<bool> {

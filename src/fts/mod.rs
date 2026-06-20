@@ -8,8 +8,10 @@
 //! Estado: Fase 1 (tokenización). El índice invertido, el operador `MATCH`, el
 //! planner y el ranking BM25 llegan en fases siguientes.
 
+mod query;
 mod tokenizer;
 
+pub use query::{Query, parse_query};
 pub use tokenizer::{AsciiTokenizer, Token, Tokenizer, UnicodeTokenizer};
 
 use crate::error::{Error, Result};

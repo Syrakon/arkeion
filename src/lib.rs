@@ -92,6 +92,8 @@ pub mod fts;
 #[doc(hidden)]
 pub mod io;
 #[doc(hidden)]
+pub mod ivf;
+#[doc(hidden)]
 pub mod keyenc;
 #[doc(hidden)]
 pub mod pager;

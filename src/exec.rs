@@ -236,6 +236,10 @@ fn validate_columns(e: &Expr, schema: &QuerySchema) -> Result<()> {
             validate_columns(expr, schema)?;
             validate_columns(pattern, schema)
         }
+        Expr::Match { column, query, .. } => {
+            validate_columns(column, schema)?;
+            validate_columns(query, schema)
+        }
         Expr::Aggregate { arg, .. } => arg
             .as_deref()
             .map_or(Ok(()), |e| validate_columns(e, schema)),
@@ -1410,6 +1414,15 @@ fn subst_expr(
         } => Expr::Like {
             expr: b(expr)?,
             pattern: b(pattern)?,
+            negated: *negated,
+        },
+        Expr::Match {
+            column,
+            query,
+            negated,
+        } => Expr::Match {
+            column: b(column)?,
+            query: b(query)?,
             negated: *negated,
         },
         Expr::Aggregate {
@@ -2606,6 +2619,7 @@ fn expr_has_subquery(e: &Expr) -> bool {
         Expr::Binary(a, _, b) => expr_has_subquery(a) || expr_has_subquery(b),
         Expr::IsNull { expr, .. } => expr_has_subquery(expr),
         Expr::Like { expr, pattern, .. } => expr_has_subquery(expr) || expr_has_subquery(pattern),
+        Expr::Match { column, query, .. } => expr_has_subquery(column) || expr_has_subquery(query),
         Expr::Aggregate { arg, sep, .. } => {
             arg.as_deref().is_some_and(expr_has_subquery)
                 || sep.as_deref().is_some_and(expr_has_subquery)
@@ -2689,6 +2703,9 @@ fn expr_refs_quals(e: &Expr, quals: &HashSet<String>) -> bool {
         Expr::Binary(a, _, b) => expr_refs_quals(a, quals) || expr_refs_quals(b, quals),
         Expr::Like { expr, pattern, .. } => {
             expr_refs_quals(expr, quals) || expr_refs_quals(pattern, quals)
+        }
+        Expr::Match { column, query, .. } => {
+            expr_refs_quals(column, quals) || expr_refs_quals(query, quals)
         }
         Expr::Aggregate { arg, sep, .. } => {
             arg.as_deref().is_some_and(|x| expr_refs_quals(x, quals))
@@ -2842,6 +2859,15 @@ fn resolve_expr(
             pattern: boxed(pattern)?,
             negated: *negated,
         },
+        Expr::Match {
+            column,
+            query,
+            negated,
+        } => Expr::Match {
+            column: boxed(column)?,
+            query: boxed(query)?,
+            negated: *negated,
+        },
         Expr::Aggregate {
             func,
             arg,
@@ -2930,6 +2956,15 @@ fn subst_outer_expr(e: &Expr, schema: &QuerySchema, row: &[Value]) -> Result<Exp
         } => Expr::Like {
             expr: b(expr)?,
             pattern: b(pattern)?,
+            negated: *negated,
+        },
+        Expr::Match {
+            column,
+            query,
+            negated,
+        } => Expr::Match {
+            column: b(column)?,
+            query: b(query)?,
             negated: *negated,
         },
         Expr::Aggregate {
@@ -3087,6 +3122,15 @@ fn resolve_correlated_expr(
         } => Expr::Like {
             expr: b(expr)?,
             pattern: b(pattern)?,
+            negated: *negated,
+        },
+        Expr::Match {
+            column,
+            query,
+            negated,
+        } => Expr::Match {
+            column: b(column)?,
+            query: b(query)?,
             negated: *negated,
         },
         Expr::Aggregate {
@@ -3624,6 +3668,9 @@ fn col_outside_agg(e: &Expr) -> Option<&str> {
         Expr::Like { expr, pattern, .. } => {
             col_outside_agg(expr).or_else(|| col_outside_agg(pattern))
         }
+        Expr::Match { column, query, .. } => {
+            col_outside_agg(column).or_else(|| col_outside_agg(query))
+        }
         Expr::Function { args, .. } => args.iter().find_map(col_outside_agg),
         Expr::In { expr, list, .. } => {
             col_outside_agg(expr).or_else(|| list.iter().find_map(col_outside_agg))
@@ -3669,6 +3716,10 @@ fn collect_columns(e: &Expr, skip_agg: bool, out: &mut Vec<ColRef>) {
         Expr::Like { expr, pattern, .. } => {
             collect_columns(expr, skip_agg, out);
             collect_columns(pattern, skip_agg, out);
+        }
+        Expr::Match { column, query, .. } => {
+            collect_columns(column, skip_agg, out);
+            collect_columns(query, skip_agg, out);
         }
         Expr::Aggregate { arg, .. } => {
             if !skip_agg && let Some(a) = arg {
@@ -4451,6 +4502,15 @@ fn fold_aggregates(
             pattern: Box::new(fold_aggregates(pattern, schema, rows, params)?),
             negated: *negated,
         },
+        Expr::Match {
+            column,
+            query,
+            negated,
+        } => Expr::Match {
+            column: Box::new(fold_aggregates(column, schema, rows, params)?),
+            query: Box::new(fold_aggregates(query, schema, rows, params)?),
+            negated: *negated,
+        },
         Expr::Function { name, args } => Expr::Function {
             name: name.clone(),
             args: args
@@ -4692,6 +4752,10 @@ fn eval(e: &Expr, row: Option<(&QuerySchema, &[Value])>, params: &[Value]) -> Re
             let is_null = matches!(eval(expr, row, params)?, Value::Null);
             Ok(Value::Bool(is_null != *negated))
         }
+        Expr::Match { .. } => Err(sql_err(
+            "MATCH se resuelve vía el índice FTS; aún no es ejecutable por fila (fase 4)"
+                .to_string(),
+        )),
         Expr::Like {
             expr,
             pattern,

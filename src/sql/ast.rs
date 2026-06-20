@@ -368,6 +368,14 @@ pub enum Expr {
         pattern: Box<Expr>,
         negated: bool,
     },
+    /// `columna MATCH 'consulta'` (full-text). `column` referencia una columna
+    /// indexada con `CREATE FULLTEXT INDEX`; `query` es el texto del
+    /// mini-lenguaje de consulta FTS. Ver `docs/12-fts.md`.
+    Match {
+        column: Box<Expr>,
+        query: Box<Expr>,
+        negated: bool,
+    },
     /// `arg = None` solo para `COUNT(*)`. `distinct` para `COUNT(DISTINCT x)` etc.
     /// `sep` solo lo usa `GROUP_CONCAT(x, sep)` (separador constante).
     Aggregate {
@@ -487,6 +495,7 @@ impl Expr {
             Expr::Binary(a, _, b) => a.is_const() && b.is_const(),
             Expr::IsNull { expr, .. } => expr.is_const(),
             Expr::Like { expr, pattern, .. } => expr.is_const() && pattern.is_const(),
+            Expr::Match { column, query, .. } => column.is_const() && query.is_const(),
             Expr::Function { args, .. } => args.iter().all(Expr::is_const),
             Expr::In { expr, list, .. } => expr.is_const() && list.iter().all(Expr::is_const),
             Expr::Cast { expr, .. } => expr.is_const(),
@@ -515,6 +524,7 @@ impl Expr {
             Expr::Binary(a, _, b) => a.contains_param() || b.contains_param(),
             Expr::IsNull { expr, .. } => expr.contains_param(),
             Expr::Like { expr, pattern, .. } => expr.contains_param() || pattern.contains_param(),
+            Expr::Match { column, query, .. } => column.contains_param() || query.contains_param(),
             Expr::Aggregate { arg, .. } => arg.as_ref().is_some_and(|e| e.contains_param()),
             Expr::Function { args, .. } => args.iter().any(Expr::contains_param),
             Expr::In { expr, list, .. } => {
@@ -551,6 +561,7 @@ impl Expr {
             Expr::Binary(a, _, b) => a.has_aggregate() || b.has_aggregate(),
             Expr::IsNull { expr, .. } => expr.has_aggregate(),
             Expr::Like { expr, pattern, .. } => expr.has_aggregate() || pattern.has_aggregate(),
+            Expr::Match { column, query, .. } => column.has_aggregate() || query.has_aggregate(),
             Expr::Function { args, .. } => args.iter().any(Expr::has_aggregate),
             Expr::In { expr, list, .. } => {
                 expr.has_aggregate() || list.iter().any(Expr::has_aggregate)
@@ -583,6 +594,7 @@ impl Expr {
             Expr::Binary(a, _, b) => a.has_window() || b.has_window(),
             Expr::IsNull { expr, .. } => expr.has_window(),
             Expr::Like { expr, pattern, .. } => expr.has_window() || pattern.has_window(),
+            Expr::Match { column, query, .. } => column.has_window() || query.has_window(),
             Expr::Aggregate { arg, .. } => arg.as_ref().is_some_and(|e| e.has_window()),
             Expr::Function { args, .. } => args.iter().any(Expr::has_window),
             Expr::In { expr, list, .. } => expr.has_window() || list.iter().any(Expr::has_window),

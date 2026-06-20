@@ -100,6 +100,31 @@ fn bulk_insert_maintains_fts() {
 }
 
 #[test]
+fn match_is_a_clean_error_until_phase4() {
+    let (_d, db) = db();
+    let conn = db.connect().unwrap();
+    conn.execute("CREATE TABLE mail (id INTEGER PRIMARY KEY, body TEXT)", &[])
+        .unwrap();
+    conn.execute("CREATE FULLTEXT INDEX f ON mail (body)", &[])
+        .unwrap();
+    conn.execute(
+        "INSERT INTO mail (body) VALUES (?1)",
+        &params!["hola mundo"],
+    )
+    .unwrap();
+    // MATCH parsea y se evalúa con un error SQL controlado (no pánico ni datos
+    // incorrectos) hasta que llegue la ejecución por índice (fase 4).
+    let err = match conn.query("SELECT id FROM mail WHERE body MATCH 'mundo'", &[]) {
+        Err(e) => e,
+        Ok(rows) => rows
+            .map(|r| r.map(|_| ()))
+            .collect::<Result<Vec<()>, _>>()
+            .expect_err("MATCH debería fallar de forma controlada"),
+    };
+    assert!(matches!(err, Error::Sql { .. }));
+}
+
+#[test]
 fn fulltext_errors() {
     let (_d, db) = db();
     let conn = db.connect().unwrap();

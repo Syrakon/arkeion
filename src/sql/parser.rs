@@ -1305,6 +1305,24 @@ impl<'a> Parser<'a> {
                 negated: false,
             });
         }
+        // [NOT] MATCH (full-text): `columna MATCH 'consulta'`.
+        if self.peek() == Some(&Tok::Kw(Kw::Not)) && self.peek2() == Some(&Tok::Kw(Kw::Match)) {
+            self.i += 2;
+            let query = self.add_expr()?;
+            return Ok(Expr::Match {
+                column: Box::new(left),
+                query: Box::new(query),
+                negated: true,
+            });
+        }
+        if self.eat_kw(Kw::Match) {
+            let query = self.add_expr()?;
+            return Ok(Expr::Match {
+                column: Box::new(left),
+                query: Box::new(query),
+                negated: false,
+            });
+        }
         // [NOT] IN (v1, v2, …)
         let neg_in =
             self.peek() == Some(&Tok::Kw(Kw::Not)) && self.peek2() == Some(&Tok::Kw(Kw::In));
@@ -1719,6 +1737,43 @@ mod tests {
             parse("DROP INDEX i").unwrap(),
             Stmt::DropIndex { .. }
         ));
+    }
+
+    #[test]
+    fn match_operator_parses() {
+        let Stmt::Select(s) = parse("SELECT id FROM mail WHERE body MATCH 'foo bar'").unwrap()
+        else {
+            panic!("se esperaba SELECT")
+        };
+        let Some(Expr::Match {
+            column,
+            query,
+            negated,
+        }) = s.where_clause
+        else {
+            panic!("se esperaba Expr::Match en el WHERE")
+        };
+        assert!(!negated);
+        assert_eq!(
+            *column,
+            Expr::Column {
+                table: None,
+                name: "body".into()
+            }
+        );
+        assert_eq!(*query, Expr::Literal(Value::Text("foo bar".into())));
+    }
+
+    #[test]
+    fn not_match_parses() {
+        let Stmt::Select(s) = parse("SELECT id FROM mail WHERE body NOT MATCH 'spam'").unwrap()
+        else {
+            panic!("se esperaba SELECT")
+        };
+        let Some(Expr::Match { negated, .. }) = s.where_clause else {
+            panic!("se esperaba Expr::Match")
+        };
+        assert!(negated);
     }
 
     #[test]

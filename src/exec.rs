@@ -696,6 +696,12 @@ pub fn run_execute(tx: &mut WriteTx, stmt: &Stmt, params: &[Value]) -> Result<us
             }
             Ok(0)
         }
+        Stmt::RebuildVectorIndex { name } => {
+            if !tx.rebuild_vector_index(name)? {
+                return Err(sql_err(format!("índice vectorial desconocido: {name}")));
+            }
+            Ok(0)
+        }
         Stmt::Insert {
             table,
             columns,

@@ -1983,6 +1983,15 @@ impl WriteTx {
         Ok(dropped)
     }
 
+    /// Reconstruye un índice vectorial (re-entrena centroides + re-asigna filas).
+    /// `false` si no existe.
+    pub fn rebuild_vector_index(&mut self, name: &str) -> Result<bool> {
+        self.schema_cache.clear();
+        let (root, rebuilt) = catalog::rebuild_vector_index(&mut self.ts, self.data_root, name)?;
+        self.data_root = root;
+        Ok(rebuilt)
+    }
+
     /// `true` si existe un índice vectorial con ese nombre (para `IF NOT EXISTS`).
     pub fn vector_index_exists(&self, name: &str) -> Result<bool> {
         catalog::vector_index_exists(&self.ts, self.data_root, name)

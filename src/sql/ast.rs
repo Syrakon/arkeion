@@ -111,6 +111,11 @@ pub enum Stmt {
         if_exists: bool,
         name: String,
     },
+    /// `REBUILD VECTOR INDEX nombre`: re-entrena los centroides sobre los datos
+    /// actuales y re-asigna las filas (refresca el clustering tras muchos INSERT).
+    RebuildVectorIndex {
+        name: String,
+    },
     Insert {
         table: String,
         columns: Option<Vec<String>>,

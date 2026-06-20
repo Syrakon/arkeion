@@ -87,14 +87,20 @@ normalizados.)*
   distancias desempaquetan ambos formatos transparentemente (query f32 vs
   almacenado int8 funciona). Cuantización simétrica por vector (`max|v|/127`).
 - **V3 — IVF (ANN) — HECHO y usable por SQL.** `CREATE VECTOR INDEX vi ON docs(emb)
-  [USING cosine|l2] [LISTS k]` entrena k-means (núcleo `src/ivf.rs`), persiste
-  centroides + postings por cluster en keyspace `0x04` (esquema catálogo v9),
-  mantiene el índice en insert/update/delete/bulk. El planner enruta
+  [USING cosine|l2] [LISTS k] [PROBES p]` entrena k-means (núcleo `src/ivf.rs`),
+  persiste centroides + postings por cluster en keyspace `0x04` (esquema catálogo
+  v9), mantiene el índice en insert/update/delete/bulk. El planner enruta
   `ORDER BY cosine_distance(col, ?) LIMIT k` (sin WHERE) al índice: escanea
-  `nprobe` clusters (~10% por defecto) y el `ORDER BY`/`LIMIT` rankea exacto los
-  candidatos. Centroides como datos versionados (evento discreto, no muta
-  por-insert) ⇒ compatible con copy-on-write; HNSW NO. **Pendiente:** `nprobe`
-  configurable, `REBUILD`, métrica en el plan vs híbrido.
+  `nprobe` clusters y el `ORDER BY`/`LIMIT` rankea exacto los candidatos. `PROBES p`
+  fija nprobe por índice (recall vs velocidad; por defecto `ceil(lists/10)`, mín 1),
+  serializado en el bloque vectorial v9. `REBUILD VECTOR INDEX vi` re-entrena los
+  centroides sobre los datos ACTUALES y re-asigna las filas: el hook de insert mete
+  cada fila nueva en el centroide viejo más cercano sin re-particionar, así que tras
+  muchas altas el clustering se degrada y REBUILD lo refresca (conserva vidx_id,
+  lists, metric y nprobe; comparte el núcleo `build_vector_clusters` con CREATE).
+  Centroides como datos versionados (evento discreto, no muta por-insert) ⇒
+  compatible con copy-on-write; HNSW NO. **Pendiente:** métrica en el plan vs
+  híbrido.
 
 ## Decisiones
 

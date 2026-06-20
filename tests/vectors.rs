@@ -217,6 +217,59 @@ fn probes_controls_recall() {
 }
 
 #[test]
+fn rebuild_refreshes_the_index() {
+    let (_d, db) = db();
+    let conn = db.connect().unwrap();
+    conn.execute("CREATE TABLE docs (id INTEGER PRIMARY KEY, emb BLOB)", &[])
+        .unwrap();
+    // Construye el índice cuando SOLO existe el cluster A (cerca de (1,0)): k-means
+    // coloca ambos centroides dentro de A.
+    for vals in ["1.0, 0.0", "0.95, 0.05", "0.9, 0.1"] {
+        conn.execute(
+            &format!("INSERT INTO docs (emb) VALUES (vector({vals}))"),
+            &[],
+        )
+        .unwrap();
+    }
+    conn.execute(
+        "CREATE VECTOR INDEX vi ON docs (emb) USING cosine LISTS 2",
+        &[],
+    )
+    .unwrap();
+    // Llegan filas de un cluster B nuevo (cerca de (0,1)); el hook las asigna al
+    // centroide viejo más cercano, sin re-particionar (clustering degradado).
+    for vals in ["0.0, 1.0", "0.05, 0.95", "0.1, 0.9"] {
+        conn.execute(
+            &format!("INSERT INTO docs (emb) VALUES (vector({vals}))"),
+            &[],
+        )
+        .unwrap();
+    }
+    // REBUILD re-entrena sobre las 6 filas: ahora un centroide cubre B de verdad.
+    conn.execute("REBUILD VECTOR INDEX vi", &[]).unwrap();
+    // Una consulta dentro de B alcanza a sus 3 vecinos exactos (rowids 4-6) por el
+    // índice, con el idéntico (rowid 4) primero.
+    let knn = ids_ordered(
+        &conn,
+        "SELECT id FROM docs ORDER BY cosine_distance(emb, vector(0.0, 1.0)) LIMIT 3",
+    );
+    assert_eq!(knn[0], 4, "el vecino exacto va primero");
+    let mut sorted = knn.clone();
+    sorted.sort_unstable();
+    assert_eq!(
+        sorted,
+        vec![4, 5, 6],
+        "tras REBUILD el cluster B es alcanzable"
+    );
+    // REBUILD es idempotente; sobre un índice inexistente es error controlado.
+    conn.execute("REBUILD VECTOR INDEX vi", &[]).unwrap();
+    assert!(matches!(
+        conn.execute("REBUILD VECTOR INDEX nope", &[]),
+        Err(Error::Sql { .. })
+    ));
+}
+
+#[test]
 fn vector_index_errors() {
     let (_d, db) = db();
     let conn = db.connect().unwrap();

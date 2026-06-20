@@ -2729,6 +2729,60 @@ fn row_vector(record: &[Value], column: usize, metric: VectorMetric) -> Result<O
     }
 }
 
+/// Núcleo de construcción IVF, compartido por crear y reconstruir: escanea los
+/// vectores no-NULL de la columna, entrena k-means, asigna cada fila a su cluster
+/// y persiste centroides + postings bajo `vidx_id`. Devuelve la dimensión.
+fn build_vector_clusters<S: NodeStore>(
+    s: &mut S,
+    mut root: PageId,
+    def: &TableDef,
+    column: usize,
+    lists: u16,
+    metric: VectorMetric,
+    vidx_id: u32,
+) -> Result<(PageId, u32)> {
+    // Vectores existentes (filas con vector no-NULL de la misma dimensión).
+    let mut vectors: Vec<Vec<f32>> = Vec::new();
+    let mut rowids: Vec<i64> = Vec::new();
+    let mut dim = 0usize;
+    for item in scan_table(s, root, def)? {
+        let (rowid, values) = item?;
+        if let Some(v) = row_vector(&values, column, metric)? {
+            if vectors.is_empty() {
+                dim = v.len();
+            } else if v.len() != dim {
+                return Err(Error::InvalidInput(
+                    "vectores de distinta dimensión en la columna",
+                ));
+            }
+            vectors.push(v);
+            rowids.push(rowid);
+        }
+    }
+    // Núcleo IVF: entrena los centroides y asigna cada vector a su cluster.
+    let centroids = crate::ivf::train(&vectors, lists as usize, 25);
+    let assignments = crate::ivf::assign(&vectors, &centroids);
+    for (cid, c) in centroids.iter().enumerate() {
+        root = btree::insert(
+            s,
+            root,
+            &vec_centroid_key(vidx_id, cid as u16),
+            &crate::vector::pack_f32(c),
+        )?;
+    }
+    for (cid, members) in assignments.iter().enumerate() {
+        for &i in members {
+            root = btree::insert(
+                s,
+                root,
+                &vec_posting_key(vidx_id, cid as u16, rowids[i]),
+                &[],
+            )?;
+        }
+    }
+    Ok((root, dim as u32))
+}
+
 /// Construye un índice vectorial IVF: entrena k-means sobre los vectores
 /// existentes (un evento discreto, determinista), asigna cada fila a su cluster y
 /// persiste centroides + postings.
@@ -2766,53 +2820,15 @@ pub fn create_vector_index<S: NodeStore>(
             "ya existe un índice vectorial con ese nombre",
         ));
     }
-    // Vectores existentes (filas con vector no-NULL de la misma dimensión).
-    let mut vectors: Vec<Vec<f32>> = Vec::new();
-    let mut rowids: Vec<i64> = Vec::new();
-    let mut dim = 0usize;
-    for item in scan_table(s, root, &def)? {
-        let (rowid, values) = item?;
-        if let Some(v) = row_vector(&values, column, metric)? {
-            if vectors.is_empty() {
-                dim = v.len();
-            } else if v.len() != dim {
-                return Err(Error::InvalidInput(
-                    "vectores de distinta dimensión en la columna",
-                ));
-            }
-            vectors.push(v);
-            rowids.push(rowid);
-        }
-    }
-    let (vidx_id, mut root) = alloc_vidx_id(s, root)?;
-    // Núcleo IVF: entrena los centroides y asigna cada vector a su cluster.
-    let centroids = crate::ivf::train(&vectors, lists as usize, 25);
-    let assignments = crate::ivf::assign(&vectors, &centroids);
-    for (cid, c) in centroids.iter().enumerate() {
-        root = btree::insert(
-            s,
-            root,
-            &vec_centroid_key(vidx_id, cid as u16),
-            &crate::vector::pack_f32(c),
-        )?;
-    }
-    for (cid, members) in assignments.iter().enumerate() {
-        for &i in members {
-            root = btree::insert(
-                s,
-                root,
-                &vec_posting_key(vidx_id, cid as u16, rowids[i]),
-                &[],
-            )?;
-        }
-    }
+    let (vidx_id, root) = alloc_vidx_id(s, root)?;
+    let (mut root, dim) = build_vector_clusters(s, root, &def, column, lists, metric, vidx_id)?;
     let idx = VectorIndexDef {
         name: index_name.to_owned(),
         vidx_id,
         column,
         lists,
         metric,
-        dim: dim as u32,
+        dim,
         nprobe: nprobe.max(1),
     };
     root = btree::insert(s, root, &vector_ref_key(index_name), table_name.as_bytes())?;
@@ -2855,6 +2871,59 @@ pub fn drop_vector_index<S: NodeStore>(
         (root, _) = btree::delete(s, root, &k)?;
     }
     (root, _) = btree::delete(s, root, &vector_ref_key(index_name))?;
+    root = btree::insert(s, root, &table_key(&table_name), &encode_def(&def))?;
+    Ok((root, true))
+}
+
+/// Reconstruye un índice vectorial IVF: re-entrena los centroides sobre los datos
+/// ACTUALES y re-asigna cada fila. Tras muchos INSERT (que caen en el centroide
+/// viejo más cercano) el clustering se degrada; REBUILD lo refresca. Conserva
+/// `vidx_id`, `lists`, `metric` y `nprobe`; solo rehace centroides + postings y la
+/// dimensión. `false` si el índice no existe.
+pub fn rebuild_vector_index<S: NodeStore>(
+    s: &mut S,
+    root: PageId,
+    index_name: &str,
+) -> Result<(PageId, bool)> {
+    let Some(table_bytes) = btree::get(s, root, &vector_ref_key(index_name))? else {
+        return Ok((root, false));
+    };
+    let table_name = String::from_utf8(table_bytes)
+        .map_err(|_| Error::CorruptRecord("ref vectorial no UTF-8"))?;
+    let mut def = get_table(s, root, &table_name)?
+        .ok_or(Error::CorruptRecord("índice vectorial sin su tabla"))?;
+    let Some(pos) = def.vector_indexes.iter().position(|i| i.name == index_name) else {
+        return Err(Error::CorruptRecord(
+            "ref vectorial sin entrada en el esquema",
+        ));
+    };
+    let vidx = def.vector_indexes[pos].clone();
+    // 1. Borra los centroides + postings viejos del vidx_id (ref y def se conservan).
+    let prefix = vidx_prefix(vidx.vidx_id);
+    let mut keys = Vec::new();
+    for item in btree::scan_from(s, root, &prefix)? {
+        let (k, _) = item?;
+        if !k.starts_with(&prefix) {
+            break;
+        }
+        keys.push(k);
+    }
+    let mut root = root;
+    for k in keys {
+        (root, _) = btree::delete(s, root, &k)?;
+    }
+    // 2. Re-entrena k-means y re-escribe centroides + postings sobre los datos actuales.
+    let (mut root, dim) = build_vector_clusters(
+        s,
+        root,
+        &def,
+        vidx.column,
+        vidx.lists,
+        vidx.metric,
+        vidx.vidx_id,
+    )?;
+    // 3. Refresca la dimensión (por si los datos cambiaron) y persiste el esquema.
+    def.vector_indexes[pos].dim = dim;
     root = btree::insert(s, root, &table_key(&table_name), &encode_def(&def))?;
     Ok((root, true))
 }

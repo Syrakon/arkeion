@@ -171,6 +171,7 @@ impl<'a> Parser<'a> {
             Some(Tok::Kw(Kw::Create)) => self.create(),
             Some(Tok::Kw(Kw::Alter)) => self.alter_table(),
             Some(Tok::Kw(Kw::Drop)) => self.drop(),
+            Some(Tok::Kw(Kw::Rebuild)) => self.rebuild_vector_index(),
             Some(Tok::Kw(Kw::Insert)) => self.insert(),
             Some(Tok::Kw(Kw::Select)) => Ok(Stmt::Select(self.select()?)),
             Some(Tok::Kw(Kw::Update)) => self.update(),
@@ -580,6 +581,15 @@ impl<'a> Parser<'a> {
         let if_exists = self.if_exists()?;
         let name = self.ident("un nombre de índice")?;
         Ok(Stmt::DropVectorIndex { if_exists, name })
+    }
+
+    /// `REBUILD VECTOR INDEX nombre`.
+    fn rebuild_vector_index(&mut self) -> Result<Stmt> {
+        self.expect_kw(Kw::Rebuild, "REBUILD")?;
+        self.expect_kw(Kw::Vector, "VECTOR")?;
+        self.expect_kw(Kw::Index, "INDEX")?;
+        let name = self.ident("un nombre de índice")?;
+        Ok(Stmt::RebuildVectorIndex { name })
     }
 
     fn alter_table(&mut self) -> Result<Stmt> {

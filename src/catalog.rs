@@ -35,6 +35,9 @@ const KS_INDEX: u8 = 0x02;
 // Índices full-text: postings y stats, todo bajo `[0x03, fts_id BE]` (un solo
 // prefijo por índice ⇒ DROP en una pasada). Disjunto de 0x00/0x02 y de las filas.
 const KS_FTS: u8 = 0x03;
+// Índices vectoriales (IVF): centroides y postings por cluster, bajo
+// `[0x04, vidx_id BE]` (un prefijo por índice ⇒ DROP en una pasada).
+const KS_VECTOR: u8 = 0x04;
 const CAT_META: u8 = 0x00;
 const CAT_TABLE: u8 = 0x01;
 const CAT_COUNTER: u8 = 0x02;
@@ -44,11 +47,16 @@ const CAT_VIEW: u8 = 0x05;
 const CAT_TRIGGER: u8 = 0x06;
 const CAT_FTS_COUNTER: u8 = 0x07;
 const CAT_FTS_REF: u8 = 0x08;
+const CAT_VECTOR_COUNTER: u8 = 0x09;
+const CAT_VECTOR_REF: u8 = 0x0A;
 // Sub-tipos dentro de un índice FTS, tras `[0x03, fts_id BE]`:
 const FTS_POSTING: u8 = 0x00; // ‖ term ‖ rowid BE ‖ field ‖ pos varint → vacío
 const FTS_DOCLEN: u8 = 0x01; // ‖ rowid BE → nº de tokens del doc (varint)
 const FTS_GLOBAL: u8 = 0x02; // → {N docs, Σ tokens} (dos varints) para avgdl
 const FTS_DF: u8 = 0x03; // ‖ term → nº de docs con el término (varint)
+// Sub-tipos dentro de un índice vectorial, tras `[0x04, vidx_id BE]`:
+const VEC_CENTROID: u8 = 0x00; // ‖ centroid_id BE(2) → vector f32 del centroide
+const VEC_POSTING: u8 = 0x01; // ‖ centroid_id BE(2) ‖ rowid BE(8) → vacío
 
 /// v2: el esquema serializado incluye la lista de índices de la tabla.
 // v3 añade el orden lógico de columnas (reorden de presentación) al final del
@@ -2640,6 +2648,270 @@ pub fn fts_row_matches(
     eval_doc(query, &doc, &columns, tk.as_ref(), None)
 }
 
+// --- índices vectoriales IVF: centroides + postings por cluster (docs/13) ---
+
+fn vector_counter_key() -> [u8; 2] {
+    [KS_CATALOG, CAT_VECTOR_COUNTER]
+}
+
+fn vector_ref_key(name: &str) -> Vec<u8> {
+    let mut k = Vec::with_capacity(2 + name.len());
+    k.extend_from_slice(&[KS_CATALOG, CAT_VECTOR_REF]);
+    k.extend_from_slice(name.as_bytes());
+    k
+}
+
+/// `[0x04, vidx_id BE]` — prefijo de TODO el índice vectorial.
+fn vidx_prefix(vidx_id: u32) -> [u8; 5] {
+    let mut p = [0u8; 5];
+    p[0] = KS_VECTOR;
+    p[1..5].copy_from_slice(&vidx_id.to_be_bytes());
+    p
+}
+
+fn vec_centroid_key(vidx_id: u32, cid: u16) -> Vec<u8> {
+    let mut k = vidx_prefix(vidx_id).to_vec();
+    k.push(VEC_CENTROID);
+    k.extend_from_slice(&cid.to_be_bytes());
+    k
+}
+
+/// Prefijo `[0x04, vidx_id, 0x01, cid]` de los postings de un cluster.
+fn vec_cluster_prefix(vidx_id: u32, cid: u16) -> Vec<u8> {
+    let mut k = vidx_prefix(vidx_id).to_vec();
+    k.push(VEC_POSTING);
+    k.extend_from_slice(&cid.to_be_bytes());
+    k
+}
+
+fn vec_posting_key(vidx_id: u32, cid: u16, rowid: i64) -> Vec<u8> {
+    let mut k = vec_cluster_prefix(vidx_id, cid);
+    k.extend_from_slice(&record::rowid_be(rowid));
+    k
+}
+
+fn alloc_vidx_id<S: NodeStore>(s: &mut S, root: PageId) -> Result<(u32, PageId)> {
+    let next = match btree::get(s, root, &vector_counter_key())? {
+        Some(v) => u32::from_le_bytes(
+            v.as_slice()
+                .try_into()
+                .map_err(|_| Error::CorruptRecord("contador vectorial"))?,
+        ),
+        None => 1,
+    };
+    let root = btree::insert(s, root, &vector_counter_key(), &(next + 1).to_le_bytes())?;
+    Ok((next, root))
+}
+
+fn vec_l2_sq(a: &[f32], b: &[f32]) -> f32 {
+    a.iter().zip(b).map(|(&x, &y)| (x - y) * (x - y)).sum()
+}
+
+/// Vector f32 de la columna indexada de una fila; `None` si NULL/no-blob.
+/// Normalizado si la métrica es coseno (entonces L2 ordena como coseno).
+fn row_vector(record: &[Value], column: usize, metric: VectorMetric) -> Result<Option<Vec<f32>>> {
+    match record.get(column) {
+        Some(Value::Blob(b)) => {
+            let v = crate::vector::to_f32(b)?;
+            Ok(Some(if metric == VectorMetric::Cosine {
+                crate::vector::normalize(&v)
+            } else {
+                v
+            }))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// Construye un índice vectorial IVF: entrena k-means sobre los vectores
+/// existentes (un evento discreto, determinista), asigna cada fila a su cluster y
+/// persiste centroides + postings.
+pub fn create_vector_index<S: NodeStore>(
+    s: &mut S,
+    root: PageId,
+    table_name: &str,
+    index_name: &str,
+    column: usize,
+    lists: u16,
+    metric: VectorMetric,
+) -> Result<PageId> {
+    validate_name(
+        index_name,
+        "nombre de índice vectorial vacío o de más de 128 bytes",
+    )?;
+    let mut def = get_table(s, root, table_name)?.ok_or(Error::Constraint("tabla desconocida"))?;
+    if column >= def.columns.len() {
+        return Err(Error::InvalidInput(
+            "columna de índice vectorial inexistente",
+        ));
+    }
+    if !matches!(def.columns[column].col_type, ColType::Blob) {
+        return Err(Error::InvalidInput(
+            "un índice vectorial requiere una columna BLOB",
+        ));
+    }
+    if lists == 0 {
+        return Err(Error::InvalidInput("lists debe ser mayor que 0"));
+    }
+    if btree::get(s, root, &vector_ref_key(index_name))?.is_some() {
+        return Err(Error::Constraint(
+            "ya existe un índice vectorial con ese nombre",
+        ));
+    }
+    // Vectores existentes (filas con vector no-NULL de la misma dimensión).
+    let mut vectors: Vec<Vec<f32>> = Vec::new();
+    let mut rowids: Vec<i64> = Vec::new();
+    let mut dim = 0usize;
+    for item in scan_table(s, root, &def)? {
+        let (rowid, values) = item?;
+        if let Some(v) = row_vector(&values, column, metric)? {
+            if vectors.is_empty() {
+                dim = v.len();
+            } else if v.len() != dim {
+                return Err(Error::InvalidInput(
+                    "vectores de distinta dimensión en la columna",
+                ));
+            }
+            vectors.push(v);
+            rowids.push(rowid);
+        }
+    }
+    let (vidx_id, mut root) = alloc_vidx_id(s, root)?;
+    // Núcleo IVF: entrena los centroides y asigna cada vector a su cluster.
+    let centroids = crate::ivf::train(&vectors, lists as usize, 25);
+    let assignments = crate::ivf::assign(&vectors, &centroids);
+    for (cid, c) in centroids.iter().enumerate() {
+        root = btree::insert(
+            s,
+            root,
+            &vec_centroid_key(vidx_id, cid as u16),
+            &crate::vector::pack_f32(c),
+        )?;
+    }
+    for (cid, members) in assignments.iter().enumerate() {
+        for &i in members {
+            root = btree::insert(
+                s,
+                root,
+                &vec_posting_key(vidx_id, cid as u16, rowids[i]),
+                &[],
+            )?;
+        }
+    }
+    let idx = VectorIndexDef {
+        name: index_name.to_owned(),
+        vidx_id,
+        column,
+        lists,
+        metric,
+        dim: dim as u32,
+    };
+    root = btree::insert(s, root, &vector_ref_key(index_name), table_name.as_bytes())?;
+    def.vector_indexes.push(idx);
+    root = btree::insert(s, root, &table_key(table_name), &encode_def(&def))?;
+    Ok(root)
+}
+
+/// Borra un índice vectorial por su nombre global: todas sus claves
+/// (`[0x04, vidx_id]`), su ref y su entrada en el esquema. `false` si no existía.
+pub fn drop_vector_index<S: NodeStore>(
+    s: &mut S,
+    root: PageId,
+    index_name: &str,
+) -> Result<(PageId, bool)> {
+    let Some(table_bytes) = btree::get(s, root, &vector_ref_key(index_name))? else {
+        return Ok((root, false));
+    };
+    let table_name = String::from_utf8(table_bytes)
+        .map_err(|_| Error::CorruptRecord("ref vectorial no UTF-8"))?;
+    let mut def = get_table(s, root, &table_name)?
+        .ok_or(Error::CorruptRecord("índice vectorial sin su tabla"))?;
+    let Some(pos) = def.vector_indexes.iter().position(|i| i.name == index_name) else {
+        return Err(Error::CorruptRecord(
+            "ref vectorial sin entrada en el esquema",
+        ));
+    };
+    let idx = def.vector_indexes.remove(pos);
+    let prefix = vidx_prefix(idx.vidx_id);
+    let mut keys = Vec::new();
+    for item in btree::scan_from(s, root, &prefix)? {
+        let (k, _) = item?;
+        if !k.starts_with(&prefix) {
+            break;
+        }
+        keys.push(k);
+    }
+    let mut root = root;
+    for k in keys {
+        (root, _) = btree::delete(s, root, &k)?;
+    }
+    (root, _) = btree::delete(s, root, &vector_ref_key(index_name))?;
+    root = btree::insert(s, root, &table_key(&table_name), &encode_def(&def))?;
+    Ok((root, true))
+}
+
+/// `true` si existe un índice vectorial con ese nombre global.
+pub fn vector_index_exists<S: NodeSource>(src: &S, root: PageId, name: &str) -> Result<bool> {
+    Ok(btree::get(src, root, &vector_ref_key(name))?.is_some())
+}
+
+/// Centroides del índice, ordenados por `cid`.
+fn read_centroids<S: NodeSource>(src: &S, root: PageId, vidx_id: u32) -> Result<Vec<Vec<f32>>> {
+    let mut prefix = vidx_prefix(vidx_id).to_vec();
+    prefix.push(VEC_CENTROID);
+    let mut cents = Vec::new();
+    for item in btree::scan_from(src, root, &prefix)? {
+        let (k, v) = item?;
+        if !k.starts_with(&prefix) {
+            break;
+        }
+        cents.push(crate::vector::to_f32(&v)?);
+    }
+    Ok(cents)
+}
+
+/// rowids candidatos de los `nprobe` clusters más cercanos a `query_raw` (ANN). El
+/// planner los trae y rankea exacto. `query_raw` es el vector crudo de la query
+/// (se normaliza aquí si la métrica es coseno, igual que al construir).
+pub fn vector_search<S: NodeSource>(
+    src: &S,
+    root: PageId,
+    vidx: &VectorIndexDef,
+    query_raw: &[f32],
+    nprobe: usize,
+) -> Result<Vec<i64>> {
+    let centroids = read_centroids(src, root, vidx.vidx_id)?;
+    if centroids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let query = if vidx.metric == VectorMetric::Cosine {
+        crate::vector::normalize(query_raw)
+    } else {
+        query_raw.to_vec()
+    };
+    let mut cents: Vec<(f32, usize)> = centroids
+        .iter()
+        .enumerate()
+        .map(|(i, c)| (vec_l2_sq(c, &query), i))
+        .collect();
+    cents.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let probe = nprobe.clamp(1, cents.len());
+
+    let mut rowids = Vec::new();
+    for &(_, cid) in cents.iter().take(probe) {
+        let pp = vec_cluster_prefix(vidx.vidx_id, cid as u16);
+        btree::for_each_prefix(src, root, &pp, |key| {
+            let rid = key
+                .get(key.len() - 8..)
+                .and_then(record::rowid_from_be)
+                .ok_or(Error::CorruptRecord("rowid en posting vectorial"))?;
+            rowids.push(rid);
+            Ok(())
+        })?;
+    }
+    Ok(rowids)
+}
+
 /// rowids cuyas columnas indexadas valen exactamente `values` (igualdad). El
 /// planificador lo usa para `WHERE col = const`; luego `get_row` por cada rowid.
 pub fn index_scan_eq<S: NodeSource>(
@@ -3389,6 +3661,74 @@ mod tests {
         assert_eq!(back.vector_indexes[0].metric, VectorMetric::Cosine);
         assert_eq!(back.vector_indexes[1].lists, 256);
         assert_eq!(back.vector_indexes[1].dim, 768);
+    }
+
+    #[test]
+    fn vector_index_build_search_drop() {
+        let mut s = MemStore::new();
+        let spec = TableSpec {
+            name: "docs".into(),
+            columns: vec![
+                ColumnSpec {
+                    primary_key: true,
+                    ..col("id", ColType::Integer)
+                },
+                col("emb", ColType::Blob),
+            ],
+            foreign_keys: Vec::new(),
+            uniques: Vec::new(),
+            checks: Vec::new(),
+        };
+        let (mut root, def) = create_table(&mut s, NO_ROOT, &spec).unwrap();
+        // Dos clusters: A≈(0,0) (rowids 1-3), B≈(10,10) (rowids 4-6).
+        let vecs = [
+            vec![0.0, 0.0],
+            vec![0.1, -0.1],
+            vec![-0.1, 0.2],
+            vec![10.0, 10.0],
+            vec![9.9, 10.1],
+            vec![10.2, 9.8],
+        ];
+        for v in &vecs {
+            let blob = crate::vector::pack_f32(v);
+            root = insert_row(&mut s, root, &def, &[Value::Null, Value::Blob(blob)])
+                .unwrap()
+                .0;
+        }
+        root = create_vector_index(&mut s, root, "docs", "v_idx", 1, 2, VectorMetric::L2).unwrap();
+        let def = get_table(&s, root, "docs").unwrap().unwrap();
+        let vidx = def.vector_indexes[0].clone();
+        assert_eq!(vidx.dim, 2);
+
+        // Query cerca de A: nprobe=1 ⇒ candidatos solo del cluster A.
+        let mut near_a = vector_search(&s, root, &vidx, &[0.05, 0.05], 1).unwrap();
+        near_a.sort_unstable();
+        assert_eq!(near_a, vec![1, 2, 3]);
+        // nprobe = nº de listas ⇒ candidatos de todos los clusters (los 6).
+        assert_eq!(
+            vector_search(&s, root, &vidx, &[0.05, 0.05], 2)
+                .unwrap()
+                .len(),
+            6
+        );
+
+        // DROP borra todo.
+        assert!(vector_index_exists(&s, root, "v_idx").unwrap());
+        let (root, dropped) = drop_vector_index(&mut s, root, "v_idx").unwrap();
+        assert!(dropped);
+        assert!(
+            get_table(&s, root, "docs")
+                .unwrap()
+                .unwrap()
+                .vector_indexes
+                .is_empty()
+        );
+        assert!(!vector_index_exists(&s, root, "v_idx").unwrap());
+        assert!(
+            vector_search(&s, root, &vidx, &[0.05, 0.05], 2)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

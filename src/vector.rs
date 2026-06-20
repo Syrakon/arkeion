@@ -46,6 +46,22 @@ pub fn pack_i8(vals: &[f32]) -> Vec<u8> {
     out
 }
 
+/// Normaliza a norma 1 (para coseno: el orden por L2 coincide con el de coseno).
+/// Un vector nulo se deja igual.
+pub fn normalize(v: &[f32]) -> Vec<f32> {
+    let norm = (v.iter().map(|&x| x as f64 * x as f64).sum::<f64>()).sqrt() as f32;
+    if norm == 0.0 {
+        return v.to_vec();
+    }
+    v.iter().map(|&x| x / norm).collect()
+}
+
+/// Desempaqueta cualquier formato (f32 o int8) a `Vec<f32>`. Público para que el
+/// índice IVF lea los vectores de las filas.
+pub fn to_f32(b: &[u8]) -> Result<Vec<f32>> {
+    unpack(b)
+}
+
 /// Desempaqueta cualquier formato (f32 o int8) a `Vec<f32>`.
 fn unpack(b: &[u8]) -> Result<Vec<f32>> {
     match b.split_first() {

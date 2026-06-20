@@ -629,6 +629,42 @@ pub fn run_execute(tx: &mut WriteTx, stmt: &Stmt, params: &[Value]) -> Result<us
             }
             Ok(0)
         }
+        Stmt::CreateVectorIndex {
+            if_not_exists,
+            name,
+            table,
+            column,
+            metric,
+            lists,
+        } => {
+            if *if_not_exists && tx.vector_index_exists(name)? {
+                return Ok(0);
+            }
+            let def = tx
+                .table(table)?
+                .ok_or_else(|| sql_err(format!("tabla desconocida: {table}")))?;
+            let col = def
+                .columns
+                .iter()
+                .position(|c| &c.name == column)
+                .ok_or_else(|| sql_err(format!("columna desconocida: {column}")))?;
+            let metric = match metric.as_deref() {
+                None | Some("cosine") => catalog::VectorMetric::Cosine,
+                Some("l2") => catalog::VectorMetric::L2,
+                Some(m) => return Err(sql_err(format!("métrica vectorial desconocida: {m}"))),
+            };
+            // Por defecto 100 listas (k-means las recorta a ≤ nº de filas).
+            let lists = (*lists).unwrap_or(100).clamp(1, u16::MAX as u32) as u16;
+            tx.create_vector_index(table, name, col, lists, metric)?;
+            Ok(0)
+        }
+        Stmt::DropVectorIndex { if_exists, name } => {
+            let dropped = tx.drop_vector_index(name)?;
+            if !dropped && !if_exists {
+                return Err(sql_err(format!("índice vectorial desconocido: {name}")));
+            }
+            Ok(0)
+        }
         Stmt::Insert {
             table,
             columns,

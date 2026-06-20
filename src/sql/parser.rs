@@ -216,6 +216,8 @@ impl<'a> Parser<'a> {
         self.expect_kw(Kw::Create, "CREATE")?;
         if matches!(self.peek(), Some(Tok::Kw(Kw::Fulltext))) {
             self.create_fts_index()
+        } else if matches!(self.peek(), Some(Tok::Kw(Kw::Vector))) {
+            self.create_vector_index()
         } else if matches!(self.peek(), Some(Tok::Kw(Kw::Unique | Kw::Index))) {
             self.create_index()
         } else if matches!(self.peek(), Some(Tok::Kw(Kw::View))) {
@@ -312,6 +314,8 @@ impl<'a> Parser<'a> {
         self.expect_kw(Kw::Drop, "DROP")?;
         if matches!(self.peek(), Some(Tok::Kw(Kw::Fulltext))) {
             self.drop_fts_index()
+        } else if matches!(self.peek(), Some(Tok::Kw(Kw::Vector))) {
+            self.drop_vector_index()
         } else if matches!(self.peek(), Some(Tok::Kw(Kw::Index))) {
             self.drop_index()
         } else if matches!(self.peek(), Some(Tok::Kw(Kw::View))) {
@@ -513,6 +517,55 @@ impl<'a> Parser<'a> {
         let if_exists = self.if_exists()?;
         let name = self.ident("un nombre de índice")?;
         Ok(Stmt::DropFtsIndex { if_exists, name })
+    }
+
+    /// Tras consumir `CREATE`: `VECTOR INDEX [IF NOT EXISTS] nombre ON tabla (col)
+    /// [USING métrica] [LISTS n]`. Índice IVF sobre una columna BLOB de vectores.
+    fn create_vector_index(&mut self) -> Result<Stmt> {
+        self.expect_kw(Kw::Vector, "VECTOR")?;
+        self.expect_kw(Kw::Index, "INDEX")?;
+        let if_not_exists = self.if_not_exists()?;
+        let name = self.ident("un nombre de índice")?;
+        self.expect_kw(Kw::On, "ON")?;
+        let table = self.ident("un nombre de tabla")?;
+        self.expect(&Tok::LParen, "'('")?;
+        let column = self.ident("un nombre de columna")?;
+        self.expect(&Tok::RParen, "')'")?;
+        let metric = if self.eat_kw(Kw::Using) {
+            Some(self.ident("una métrica (cosine|l2)")?)
+        } else {
+            None
+        };
+        let lists = if self.eat_kw(Kw::Lists) {
+            match self.next() {
+                Some(Tok::Int(n)) if n > 0 => Some(n as u32),
+                _ => {
+                    return Err(err_at(
+                        self.pos(),
+                        "se esperaba un entero positivo tras LISTS",
+                    ));
+                }
+            }
+        } else {
+            None
+        };
+        Ok(Stmt::CreateVectorIndex {
+            if_not_exists,
+            name,
+            table,
+            column,
+            metric,
+            lists,
+        })
+    }
+
+    /// Tras consumir `DROP`: `VECTOR INDEX [IF EXISTS] nombre`.
+    fn drop_vector_index(&mut self) -> Result<Stmt> {
+        self.expect_kw(Kw::Vector, "VECTOR")?;
+        self.expect_kw(Kw::Index, "INDEX")?;
+        let if_exists = self.if_exists()?;
+        let name = self.ident("un nombre de índice")?;
+        Ok(Stmt::DropVectorIndex { if_exists, name })
     }
 
     fn alter_table(&mut self) -> Result<Stmt> {
@@ -1523,6 +1576,25 @@ impl<'a> Parser<'a> {
                 };
                 Ok(Expr::Param(idx + 1))
             }
+            Some(Tok::Kw(Kw::Vector)) => {
+                // `vector` es palabra reservada (CREATE VECTOR INDEX) pero también
+                // el constructor `vector(x, …)`; en una expresión es la función.
+                self.expect(&Tok::LParen, "'(' tras vector")?;
+                let mut args = Vec::new();
+                if !matches!(self.peek(), Some(Tok::RParen)) {
+                    loop {
+                        args.push(self.expr()?);
+                        if !self.eat(&Tok::Comma) {
+                            break;
+                        }
+                    }
+                }
+                self.expect(&Tok::RParen, "')'")?;
+                self.finish_call(Expr::Function {
+                    name: "vector".into(),
+                    args,
+                })
+            }
             Some(Tok::Ident(name)) => {
                 // tabla.columna
                 if self.eat(&Tok::Dot) {
@@ -1721,6 +1793,45 @@ mod tests {
         };
         assert!(if_exists);
         assert_eq!(name, "fx");
+    }
+
+    #[test]
+    fn create_vector_index_parses() {
+        let Stmt::CreateVectorIndex {
+            if_not_exists,
+            name,
+            table,
+            column,
+            metric,
+            lists,
+        } = parse("CREATE VECTOR INDEX v ON docs (emb) USING cosine LISTS 64").unwrap()
+        else {
+            panic!("se esperaba CreateVectorIndex")
+        };
+        assert!(!if_not_exists);
+        assert_eq!(
+            (name.as_str(), table.as_str(), column.as_str()),
+            ("v", "docs", "emb")
+        );
+        assert_eq!(metric.as_deref(), Some("cosine"));
+        assert_eq!(lists, Some(64));
+    }
+
+    #[test]
+    fn create_vector_index_defaults_and_drop() {
+        let Stmt::CreateVectorIndex { metric, lists, .. } =
+            parse("CREATE VECTOR INDEX IF NOT EXISTS v ON docs (emb)").unwrap()
+        else {
+            panic!("se esperaba CreateVectorIndex")
+        };
+        assert_eq!((metric, lists), (None, None));
+        let Stmt::DropVectorIndex { if_exists, name } =
+            parse("DROP VECTOR INDEX IF EXISTS v").unwrap()
+        else {
+            panic!("se esperaba DropVectorIndex")
+        };
+        assert!(if_exists);
+        assert_eq!(name, "v");
     }
 
     #[test]

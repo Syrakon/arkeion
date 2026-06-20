@@ -1939,6 +1939,42 @@ impl WriteTx {
         catalog::fts_index_exists(&self.ts, self.data_root, name)
     }
 
+    /// Construye un índice vectorial IVF sobre `column` (BLOB) entrenando k-means
+    /// sobre las filas existentes.
+    pub fn create_vector_index(
+        &mut self,
+        table: &str,
+        name: &str,
+        column: usize,
+        lists: u16,
+        metric: catalog::VectorMetric,
+    ) -> Result<()> {
+        self.schema_cache.clear();
+        self.data_root = catalog::create_vector_index(
+            &mut self.ts,
+            self.data_root,
+            table,
+            name,
+            column,
+            lists,
+            metric,
+        )?;
+        Ok(())
+    }
+
+    /// Borra un índice vectorial por su nombre global. `false` si no existía.
+    pub fn drop_vector_index(&mut self, name: &str) -> Result<bool> {
+        self.schema_cache.clear();
+        let (root, dropped) = catalog::drop_vector_index(&mut self.ts, self.data_root, name)?;
+        self.data_root = root;
+        Ok(dropped)
+    }
+
+    /// `true` si existe un índice vectorial con ese nombre (para `IF NOT EXISTS`).
+    pub fn vector_index_exists(&self, name: &str) -> Result<bool> {
+        catalog::vector_index_exists(&self.ts, self.data_root, name)
+    }
+
     /// rowids cuyas columnas indexadas valen `values` (igualdad, una entrada por
     /// columna del índice), vía el índice.
     pub fn index_lookup(&self, idx: &IndexDef, values: &[Value]) -> Result<Vec<i64>> {

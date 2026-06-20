@@ -92,6 +92,23 @@ pub enum Stmt {
         if_exists: bool,
         name: String,
     },
+    /// `CREATE VECTOR INDEX [IF NOT EXISTS] nombre ON tabla (col) [USING métrica]
+    /// [LISTS n]`. Índice IVF (ANN) sobre una columna BLOB de vectores.
+    CreateVectorIndex {
+        if_not_exists: bool,
+        name: String,
+        table: String,
+        column: String,
+        /// Métrica (`cosine` por defecto, o `l2`).
+        metric: Option<String>,
+        /// Número de clusters (k); `None` ⇒ por defecto.
+        lists: Option<u32>,
+    },
+    /// `DROP VECTOR INDEX [IF EXISTS] nombre`.
+    DropVectorIndex {
+        if_exists: bool,
+        name: String,
+    },
     Insert {
         table: String,
         columns: Option<Vec<String>>,

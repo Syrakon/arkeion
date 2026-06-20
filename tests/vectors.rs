@@ -95,6 +95,68 @@ fn int8_quantized_storage_knn() {
 }
 
 #[test]
+fn create_drop_vector_index_via_sql() {
+    let (_d, db) = db();
+    let conn = db.connect().unwrap();
+    conn.execute("CREATE TABLE docs (id INTEGER PRIMARY KEY, emb BLOB)", &[])
+        .unwrap();
+    for vals in ["1.0, 0.0", "0.0, 1.0", "0.9, 0.1"] {
+        conn.execute(
+            &format!("INSERT INTO docs (emb) VALUES (vector({vals}))"),
+            &[],
+        )
+        .unwrap();
+    }
+    // Construye el índice IVF (entrena sobre las filas existentes).
+    conn.execute(
+        "CREATE VECTOR INDEX vi ON docs (emb) USING cosine LISTS 2",
+        &[],
+    )
+    .unwrap();
+    // IF NOT EXISTS es idempotente.
+    conn.execute("CREATE VECTOR INDEX IF NOT EXISTS vi ON docs (emb)", &[])
+        .unwrap();
+    // INSERT con el índice activo: el hook lo mantiene sin error.
+    conn.execute("INSERT INTO docs (emb) VALUES (vector(0.95, 0.05))", &[])
+        .unwrap();
+    // El KNN exacto sigue dando el resultado correcto (full scan).
+    let knn = ids_ordered(
+        &conn,
+        "SELECT id FROM docs ORDER BY cosine_distance(emb, vector(1.0, 0.0)) LIMIT 1",
+    );
+    assert_eq!(knn, vec![1]);
+    // DROP, idempotente con IF EXISTS.
+    conn.execute("DROP VECTOR INDEX vi", &[]).unwrap();
+    conn.execute("DROP VECTOR INDEX IF EXISTS vi", &[]).unwrap();
+}
+
+#[test]
+fn vector_index_errors() {
+    let (_d, db) = db();
+    let conn = db.connect().unwrap();
+    conn.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER, e BLOB)",
+        &[],
+    )
+    .unwrap();
+    // Columna no-BLOB.
+    assert!(matches!(
+        conn.execute("CREATE VECTOR INDEX v ON t (n)", &[]),
+        Err(Error::InvalidInput(_))
+    ));
+    // Métrica desconocida.
+    assert!(matches!(
+        conn.execute("CREATE VECTOR INDEX v ON t (e) USING manhattan", &[]),
+        Err(Error::Sql { .. })
+    ));
+    // DROP de un índice inexistente sin IF EXISTS.
+    assert!(matches!(
+        conn.execute("DROP VECTOR INDEX nope", &[]),
+        Err(Error::Sql { .. })
+    ));
+}
+
+#[test]
 fn dimension_mismatch_errors() {
     let (_d, db) = db();
     let conn = db.connect().unwrap();

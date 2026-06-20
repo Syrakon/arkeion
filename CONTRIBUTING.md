@@ -1,34 +1,34 @@
-# Contribuir a Arkeion
+# Contributing to Arkeion
 
-Gracias por el interés. Arkeion está en desarrollo activo **pre-1.0**: el formato en disco y la
-API pueden cambiar entre versiones sin garantía de compatibilidad.
+Thanks for your interest. Arkeion is under active **pre-1.0** development: the on-disk format and
+the API may change between releases with no compatibility guarantee.
 
-## Antes de abrir un PR
+## Before opening a PR
 
-- Para cualquier cambio no trivial, abre primero un **issue** y cuéntanos qué quieres hacer —
-  así evitamos trabajo descartado.
-- El proyecto es Rust estable, sin dependencias en runtime y con `#![forbid(unsafe_code)]`.
-  Eso no se negocia.
+- For any non-trivial change, open an **issue** first and tell us what you want to do — that way
+  we avoid throwaway work.
+- The project is stable Rust, with no runtime dependencies and `#![forbid(unsafe_code)]`.
+  That is non-negotiable.
 
-## Requisitos de un PR
+## PR requirements
 
-1. `cargo test` — la suite completa en verde.
-2. `cargo clippy --all-targets -- -D warnings` — limpio.
-3. `cargo fmt` — aplicado.
-4. Commits en formato [Conventional Commits](https://www.conventionalcommits.org/)
+1. `cargo test` — the full suite green.
+2. `cargo clippy --all-targets -- -D warnings` — clean.
+3. `cargo fmt` — applied.
+4. Commits in [Conventional Commits](https://www.conventionalcommits.org/) format
    (`feat:`, `fix:`, `perf:`, `docs:`, …).
-5. Si el cambio toca rendimiento, acompáñalo de números: `benches/crud.rs` con la metodología
-   descrita en el README (disco real, no tmpfs; mediana de varias corridas).
+5. If the change touches performance, back it up with numbers: `benches/crud.rs` following the
+   methodology described in the README (real disk, not tmpfs; median of several runs).
 
-## Cómo está organizado
+## How it is organized
 
-La arquitectura por capas está en [`docs/01-arquitectura.md`](docs/01-arquitectura.md) y cada
-decisión relevante (D1–D8…) tiene su porqué escrito en
-[`docs/05-decisiones.md`](docs/05-decisiones.md); si tu propuesta contradice una, argumenta
-contra el porqué, no contra la decisión.
+The layered architecture lives in [`docs/01-arquitectura.md`](docs/01-arquitectura.md), and every
+relevant decision (D1–D8…) has its rationale written down in
+[`docs/05-decisiones.md`](docs/05-decisiones.md); if your proposal contradicts one, argue against
+the rationale, not against the decision.
 
-## Licencia de las contribuciones
+## License of contributions
 
-Salvo que indiques explícitamente lo contrario, toda contribución que envíes para su inclusión
-en el proyecto queda bajo la doble licencia [MIT](LICENSE-MIT) o [Apache 2.0](LICENSE-APACHE),
-tal y como define la licencia Apache 2.0, sin términos ni condiciones adicionales.
+Unless you explicitly state otherwise, any contribution you submit for inclusion in the project is
+licensed under the dual [MIT](LICENSE-MIT) or [Apache 2.0](LICENSE-APACHE) license, as defined by
+the Apache 2.0 license, without any additional terms or conditions.

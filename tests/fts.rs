@@ -215,6 +215,47 @@ fn match_combines_with_normal_predicates() {
 }
 
 #[test]
+fn snippet_and_highlight_via_sql() {
+    let (_d, db) = db();
+    let conn = db.connect().unwrap();
+    mail_corpus(&conn);
+
+    // highlight con marcadores explícitos sobre las filas que casan.
+    let hls: Vec<String> = conn
+        .query(
+            "SELECT highlight(body, 'mundo', '<b>', '</b>') FROM mail \
+             WHERE body MATCH 'mundo' ORDER BY id",
+            &[],
+        )
+        .unwrap()
+        .map(|r| {
+            let s: String = r.unwrap().get(0).unwrap();
+            s
+        })
+        .collect();
+    assert_eq!(
+        hls,
+        vec![
+            "el <b>mundo</b> es grande".to_string(),
+            "<b>mundo</b> cruel y frio".to_string(),
+        ]
+    );
+
+    // snippet con marcadores por defecto ([ ]).
+    let mut rows = conn
+        .query("SELECT snippet(body, 'grande') FROM mail WHERE id = 1", &[])
+        .unwrap();
+    let snip: String = rows.next().unwrap().unwrap().get(0).unwrap();
+    assert!(snip.contains("[grande]"), "snippet: {snip}");
+
+    // El primer argumento debe ser una columna FTS.
+    let bad = conn
+        .query("SELECT highlight(folder, 'x') FROM mail WHERE id = 1", &[])
+        .and_then(|rows| rows.map(|r| r.map(|_| ())).collect::<Result<Vec<()>, _>>());
+    assert!(matches!(bad, Err(Error::Sql { .. })));
+}
+
+#[test]
 fn match_on_unindexed_column_errors() {
     let (_d, db) = db();
     let conn = db.connect().unwrap();

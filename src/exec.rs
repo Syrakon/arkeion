@@ -4792,6 +4792,96 @@ fn eval_const(e: &Expr, params: &[Value]) -> Result<Value> {
     eval(e, None, params)
 }
 
+/// `snippet(col, q[, open, close, ellipsis, max])` / `highlight(col, q[, open,
+/// close])`: resuelven `col` a su índice FTS (para usar el **mismo** tokenizer) y
+/// generan el extracto del texto de la fila. Puro, sin tocar el índice.
+fn eval_excerpt(
+    name: &str,
+    args: &[Expr],
+    row: Option<(&QuerySchema, &[Value])>,
+    params: &[Value],
+) -> Result<Value> {
+    let Some((schema, full_row)) = row else {
+        return Err(sql_err(format!("{name}() necesita una fila")));
+    };
+    if args.len() < 2 {
+        return Err(sql_err(format!(
+            "{name}(columna, consulta, …) requiere al menos 2 argumentos"
+        )));
+    }
+    let Expr::Column {
+        table: tq,
+        name: col,
+    } = &args[0]
+    else {
+        return Err(sql_err(format!(
+            "{name}(): el primer argumento debe ser una columna indexada"
+        )));
+    };
+    let (def, local_pos, offset) = schema.owner_of(tq.as_deref(), col)?;
+    let fts = def
+        .fts_indexes
+        .iter()
+        .find(|f| f.columns.contains(&local_pos))
+        .ok_or_else(|| sql_err(format!("la columna «{col}» no tiene un índice FULLTEXT")))?;
+    let tk = crate::fts::tokenizer_for(&fts.tokenizer)?;
+    let text = match &full_row[offset + local_pos] {
+        Value::Text(t) => t.clone(),
+        Value::Null => return Ok(Value::Null),
+        _ => return Err(sql_err(format!("{name}() solo aplica a columnas TEXT"))),
+    };
+    let q = match eval(&args[1], row, params)? {
+        Value::Text(s) => crate::fts::parse_query(&s)?,
+        Value::Null => return Ok(Value::Null),
+        _ => return Err(sql_err(format!("{name}(): la consulta debe ser texto"))),
+    };
+    // Argumentos de texto opcionales (marcadores / elipsis) con valor por defecto.
+    let str_arg = |i: usize, default: &str| -> Result<String> {
+        match args.get(i) {
+            None => Ok(default.to_string()),
+            Some(e) => match eval(e, row, params)? {
+                Value::Text(s) => Ok(s),
+                _ => Err(sql_err(format!(
+                    "{name}(): el argumento {i} debe ser texto"
+                ))),
+            },
+        }
+    };
+    let open = str_arg(2, "[")?;
+    let close = str_arg(3, "]")?;
+    if name == "highlight" {
+        Ok(Value::Text(crate::fts::highlight(
+            &text,
+            &q,
+            tk.as_ref(),
+            &open,
+            &close,
+        )))
+    } else {
+        let ellipsis = str_arg(4, "…")?;
+        let max_tokens = match args.get(5) {
+            None => 15usize,
+            Some(e) => match eval(e, row, params)? {
+                Value::Integer(n) if n > 0 => n as usize,
+                _ => {
+                    return Err(sql_err(
+                        "snippet(): max_tokens debe ser un entero positivo".to_string(),
+                    ));
+                }
+            },
+        };
+        Ok(Value::Text(crate::fts::snippet(
+            &text,
+            &q,
+            tk.as_ref(),
+            &open,
+            &close,
+            &ellipsis,
+            max_tokens,
+        )))
+    }
+}
+
 fn eval(e: &Expr, row: Option<(&QuerySchema, &[Value])>, params: &[Value]) -> Result<Value> {
     match e {
         Expr::Literal(v) => Ok(v.clone()),
@@ -4947,6 +5037,9 @@ fn eval(e: &Expr, row: Option<(&QuerySchema, &[Value])>, params: &[Value]) -> Re
                     json_arrow(*op, l, eval(right, row, params)?)
                 }
             }
+        }
+        Expr::Function { name, args } if matches!(name.as_str(), "snippet" | "highlight") => {
+            eval_excerpt(name, args, row, params)
         }
         Expr::Function { name, args } => {
             let vals: Vec<Value> = args

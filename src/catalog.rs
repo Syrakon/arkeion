@@ -9,10 +9,14 @@
 //! [0x00,0x02, table_id BE]          → próximo rowid (i64 LE)
 //! [0x00,0x03]                       → próximo index_id (u32 LE)
 //! [0x00,0x04, nombre índice UTF-8]  → nombre de tabla (ref global del índice)
+//! [0x00,0x07]                       → próximo fts_id (u32 LE)
+//! [0x00,0x08, nombre FTS UTF-8]     → nombre de tabla (ref global del índice FTS)
 //! [enc_oint(table_id), enc_oint(rowid)] → registro (v5: enteros
 //!     order-preserving de longitud variable; sin byte de namespace — la
 //!     cabecera 0x80+ de table_id ya lo distingue de 0x00/0x02)
 //! [0x02, index_id BE, valor*, rowid BE*] → entrada de índice (valor memcomparable)
+//! [0x03, fts_id BE, 0x00, term, rowid BE, field, pos] → posting full-text (docs/12)
+//! [0x03, fts_id BE, 0x01|0x02|0x03, …]    → stats BM25 (doclen / globales / df)
 //! ```
 
 use crate::btree::{self, Cursor, NodeSource, NodeStore};
@@ -28,6 +32,9 @@ const KS_CATALOG: u8 = 0x00;
 // 0x01 era el byte de namespace de las filas (v4); en v5 la clave de fila empieza
 // directo por enc_oint(table_id) (cabecera 0x80+), disjunta de 0x00 y 0x02.
 const KS_INDEX: u8 = 0x02;
+// Índices full-text: postings y stats, todo bajo `[0x03, fts_id BE]` (un solo
+// prefijo por índice ⇒ DROP en una pasada). Disjunto de 0x00/0x02 y de las filas.
+const KS_FTS: u8 = 0x03;
 const CAT_META: u8 = 0x00;
 const CAT_TABLE: u8 = 0x01;
 const CAT_COUNTER: u8 = 0x02;
@@ -35,6 +42,13 @@ const CAT_INDEX_COUNTER: u8 = 0x03;
 const CAT_INDEX_REF: u8 = 0x04;
 const CAT_VIEW: u8 = 0x05;
 const CAT_TRIGGER: u8 = 0x06;
+const CAT_FTS_COUNTER: u8 = 0x07;
+const CAT_FTS_REF: u8 = 0x08;
+// Sub-tipos dentro de un índice FTS, tras `[0x03, fts_id BE]`:
+const FTS_POSTING: u8 = 0x00; // ‖ term ‖ rowid BE ‖ field ‖ pos varint → vacío
+const FTS_DOCLEN: u8 = 0x01; // ‖ rowid BE → nº de tokens del doc (varint)
+const FTS_GLOBAL: u8 = 0x02; // → {N docs, Σ tokens} (dos varints) para avgdl
+const FTS_DF: u8 = 0x03; // ‖ term → nº de docs con el término (varint)
 
 /// v2: el esquema serializado incluye la lista de índices de la tabla.
 // v3 añade el orden lógico de columnas (reorden de presentación) al final del
@@ -1636,6 +1650,374 @@ fn delete_index_entries<S: NodeStore>(
     Ok(root)
 }
 
+// --- índices full-text (FTS): postings + stats BM25 (docs/12-fts.md) ---
+
+/// `[0x00,0x07]` → contador de `fts_id`.
+fn fts_counter_key() -> [u8; 2] {
+    [KS_CATALOG, CAT_FTS_COUNTER]
+}
+
+/// `[0x00,0x08, nombre]` → tabla: ref global del índice FTS (nombre único en toda
+/// la base, para que `DROP FULLTEXT INDEX nombre` lo ubique).
+fn fts_ref_key(name: &str) -> Vec<u8> {
+    let mut k = Vec::with_capacity(2 + name.len());
+    k.extend_from_slice(&[KS_CATALOG, CAT_FTS_REF]);
+    k.extend_from_slice(name.as_bytes());
+    k
+}
+
+/// `[0x03, fts_id BE]` — prefijo de TODO el índice (postings + stats); un solo
+/// barrido lo borra entero.
+fn fts_id_prefix(fts_id: u32) -> [u8; 5] {
+    let mut p = [0u8; 5];
+    p[0] = KS_FTS;
+    p[1..5].copy_from_slice(&fts_id.to_be_bytes());
+    p
+}
+
+/// Prefijo `[0x03, fts_id, sub]`.
+fn fts_sub_prefix(fts_id: u32, sub: u8) -> Vec<u8> {
+    let mut k = fts_id_prefix(fts_id).to_vec();
+    k.push(sub);
+    k
+}
+
+/// Clave de un posting: `[0x03, fts_id, 0x00, term, rowid BE, field, pos]`. El
+/// `term` va memcomparable (self-delimitado), así el `rowid` que sigue no se
+/// confunde con su cola de longitud variable.
+fn fts_posting_key(fts_id: u32, term: &str, rowid: i64, field: u8, pos: u32) -> Vec<u8> {
+    let mut k = fts_sub_prefix(fts_id, FTS_POSTING);
+    keyenc::encode_index_value_ref(ValueRef::Text(term), &mut k);
+    k.extend_from_slice(&record::rowid_be(rowid));
+    k.push(field);
+    put_varint(&mut k, pos as u64);
+    k
+}
+
+fn fts_doclen_key(fts_id: u32, rowid: i64) -> Vec<u8> {
+    let mut k = fts_sub_prefix(fts_id, FTS_DOCLEN);
+    k.extend_from_slice(&record::rowid_be(rowid));
+    k
+}
+
+fn fts_df_key(fts_id: u32, term: &str) -> Vec<u8> {
+    let mut k = fts_sub_prefix(fts_id, FTS_DF);
+    keyenc::encode_index_value_ref(ValueRef::Text(term), &mut k);
+    k
+}
+
+fn fts_global_key(fts_id: u32) -> Vec<u8> {
+    fts_sub_prefix(fts_id, FTS_GLOBAL)
+}
+
+fn alloc_fts_id<S: NodeStore>(s: &mut S, root: PageId) -> Result<(u32, PageId)> {
+    let next = match btree::get(s, root, &fts_counter_key())? {
+        Some(v) => u32::from_le_bytes(
+            v.as_slice()
+                .try_into()
+                .map_err(|_| Error::CorruptRecord("contador FTS"))?,
+        ),
+        None => 1,
+    };
+    let root = btree::insert(s, root, &fts_counter_key(), &(next + 1).to_le_bytes())?;
+    Ok((next, root))
+}
+
+/// Lee un contador varint (`df`/`doclen`); ausente ⇒ 0.
+fn fts_read_varint<S: NodeSource>(src: &S, root: PageId, key: &[u8]) -> Result<u64> {
+    match btree::get(src, root, key)? {
+        Some(v) => {
+            let mut p = 0;
+            take_varint(&v, &mut p).ok_or(Error::CorruptRecord("contador FTS varint"))
+        }
+        None => Ok(0),
+    }
+}
+
+/// Lee las globales `{N docs, Σ tokens}`; ausente ⇒ (0, 0).
+fn fts_read_global<S: NodeSource>(src: &S, root: PageId, fts_id: u32) -> Result<(u64, u64)> {
+    match btree::get(src, root, &fts_global_key(fts_id))? {
+        Some(v) => {
+            let mut p = 0;
+            let n = take_varint(&v, &mut p).ok_or(Error::CorruptRecord("FTS global N"))?;
+            let total = take_varint(&v, &mut p).ok_or(Error::CorruptRecord("FTS global suma"))?;
+            Ok((n, total))
+        }
+        None => Ok((0, 0)),
+    }
+}
+
+/// Suma/resta `delta` a un contador varint; si llega a 0, borra la clave.
+fn fts_adjust_varint<S: NodeStore>(
+    s: &mut S,
+    root: PageId,
+    key: &[u8],
+    add: bool,
+    delta: u64,
+) -> Result<PageId> {
+    let cur = fts_read_varint(s, root, key)?;
+    let new = if add {
+        cur + delta
+    } else {
+        cur.saturating_sub(delta)
+    };
+    if new == 0 {
+        let (root, _) = btree::delete(s, root, key)?;
+        Ok(root)
+    } else {
+        let mut v = Vec::new();
+        put_varint(&mut v, new);
+        btree::insert(s, root, key, &v)
+    }
+}
+
+/// Ajusta las globales: ±1 doc y ±`doclen` tokens; si N llega a 0, borra la clave.
+fn fts_adjust_global<S: NodeStore>(
+    s: &mut S,
+    root: PageId,
+    fts_id: u32,
+    add: bool,
+    doclen: u64,
+) -> Result<PageId> {
+    let (n, total) = fts_read_global(s, root, fts_id)?;
+    let (n, total) = if add {
+        (n + 1, total + doclen)
+    } else {
+        (n.saturating_sub(1), total.saturating_sub(doclen))
+    };
+    let key = fts_global_key(fts_id);
+    if n == 0 {
+        let (root, _) = btree::delete(s, root, &key)?;
+        Ok(root)
+    } else {
+        let mut v = Vec::new();
+        put_varint(&mut v, n);
+        put_varint(&mut v, total);
+        btree::insert(s, root, &key, &v)
+    }
+}
+
+/// Aplica (`add`) o revierte (`!add`) la contribución de una fila a un índice FTS:
+/// sus postings (uno por token de cada columna indexada) y las stats —`doclen`,
+/// `df` por término distinto y globales—. Re-tokeniza el registro; como la
+/// tokenización es determinista, revertir reconstruye exactamente las claves que
+/// se insertaron.
+fn apply_fts_row<S: NodeStore>(
+    s: &mut S,
+    mut root: PageId,
+    fts: &FtsIndexDef,
+    rowid: i64,
+    record: &[Value],
+    add: bool,
+) -> Result<PageId> {
+    let tk = crate::fts::tokenizer_for(&fts.tokenizer)?;
+    let mut buf = Vec::new();
+    let mut doc_terms: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut doclen: u64 = 0;
+    for &col in &fts.columns {
+        buf.clear();
+        if let Value::Text(text) = &record[col] {
+            tk.tokenize(text, &mut buf);
+        }
+        for token in &buf {
+            let key = fts_posting_key(fts.fts_id, &token.text, rowid, col as u8, token.position);
+            if add {
+                root = btree::insert(s, root, &key, &[])?;
+            } else {
+                (root, _) = btree::delete(s, root, &key)?;
+            }
+            doclen += 1;
+            doc_terms.insert(token.text.clone());
+        }
+    }
+    // `df`: una vez por término distinto del documento.
+    for term in &doc_terms {
+        root = fts_adjust_varint(s, root, &fts_df_key(fts.fts_id, term), add, 1)?;
+    }
+    // `doclen` del documento (no escribimos clave para longitud 0; ausente ⇒ 0).
+    let doclen_key = fts_doclen_key(fts.fts_id, rowid);
+    if add {
+        if doclen > 0 {
+            let mut v = Vec::new();
+            put_varint(&mut v, doclen);
+            root = btree::insert(s, root, &doclen_key, &v)?;
+        }
+    } else {
+        (root, _) = btree::delete(s, root, &doclen_key)?;
+    }
+    fts_adjust_global(s, root, fts.fts_id, add, doclen)
+}
+
+/// Inserta las entradas FTS de una fila (todos los índices FTS de la tabla).
+pub fn insert_fts_entries<S: NodeStore>(
+    s: &mut S,
+    root: PageId,
+    table: &TableDef,
+    rowid: i64,
+    record: &[Value],
+) -> Result<PageId> {
+    let mut root = root;
+    for fts in &table.fts_indexes {
+        root = apply_fts_row(s, root, fts, rowid, record, true)?;
+    }
+    Ok(root)
+}
+
+/// Borra las entradas FTS de una fila (todos los índices FTS de la tabla).
+pub fn delete_fts_entries<S: NodeStore>(
+    s: &mut S,
+    root: PageId,
+    table: &TableDef,
+    rowid: i64,
+    record: &[Value],
+) -> Result<PageId> {
+    let mut root = root;
+    for fts in &table.fts_indexes {
+        root = apply_fts_row(s, root, fts, rowid, record, false)?;
+    }
+    Ok(root)
+}
+
+/// Crea un índice FTS sobre columnas TEXT y lo **rellena** con las filas
+/// existentes (backfill). Nombre único en toda la base.
+pub fn create_fts_index<S: NodeStore>(
+    s: &mut S,
+    root: PageId,
+    table_name: &str,
+    index_name: &str,
+    columns: &[usize],
+    tokenizer: &str,
+) -> Result<PageId> {
+    validate_name(
+        index_name,
+        "nombre de índice FTS vacío o de más de 128 bytes",
+    )?;
+    crate::fts::tokenizer_for(tokenizer)?; // valida el nombre del tokenizer
+    let mut def = get_table(s, root, table_name)?.ok_or(Error::Constraint("tabla desconocida"))?;
+    if columns.is_empty() || columns.len() > MAX_COLUMNS {
+        return Err(Error::InvalidInput(
+            "un índice FTS necesita entre 1 y 255 columnas",
+        ));
+    }
+    for &c in columns {
+        if c >= def.columns.len() {
+            return Err(Error::InvalidInput("columna de índice FTS inexistente"));
+        }
+        if !matches!(def.columns[c].col_type, ColType::Text) {
+            return Err(Error::InvalidInput("FULLTEXT solo indexa columnas TEXT"));
+        }
+    }
+    if btree::get(s, root, &fts_ref_key(index_name))?.is_some() {
+        return Err(Error::Constraint("ya existe un índice FTS con ese nombre"));
+    }
+    let (fts_id, mut root) = alloc_fts_id(s, root)?;
+    let idx = FtsIndexDef {
+        name: index_name.to_owned(),
+        fts_id,
+        columns: columns.to_vec(),
+        tokenizer: tokenizer.to_owned(),
+    };
+    // Backfill: una entrada por token de cada fila existente.
+    let rows: Vec<(i64, Vec<Value>)> = scan_table(s, root, &def)?.collect::<Result<_>>()?;
+    for (rowid, values) in rows {
+        root = apply_fts_row(s, root, &idx, rowid, &values, true)?;
+    }
+    root = btree::insert(s, root, &fts_ref_key(index_name), table_name.as_bytes())?;
+    def.fts_indexes.push(idx);
+    root = btree::insert(s, root, &table_key(table_name), &encode_def(&def))?;
+    Ok(root)
+}
+
+/// Borra un índice FTS por su nombre global: todas sus claves (`[0x03, fts_id]`),
+/// su ref y su entrada en el esquema. `false` si no existía.
+pub fn drop_fts_index<S: NodeStore>(
+    s: &mut S,
+    root: PageId,
+    index_name: &str,
+) -> Result<(PageId, bool)> {
+    let Some(table_bytes) = btree::get(s, root, &fts_ref_key(index_name))? else {
+        return Ok((root, false));
+    };
+    let table_name =
+        String::from_utf8(table_bytes).map_err(|_| Error::CorruptRecord("ref FTS no UTF-8"))?;
+    let mut def =
+        get_table(s, root, &table_name)?.ok_or(Error::CorruptRecord("índice FTS sin su tabla"))?;
+    let Some(pos) = def.fts_indexes.iter().position(|i| i.name == index_name) else {
+        return Err(Error::CorruptRecord("ref FTS sin entrada en el esquema"));
+    };
+    let idx = def.fts_indexes.remove(pos);
+    let mut root = delete_all_fts_entries(s, root, idx.fts_id)?;
+    (root, _) = btree::delete(s, root, &fts_ref_key(index_name))?;
+    root = btree::insert(s, root, &table_key(&table_name), &encode_def(&def))?;
+    Ok((root, true))
+}
+
+/// `true` si existe un índice FTS con ese nombre global.
+pub fn fts_index_exists<S: NodeSource>(src: &S, root: PageId, name: &str) -> Result<bool> {
+    Ok(btree::get(src, root, &fts_ref_key(name))?.is_some())
+}
+
+fn delete_all_fts_entries<S: NodeStore>(s: &mut S, root: PageId, fts_id: u32) -> Result<PageId> {
+    let prefix = fts_id_prefix(fts_id);
+    let mut keys = Vec::new();
+    for item in btree::scan_from(s, root, &prefix)? {
+        let (k, _) = item?;
+        if !k.starts_with(&prefix) {
+            break;
+        }
+        keys.push(k);
+    }
+    let mut root = root;
+    for k in keys {
+        (root, _) = btree::delete(s, root, &k)?;
+    }
+    Ok(root)
+}
+
+// --- lectura FTS (la usan los tests y, más adelante, el planner/ranking) ---
+
+/// rowids **distintos** (ordenados) que contienen `term` en este índice. La base
+/// de `MATCH`: por término, los documentos que lo tienen.
+pub fn fts_term_rowids<S: NodeSource>(
+    src: &S,
+    root: PageId,
+    fts_id: u32,
+    term: &str,
+) -> Result<Vec<i64>> {
+    let mut prefix = fts_sub_prefix(fts_id, FTS_POSTING);
+    keyenc::encode_index_value_ref(ValueRef::Text(term), &mut prefix);
+    let plen = prefix.len();
+    let mut rowids = Vec::new();
+    let mut last: Option<i64> = None;
+    btree::for_each_prefix(src, root, &prefix, |key| {
+        let rid = key
+            .get(plen..plen + 8)
+            .and_then(record::rowid_from_be)
+            .ok_or(Error::CorruptRecord("rowid en posting FTS"))?;
+        if last != Some(rid) {
+            rowids.push(rid);
+            last = Some(rid);
+        }
+        Ok(())
+    })?;
+    Ok(rowids)
+}
+
+/// Frecuencia documental de `term` (nº de docs que lo contienen).
+pub fn fts_doc_freq<S: NodeSource>(src: &S, root: PageId, fts_id: u32, term: &str) -> Result<u64> {
+    fts_read_varint(src, root, &fts_df_key(fts_id, term))
+}
+
+/// Longitud (nº de tokens) del documento `rowid`; 0 si no tiene.
+pub fn fts_doc_len<S: NodeSource>(src: &S, root: PageId, fts_id: u32, rowid: i64) -> Result<u64> {
+    fts_read_varint(src, root, &fts_doclen_key(fts_id, rowid))
+}
+
+/// Globales del índice: `(N docs, Σ tokens)` — para la longitud media de BM25.
+pub fn fts_global_stats<S: NodeSource>(src: &S, root: PageId, fts_id: u32) -> Result<(u64, u64)> {
+    fts_read_global(src, root, fts_id)
+}
+
 /// rowids cuyas columnas indexadas valen exactamente `values` (igualdad). El
 /// planificador lo usa para `WHERE col = const`; luego `get_row` por cada rowid.
 pub fn index_scan_eq<S: NodeSource>(
@@ -2346,6 +2728,158 @@ mod tests {
         bytes[0] = 7;
         let back = decode_def(&def.name, &bytes).unwrap();
         assert!(back.fts_indexes.is_empty());
+    }
+
+    fn mail_spec() -> TableSpec {
+        TableSpec {
+            name: "mail".into(),
+            columns: vec![
+                ColumnSpec {
+                    primary_key: true,
+                    ..col("id", ColType::Integer)
+                },
+                col("subject", ColType::Text),
+                col("body", ColType::Text),
+            ],
+            foreign_keys: Vec::new(),
+            uniques: Vec::new(),
+            checks: Vec::new(),
+        }
+    }
+
+    fn insert_mail(
+        s: &mut MemStore,
+        root: PageId,
+        def: &TableDef,
+        sub: &str,
+        body: &str,
+    ) -> PageId {
+        insert_row(
+            s,
+            root,
+            def,
+            &[
+                Value::Null,
+                Value::Text(sub.into()),
+                Value::Text(body.into()),
+            ],
+        )
+        .unwrap()
+        .0
+    }
+
+    #[test]
+    fn fts_backfill_postings_and_stats() {
+        let mut s = MemStore::new();
+        let (mut root, def) = create_table(&mut s, NO_ROOT, &mail_spec()).unwrap();
+        root = insert_mail(&mut s, root, &def, "hola mundo", "el mundo es grande");
+        root = insert_mail(&mut s, root, &def, "adios mundo", "hasta luego");
+        root = create_fts_index(&mut s, root, "mail", "fts_mail", &[1, 2], "unicode").unwrap();
+
+        let fts_id = get_table(&s, root, "mail").unwrap().unwrap().fts_indexes[0].fts_id;
+        // "mundo" está en la fila 1 (subject y body) y en la 2 (subject) → 2 docs.
+        assert_eq!(
+            fts_term_rowids(&s, root, fts_id, "mundo").unwrap(),
+            vec![1, 2]
+        );
+        assert_eq!(fts_doc_freq(&s, root, fts_id, "mundo").unwrap(), 2);
+        assert_eq!(fts_doc_freq(&s, root, fts_id, "grande").unwrap(), 1);
+        assert!(
+            fts_term_rowids(&s, root, fts_id, "inexistente")
+                .unwrap()
+                .is_empty()
+        );
+        // doclen fila 1 = tokens(subject)+tokens(body) = 2 + 4 = 6; fila 2 = 2 + 2.
+        assert_eq!(fts_doc_len(&s, root, fts_id, 1).unwrap(), 6);
+        assert_eq!(fts_doc_len(&s, root, fts_id, 2).unwrap(), 4);
+        // globales: N = 2 docs, Σ = 10 tokens.
+        assert_eq!(fts_global_stats(&s, root, fts_id).unwrap(), (2, 10));
+    }
+
+    #[test]
+    fn fts_insert_delete_maintenance_reverts_stats() {
+        let mut s = MemStore::new();
+        let (mut root, _) = create_table(&mut s, NO_ROOT, &mail_spec()).unwrap();
+        root = create_fts_index(&mut s, root, "mail", "fts_mail", &[1, 2], "unicode").unwrap();
+        let def = get_table(&s, root, "mail").unwrap().unwrap();
+        let fts_id = def.fts_indexes[0].fts_id;
+        assert_eq!(fts_global_stats(&s, root, fts_id).unwrap(), (0, 0));
+
+        // "mundo" sale dos veces en la misma fila ⇒ df cuenta 1 doc distinto.
+        let rec = [
+            Value::Integer(1),
+            Value::Text("hola mundo".into()),
+            Value::Text("mundo cruel".into()),
+        ];
+        root = insert_fts_entries(&mut s, root, &def, 1, &rec).unwrap();
+        assert_eq!(fts_term_rowids(&s, root, fts_id, "mundo").unwrap(), vec![1]);
+        assert_eq!(fts_doc_freq(&s, root, fts_id, "mundo").unwrap(), 1);
+        assert_eq!(fts_doc_len(&s, root, fts_id, 1).unwrap(), 4);
+        assert_eq!(fts_global_stats(&s, root, fts_id).unwrap(), (1, 4));
+
+        // Revertir lo deja todo a cero (índice consistente con el dato borrado).
+        root = delete_fts_entries(&mut s, root, &def, 1, &rec).unwrap();
+        assert!(
+            fts_term_rowids(&s, root, fts_id, "mundo")
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(fts_doc_freq(&s, root, fts_id, "mundo").unwrap(), 0);
+        assert_eq!(fts_doc_len(&s, root, fts_id, 1).unwrap(), 0);
+        assert_eq!(fts_global_stats(&s, root, fts_id).unwrap(), (0, 0));
+    }
+
+    #[test]
+    fn fts_drop_removes_all_entries_and_schema() {
+        let mut s = MemStore::new();
+        let (mut root, def) = create_table(&mut s, NO_ROOT, &mail_spec()).unwrap();
+        root = insert_mail(&mut s, root, &def, "hola mundo", "texto");
+        root = create_fts_index(&mut s, root, "mail", "fts_mail", &[1, 2], "unicode").unwrap();
+        let fts_id = get_table(&s, root, "mail").unwrap().unwrap().fts_indexes[0].fts_id;
+
+        assert!(fts_index_exists(&s, root, "fts_mail").unwrap());
+        let (root, dropped) = drop_fts_index(&mut s, root, "fts_mail").unwrap();
+        assert!(dropped);
+        assert!(
+            get_table(&s, root, "mail")
+                .unwrap()
+                .unwrap()
+                .fts_indexes
+                .is_empty()
+        );
+        assert!(!fts_index_exists(&s, root, "fts_mail").unwrap());
+        // Ni postings ni stats quedan bajo el fts_id.
+        assert!(
+            fts_term_rowids(&s, root, fts_id, "mundo")
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(fts_global_stats(&s, root, fts_id).unwrap(), (0, 0));
+        // Idempotente sobre un nombre inexistente.
+        let (_, again) = drop_fts_index(&mut s, root, "fts_mail").unwrap();
+        assert!(!again);
+    }
+
+    #[test]
+    fn fts_create_validations() {
+        let mut s = MemStore::new();
+        let (root, _) = create_table(&mut s, NO_ROOT, &mail_spec()).unwrap();
+        // Columna no-TEXT (id) → InvalidInput.
+        assert!(matches!(
+            create_fts_index(&mut s, root, "mail", "fx", &[0], "unicode"),
+            Err(Error::InvalidInput(_))
+        ));
+        // Tokenizer desconocido → error SQL.
+        assert!(matches!(
+            create_fts_index(&mut s, root, "mail", "fx", &[1], "porter"),
+            Err(Error::Sql { .. })
+        ));
+        // Nombre duplicado → Constraint.
+        let root = create_fts_index(&mut s, root, "mail", "fx", &[1], "unicode").unwrap();
+        assert!(matches!(
+            create_fts_index(&mut s, root, "mail", "fx", &[2], "unicode"),
+            Err(Error::Constraint(_))
+        ));
     }
 
     #[test]

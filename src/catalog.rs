@@ -57,7 +57,7 @@ const FTS_DF: u8 = 0x03; // ‖ term → nº de docs con el término (varint)
 // ellas) se leen con `foreign_keys` vacío. v5 añade el flag `dropped` por columna
 // (DROP COLUMN lógico); v<5 lo lee como `false`. v7 añade los predicados CHECK de
 // tabla. v8 añade los índices FTS al final del registro; v<8 los lee vacíos.
-const SCHEMA_VERSION: u8 = 8;
+const SCHEMA_VERSION: u8 = 9;
 const NO_ALIAS: u8 = 0xFF;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -324,6 +324,48 @@ pub struct FtsIndexDef {
     pub tokenizer: String,
 }
 
+/// Métrica de un índice vectorial. Para `Cosine` los vectores se **normalizan** a
+/// norma 1 al construir/buscar, así el orden por L2 coincide con el de coseno.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VectorMetric {
+    Cosine,
+    L2,
+}
+
+impl VectorMetric {
+    fn as_u8(self) -> u8 {
+        match self {
+            VectorMetric::Cosine => 0,
+            VectorMetric::L2 => 1,
+        }
+    }
+    fn from_u8(b: u8) -> Option<VectorMetric> {
+        match b {
+            0 => Some(VectorMetric::Cosine),
+            1 => Some(VectorMetric::L2),
+            _ => None,
+        }
+    }
+}
+
+/// Índice vectorial IVF sobre una columna BLOB de vectores (keyspace `0x04`).
+///
+/// Agrupa los vectores en `lists` clusters (k-means); la búsqueda escanea solo los
+/// `nprobe` clusters más cercanos (ANN aproximado). Centroides y postings por
+/// cluster persisten bajo `[0x04, vidx_id]`. Ver `docs/13-vectores.md`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct VectorIndexDef {
+    pub name: String,
+    pub vidx_id: u32,
+    /// Posición de la columna BLOB con los vectores (en `TableDef.columns`).
+    pub column: usize,
+    /// Número de clusters (k de k-means).
+    pub lists: u16,
+    pub metric: VectorMetric,
+    /// Dimensión de los vectores (fijada al construir).
+    pub dim: u32,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct TableDef {
     pub name: String,
@@ -337,6 +379,9 @@ pub struct TableDef {
     /// Índices full-text de la tabla (keyspace `0x03`); mismo ciclo de
     /// mantenimiento que `indexes`. Vacío salvo `CREATE FULLTEXT INDEX`.
     pub fts_indexes: Vec<FtsIndexDef>,
+    /// Índices vectoriales IVF de la tabla (keyspace `0x04`). Vacío salvo
+    /// `CREATE VECTOR INDEX`.
+    pub vector_indexes: Vec<VectorIndexDef>,
     /// Orden **lógico** (de presentación) de las columnas: `logical_order[i]` es la
     /// posición **física** de la i-ésima columna lógica — una permutación de
     /// `0..columns.len()`. Físicamente las columnas y las filas **nunca** se mueven
@@ -551,6 +596,18 @@ fn encode_def(def: &TableDef) -> Vec<u8> {
         put_varint(&mut out, fts.tokenizer.len() as u64);
         out.extend_from_slice(fts.tokenizer.as_bytes());
     }
+    // Índices vectoriales (v9): cuenta, y por cada uno: vidx_id, columna, lists,
+    // métrica, dim y nombre. v2..v8 no los llevan ⇒ se leen vacíos.
+    put_varint(&mut out, def.vector_indexes.len() as u64);
+    for vi in &def.vector_indexes {
+        out.extend_from_slice(&vi.vidx_id.to_le_bytes());
+        put_varint(&mut out, vi.column as u64);
+        put_varint(&mut out, vi.lists as u64);
+        out.push(vi.metric.as_u8());
+        out.extend_from_slice(&vi.dim.to_le_bytes());
+        put_varint(&mut out, vi.name.len() as u64);
+        out.extend_from_slice(vi.name.as_bytes());
+    }
     out
 }
 
@@ -579,7 +636,7 @@ fn decode_def(name: &str, buf: &[u8]) -> Result<TableDef> {
     };
 
     let version = *take(&mut pos, 1)?.first().expect("len 1");
-    if !(2..=8).contains(&version) {
+    if !(2..=9).contains(&version) {
         return Err(bad("versión de esquema desconocida"));
     }
     let table_id = u32::from_le_bytes(
@@ -774,6 +831,34 @@ fn decode_def(name: &str, buf: &[u8]) -> Result<TableDef> {
         }
     }
 
+    // Índices vectoriales (v9). v2..v8 no los llevan ⇒ vacío.
+    let mut vector_indexes = Vec::new();
+    if version >= 9 {
+        let nv = take_varint(buf, &mut pos).ok_or(bad("esquema truncado"))? as usize;
+        for _ in 0..nv {
+            let vidx_id = u32::from_le_bytes(take(&mut pos, 4)?.try_into().expect("rango fijo"));
+            let column = take_varint(buf, &mut pos).ok_or(bad("esquema truncado"))? as usize;
+            if column >= columns.len() {
+                return Err(bad("columna de índice vectorial fuera de rango"));
+            }
+            let lists = take_varint(buf, &mut pos).ok_or(bad("esquema truncado"))? as u16;
+            let metric = VectorMetric::from_u8(*take(&mut pos, 1)?.first().expect("len 1"))
+                .ok_or(bad("métrica vectorial desconocida"))?;
+            let dim = u32::from_le_bytes(take(&mut pos, 4)?.try_into().expect("rango fijo"));
+            let nlen = take_varint(buf, &mut pos).ok_or(bad("esquema truncado"))? as usize;
+            let name = String::from_utf8(take(&mut pos, nlen)?.to_vec())
+                .map_err(|_| bad("nombre de índice vectorial no UTF-8"))?;
+            vector_indexes.push(VectorIndexDef {
+                name,
+                vidx_id,
+                column,
+                lists,
+                metric,
+                dim,
+            });
+        }
+    }
+
     if pos != buf.len() {
         return Err(bad("bytes sobrantes tras el esquema"));
     }
@@ -789,6 +874,7 @@ fn decode_def(name: &str, buf: &[u8]) -> Result<TableDef> {
         columns,
         indexes,
         fts_indexes,
+        vector_indexes,
         logical_order,
         foreign_keys,
         checks,
@@ -1001,6 +1087,7 @@ pub fn create_table<S: NodeStore>(
             .collect(),
         indexes: Vec::new(),
         fts_indexes: Vec::new(),
+        vector_indexes: Vec::new(),
         logical_order: (0..spec.columns.len()).collect(),
         foreign_keys,
         checks,
@@ -3273,19 +3360,53 @@ mod tests {
     }
 
     #[test]
+    fn vector_index_schema_roundtrip() {
+        let mut s = MemStore::new();
+        let (_, def) = create_table(&mut s, NO_ROOT, &facturas_spec()).unwrap();
+        // Sin índices vectoriales: el bloque v9 está presente pero vacío.
+        assert!(def.vector_indexes.is_empty());
+        assert_eq!(decode_def(&def.name, &encode_def(&def)).unwrap(), def);
+
+        let mut d = def.clone();
+        d.vector_indexes.push(VectorIndexDef {
+            name: "v_cos".into(),
+            vidx_id: 1,
+            column: 4,
+            lists: 16,
+            metric: VectorMetric::Cosine,
+            dim: 384,
+        });
+        d.vector_indexes.push(VectorIndexDef {
+            name: "v_l2".into(),
+            vidx_id: 2,
+            column: 4,
+            lists: 256,
+            metric: VectorMetric::L2,
+            dim: 768,
+        });
+        let back = decode_def(&d.name, &encode_def(&d)).unwrap();
+        assert_eq!(back, d);
+        assert_eq!(back.vector_indexes[0].metric, VectorMetric::Cosine);
+        assert_eq!(back.vector_indexes[1].lists, 256);
+        assert_eq!(back.vector_indexes[1].dim, 768);
+    }
+
+    #[test]
     fn schema_v7_decodes_with_empty_fts() {
-        // Compatibilidad hacia atrás: un esquema v7 (sin bloque FTS) debe seguir
-        // leyéndose. Degradamos un v8 con 0 índices FTS quitando su byte de count
-        // y marcando la versión 7.
+        // Compatibilidad hacia atrás: un esquema v7 (sin bloques FTS ni vectorial)
+        // debe seguir leyéndose. Degradamos un v9 con 0 índices FTS/vectoriales
+        // quitando sus dos bytes de count (vectorial v9, luego FTS v8) y marcando
+        // la versión 7.
         let mut s = MemStore::new();
         let (_, def) = create_table(&mut s, NO_ROOT, &facturas_spec()).unwrap();
         let mut bytes = encode_def(&def);
-        assert_eq!(bytes[0], 8);
-        assert_eq!(*bytes.last().unwrap(), 0, "count FTS = 0 al final");
-        bytes.pop();
+        assert_eq!(bytes[0], 9);
+        assert_eq!(bytes.pop(), Some(0), "count vectorial = 0 al final");
+        assert_eq!(bytes.pop(), Some(0), "count FTS = 0");
         bytes[0] = 7;
         let back = decode_def(&def.name, &bytes).unwrap();
         assert!(back.fts_indexes.is_empty());
+        assert!(back.vector_indexes.is_empty());
     }
 
     fn mail_spec() -> TableSpec {

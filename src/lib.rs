@@ -101,6 +101,8 @@ pub mod record;
 pub mod sql;
 #[doc(hidden)]
 pub mod tx;
+#[doc(hidden)]
+pub mod vector;
 
 #[cfg(test)]
 pub(crate) mod testutil;

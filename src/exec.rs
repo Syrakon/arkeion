@@ -6044,6 +6044,33 @@ fn call_function(name: &str, args: &[Value]) -> Result<Value> {
             [_, _] => Err(sql_err("strftime(formato TEXT, epoch_ms INTEGER)")),
             _ => Err(bad_arity()),
         },
+        // --- búsqueda vectorial: el vector es un BLOB de f32 (docs/13) ---
+        "vector" => {
+            // Constructor: empaqueta los argumentos numéricos como f32 LE.
+            let mut vals = Vec::with_capacity(args.len());
+            for v in args {
+                match v {
+                    Value::Real(r) => vals.push(*r as f32),
+                    Value::Integer(n) => vals.push(*n as f32),
+                    Value::Null => return Ok(Value::Null),
+                    _ => return Err(need_num(v)),
+                }
+            }
+            Ok(Value::Blob(crate::vector::pack_f32(&vals)))
+        }
+        "cosine_distance" | "l2_distance" | "dot" => match args {
+            [Value::Null, _] | [_, Value::Null] => Ok(Value::Null),
+            [Value::Blob(a), Value::Blob(b)] => {
+                let d = match lname.as_str() {
+                    "cosine_distance" => crate::vector::cosine_distance(a, b),
+                    "l2_distance" => crate::vector::l2_distance(a, b),
+                    _ => crate::vector::dot(a, b),
+                }?;
+                Ok(Value::Real(d))
+            }
+            [_, _] => Err(sql_err(format!("{lname}() requiere dos BLOB de vector"))),
+            _ => Err(bad_arity()),
+        },
         _ => Err(sql_err(format!("función desconocida: {name}()"))),
     }
 }

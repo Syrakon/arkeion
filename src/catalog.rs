@@ -372,6 +372,9 @@ pub struct VectorIndexDef {
     pub metric: VectorMetric,
     /// Dimensión de los vectores (fijada al construir).
     pub dim: u32,
+    /// Clusters a escanear por búsqueda (recall vs velocidad). El planner usa
+    /// este valor; más `nprobe` ⇒ más recall, más coste.
+    pub nprobe: u16,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -613,6 +616,7 @@ fn encode_def(def: &TableDef) -> Vec<u8> {
         put_varint(&mut out, vi.lists as u64);
         out.push(vi.metric.as_u8());
         out.extend_from_slice(&vi.dim.to_le_bytes());
+        put_varint(&mut out, vi.nprobe as u64);
         put_varint(&mut out, vi.name.len() as u64);
         out.extend_from_slice(vi.name.as_bytes());
     }
@@ -853,6 +857,7 @@ fn decode_def(name: &str, buf: &[u8]) -> Result<TableDef> {
             let metric = VectorMetric::from_u8(*take(&mut pos, 1)?.first().expect("len 1"))
                 .ok_or(bad("métrica vectorial desconocida"))?;
             let dim = u32::from_le_bytes(take(&mut pos, 4)?.try_into().expect("rango fijo"));
+            let nprobe = take_varint(buf, &mut pos).ok_or(bad("esquema truncado"))? as u16;
             let nlen = take_varint(buf, &mut pos).ok_or(bad("esquema truncado"))? as usize;
             let name = String::from_utf8(take(&mut pos, nlen)?.to_vec())
                 .map_err(|_| bad("nombre de índice vectorial no UTF-8"))?;
@@ -863,6 +868,7 @@ fn decode_def(name: &str, buf: &[u8]) -> Result<TableDef> {
                 lists,
                 metric,
                 dim,
+                nprobe,
             });
         }
     }
@@ -2726,6 +2732,7 @@ fn row_vector(record: &[Value], column: usize, metric: VectorMetric) -> Result<O
 /// Construye un índice vectorial IVF: entrena k-means sobre los vectores
 /// existentes (un evento discreto, determinista), asigna cada fila a su cluster y
 /// persiste centroides + postings.
+#[allow(clippy::too_many_arguments)]
 pub fn create_vector_index<S: NodeStore>(
     s: &mut S,
     root: PageId,
@@ -2734,6 +2741,7 @@ pub fn create_vector_index<S: NodeStore>(
     column: usize,
     lists: u16,
     metric: VectorMetric,
+    nprobe: u16,
 ) -> Result<PageId> {
     validate_name(
         index_name,
@@ -2805,6 +2813,7 @@ pub fn create_vector_index<S: NodeStore>(
         lists,
         metric,
         dim: dim as u32,
+        nprobe: nprobe.max(1),
     };
     root = btree::insert(s, root, &vector_ref_key(index_name), table_name.as_bytes())?;
     def.vector_indexes.push(idx);
@@ -3737,6 +3746,7 @@ mod tests {
             lists: 16,
             metric: VectorMetric::Cosine,
             dim: 384,
+            nprobe: 4,
         });
         d.vector_indexes.push(VectorIndexDef {
             name: "v_l2".into(),
@@ -3745,6 +3755,7 @@ mod tests {
             lists: 256,
             metric: VectorMetric::L2,
             dim: 768,
+            nprobe: 16,
         });
         let back = decode_def(&d.name, &encode_def(&d)).unwrap();
         assert_eq!(back, d);
@@ -3785,7 +3796,8 @@ mod tests {
                 .unwrap()
                 .0;
         }
-        root = create_vector_index(&mut s, root, "docs", "v_idx", 1, 2, VectorMetric::L2).unwrap();
+        root =
+            create_vector_index(&mut s, root, "docs", "v_idx", 1, 2, VectorMetric::L2, 1).unwrap();
         let def = get_table(&s, root, "docs").unwrap().unwrap();
         let vidx = def.vector_indexes[0].clone();
         assert_eq!(vidx.dim, 2);
@@ -3854,7 +3866,7 @@ mod tests {
             .unwrap()
             .0;
         }
-        root = create_vector_index(&mut s, root, "docs", "v", 1, 2, VectorMetric::L2).unwrap();
+        root = create_vector_index(&mut s, root, "docs", "v", 1, 2, VectorMetric::L2, 1).unwrap();
         let def = get_table(&s, root, "docs").unwrap().unwrap();
         let vidx = def.vector_indexes[0].clone();
 

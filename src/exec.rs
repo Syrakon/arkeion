@@ -662,6 +662,7 @@ pub fn run_execute(tx: &mut WriteTx, stmt: &Stmt, params: &[Value]) -> Result<us
             column,
             metric,
             lists,
+            probes,
         } => {
             if *if_not_exists && tx.vector_index_exists(name)? {
                 return Ok(0);
@@ -679,9 +680,13 @@ pub fn run_execute(tx: &mut WriteTx, stmt: &Stmt, params: &[Value]) -> Result<us
                 Some("l2") => catalog::VectorMetric::L2,
                 Some(m) => return Err(sql_err(format!("métrica vectorial desconocida: {m}"))),
             };
-            // Por defecto 100 listas (k-means las recorta a ≤ nº de filas).
+            // Por defecto 100 listas (k-means las recorta a ≤ nº de filas) y
+            // nprobe ≈ 10% de las listas (recall vs velocidad).
             let lists = (*lists).unwrap_or(100).clamp(1, u16::MAX as u32) as u16;
-            tx.create_vector_index(table, name, col, lists, metric)?;
+            let nprobe = (*probes)
+                .unwrap_or_else(|| (lists as u32).div_ceil(10))
+                .clamp(1, u16::MAX as u32) as u16;
+            tx.create_vector_index(table, name, col, lists, metric, nprobe)?;
             Ok(0)
         }
         Stmt::DropVectorIndex { if_exists, name } => {
@@ -1071,8 +1076,8 @@ fn vector_plan(
         return Ok(None);
     };
     let query = crate::vector::to_f32(&qb)?;
-    // nprobe por defecto: ~10% de los clusters (mínimo 1). Más recall ⇒ más listas.
-    let nprobe = (vidx.lists as usize).div_ceil(10).max(1);
+    // nprobe del índice (recall vs velocidad), fijado al crearlo con `PROBES`.
+    let nprobe = (vidx.nprobe as usize).max(1);
     let mut rows = Vec::new();
     for rowid in src.vector_search(vidx, &query, nprobe)? {
         if let Some(row) = src.get_row(def, rowid)? {

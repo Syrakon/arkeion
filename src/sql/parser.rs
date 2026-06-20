@@ -549,6 +549,19 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
+        let probes = if self.eat_kw(Kw::Probes) {
+            match self.next() {
+                Some(Tok::Int(n)) if n > 0 => Some(n as u32),
+                _ => {
+                    return Err(err_at(
+                        self.pos(),
+                        "se esperaba un entero positivo tras PROBES",
+                    ));
+                }
+            }
+        } else {
+            None
+        };
         Ok(Stmt::CreateVectorIndex {
             if_not_exists,
             name,
@@ -556,6 +569,7 @@ impl<'a> Parser<'a> {
             column,
             metric,
             lists,
+            probes,
         })
     }
 
@@ -1804,7 +1818,8 @@ mod tests {
             column,
             metric,
             lists,
-        } = parse("CREATE VECTOR INDEX v ON docs (emb) USING cosine LISTS 64").unwrap()
+            probes,
+        } = parse("CREATE VECTOR INDEX v ON docs (emb) USING cosine LISTS 64 PROBES 8").unwrap()
         else {
             panic!("se esperaba CreateVectorIndex")
         };
@@ -1814,7 +1829,7 @@ mod tests {
             ("v", "docs", "emb")
         );
         assert_eq!(metric.as_deref(), Some("cosine"));
-        assert_eq!(lists, Some(64));
+        assert_eq!((lists, probes), (Some(64), Some(8)));
     }
 
     #[test]

@@ -1959,6 +1959,7 @@ impl WriteTx {
         column: usize,
         lists: u16,
         metric: catalog::VectorMetric,
+        nprobe: u16,
     ) -> Result<()> {
         self.schema_cache.clear();
         self.data_root = catalog::create_vector_index(
@@ -1969,6 +1970,7 @@ impl WriteTx {
             column,
             lists,
             metric,
+            nprobe,
         )?;
         Ok(())
     }

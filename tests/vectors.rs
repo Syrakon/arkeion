@@ -183,6 +183,40 @@ fn knn_routes_through_ivf_index() {
 }
 
 #[test]
+fn probes_controls_recall() {
+    let (_d, db) = db();
+    let conn = db.connect().unwrap();
+    conn.execute("CREATE TABLE docs (id INTEGER PRIMARY KEY, emb BLOB)", &[])
+        .unwrap();
+    for vals in [
+        "1.0, 0.0",
+        "0.95, 0.05",
+        "0.9, 0.1",
+        "0.0, 1.0",
+        "0.05, 0.95",
+        "0.1, 0.9",
+    ] {
+        conn.execute(
+            &format!("INSERT INTO docs (emb) VALUES (vector({vals}))"),
+            &[],
+        )
+        .unwrap();
+    }
+    // PROBES 2 escanea AMBOS clusters ⇒ los 6 son candidatos: LIMIT 4 da 4 filas
+    // (vs PROBES por defecto = 1 cluster = 3, cf. knn_routes_through_ivf_index).
+    conn.execute(
+        "CREATE VECTOR INDEX vi ON docs (emb) USING cosine LISTS 2 PROBES 2",
+        &[],
+    )
+    .unwrap();
+    let four = ids_ordered(
+        &conn,
+        "SELECT id FROM docs ORDER BY cosine_distance(emb, vector(1.0, 0.0)) LIMIT 4",
+    );
+    assert_eq!(four.len(), 4, "PROBES 2 escanea todos los clusters");
+}
+
+#[test]
 fn vector_index_errors() {
     let (_d, db) = db();
     let conn = db.connect().unwrap();

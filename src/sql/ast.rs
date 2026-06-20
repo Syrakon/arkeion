@@ -103,6 +103,8 @@ pub enum Stmt {
         metric: Option<String>,
         /// Número de clusters (k); `None` ⇒ por defecto.
         lists: Option<u32>,
+        /// Clusters a escanear por búsqueda (`PROBES n`); `None` ⇒ por defecto.
+        probes: Option<u32>,
     },
     /// `DROP VECTOR INDEX [IF EXISTS] nombre`.
     DropVectorIndex {

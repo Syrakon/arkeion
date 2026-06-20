@@ -44,6 +44,20 @@ pub fn encode_index_value_ref(v: ValueRef<'_>, out: &mut Vec<u8>) {
     }
 }
 
+/// Codifica `s` como **prefijo** de una clave de texto: byte de presencia + bytes
+/// escapados, **sin** el terminador. Es un byte-prefijo de
+/// `encode_index_value(Text(t))` para cualquier `t` que empiece por `s`, así que
+/// sirve para escaneos por prefijo (`term*` en FTS).
+pub fn encode_text_prefix(s: &str, out: &mut Vec<u8>) {
+    out.push(0x01); // presencia (no-null), igual que la rama Text de arriba
+    for &byte in s.as_bytes() {
+        out.push(byte);
+        if byte == 0x00 {
+            out.push(0xFF);
+        }
+    }
+}
+
 /// f64 → 8 bytes BE order-preserving: si el bit de signo está puesto (negativo),
 /// invertir **todos** los bits; si no, poner el bit de signo. Así los negativos
 /// caen por debajo de los positivos y, entre negativos, el de mayor magnitud va

@@ -2035,6 +2035,352 @@ pub fn fts_global_stats<S: NodeSource>(src: &S, root: PageId, fts_id: u32) -> Re
     fts_read_global(src, root, fts_id)
 }
 
+// --- evaluación de consultas MATCH contra el índice (docs/12-fts.md, fase 4) ---
+
+/// Decodifica el sufijo `rowid BE(8) ‖ field(1) ‖ pos(varint)` de un posting.
+fn decode_posting_suffix(suffix: &[u8]) -> Result<(i64, u8, u32)> {
+    let rid = suffix
+        .get(0..8)
+        .and_then(record::rowid_from_be)
+        .ok_or(Error::CorruptRecord("rowid en posting FTS"))?;
+    let field = *suffix
+        .get(8)
+        .ok_or(Error::CorruptRecord("field en posting FTS"))?;
+    let mut p = 9;
+    let pos = take_varint(suffix, &mut p).ok_or(Error::CorruptRecord("pos en posting FTS"))? as u32;
+    Ok((rid, field, pos))
+}
+
+/// Postings `(rowid, field, pos)` de un término exacto.
+fn fts_term_postings<S: NodeSource>(
+    src: &S,
+    root: PageId,
+    fts_id: u32,
+    term: &str,
+) -> Result<Vec<(i64, u8, u32)>> {
+    let mut prefix = fts_sub_prefix(fts_id, FTS_POSTING);
+    keyenc::encode_index_value_ref(ValueRef::Text(term), &mut prefix);
+    let plen = prefix.len();
+    let mut out = Vec::new();
+    btree::for_each_prefix(src, root, &prefix, |key| {
+        out.push(decode_posting_suffix(&key[plen..])?);
+        Ok(())
+    })?;
+    Ok(out)
+}
+
+/// Postings de los términos que empiezan por `prefix_text` (`term*`). Los tokens
+/// son texto normalizado sin `0x00`, así que el terminador del término es el
+/// primer `0x00 0x00` tras el prefijo de escaneo.
+fn fts_prefix_postings<S: NodeSource>(
+    src: &S,
+    root: PageId,
+    fts_id: u32,
+    prefix_text: &str,
+) -> Result<Vec<(i64, u8, u32)>> {
+    let mut scan = fts_sub_prefix(fts_id, FTS_POSTING);
+    keyenc::encode_text_prefix(prefix_text, &mut scan);
+    let slen = scan.len();
+    let mut out = Vec::new();
+    btree::for_each_prefix(src, root, &scan, |key| {
+        let tail = key
+            .get(slen..)
+            .ok_or(Error::CorruptRecord("posting FTS truncado"))?;
+        let term_end = tail
+            .windows(2)
+            .position(|w| w == [0x00, 0x00])
+            .ok_or(Error::CorruptRecord("terminador de término FTS"))?;
+        out.push(decode_posting_suffix(&tail[term_end + 2..])?);
+        Ok(())
+    })?;
+    Ok(out)
+}
+
+/// rowids distintos y ordenados de unos postings, opcionalmente por `field`.
+fn distinct_rowids(postings: &[(i64, u8, u32)], field: Option<u8>) -> Vec<i64> {
+    let mut ids: Vec<i64> = postings
+        .iter()
+        .filter(|(_, f, _)| field.is_none_or(|ff| *f == ff))
+        .map(|(r, _, _)| *r)
+        .collect();
+    ids.sort_unstable();
+    ids.dedup();
+    ids
+}
+
+fn intersect_sorted(a: &[i64], b: &[i64]) -> Vec<i64> {
+    let (mut i, mut j) = (0, 0);
+    let mut out = Vec::new();
+    while i < a.len() && j < b.len() {
+        if a[i] < b[j] {
+            i += 1;
+        } else if a[i] > b[j] {
+            j += 1;
+        } else {
+            out.push(a[i]);
+            i += 1;
+            j += 1;
+        }
+    }
+    out
+}
+
+fn union_sorted(a: &[i64], b: &[i64]) -> Vec<i64> {
+    let mut out = Vec::with_capacity(a.len() + b.len());
+    let (mut i, mut j) = (0, 0);
+    while i < a.len() && j < b.len() {
+        if a[i] < b[j] {
+            out.push(a[i]);
+            i += 1;
+        } else if a[i] > b[j] {
+            out.push(b[j]);
+            j += 1;
+        } else {
+            out.push(a[i]);
+            i += 1;
+            j += 1;
+        }
+    }
+    out.extend_from_slice(&a[i..]);
+    out.extend_from_slice(&b[j..]);
+    out
+}
+
+fn difference_sorted(a: &[i64], b: &[i64]) -> Vec<i64> {
+    let (mut i, mut j) = (0, 0);
+    let mut out = Vec::new();
+    while i < a.len() {
+        if j >= b.len() || a[i] < b[j] {
+            out.push(a[i]);
+            i += 1;
+        } else if a[i] > b[j] {
+            j += 1;
+        } else {
+            i += 1;
+            j += 1;
+        }
+    }
+    out
+}
+
+/// Tokeniza un texto de consulta crudo a su secuencia de términos normalizados
+/// (igual que se indexaron).
+fn tokenize_all(tk: &dyn crate::fts::Tokenizer, text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    tk.tokenize(text, &mut out);
+    out.into_iter().map(|t| t.text).collect()
+}
+
+/// rowids de una secuencia de tokens **adyacentes y en orden** en el mismo field
+/// (frase). Un solo token degenera en término exacto.
+fn phrase_rowids<S: NodeSource>(
+    src: &S,
+    root: PageId,
+    fts: &FtsIndexDef,
+    tokens: &[String],
+    field: Option<u8>,
+) -> Result<Vec<i64>> {
+    if tokens.is_empty() {
+        return Ok(Vec::new());
+    }
+    if tokens.len() == 1 {
+        let p = fts_term_postings(src, root, fts.fts_id, &tokens[0])?;
+        return Ok(distinct_rowids(&p, field));
+    }
+    let first = fts_term_postings(src, root, fts.fts_id, &tokens[0])?;
+    let rest: Vec<std::collections::HashSet<(i64, u8, u32)>> = tokens[1..]
+        .iter()
+        .map(|t| fts_term_postings(src, root, fts.fts_id, t).map(|v| v.into_iter().collect()))
+        .collect::<Result<_>>()?;
+    let mut rowids = Vec::new();
+    for &(rid, fld, pos) in &first {
+        if field.is_some_and(|f| f != fld) {
+            continue;
+        }
+        let ok = rest.iter().enumerate().all(|(k, set)| {
+            pos.checked_add(k as u32 + 1)
+                .is_some_and(|want| set.contains(&(rid, fld, want)))
+        });
+        if ok {
+            rowids.push(rid);
+        }
+    }
+    rowids.sort_unstable();
+    rowids.dedup();
+    Ok(rowids)
+}
+
+/// Span mínimo (max-min de una posición por grupo) de una ventana que cubre todos
+/// los grupos; `None` si algún grupo está vacío. Ventana deslizante sobre las
+/// posiciones etiquetadas por grupo.
+fn min_window_span(groups: &[Vec<u32>]) -> Option<u32> {
+    if groups.iter().any(|g| g.is_empty()) {
+        return None;
+    }
+    let mut items: Vec<(u32, usize)> = Vec::new();
+    for (g, ps) in groups.iter().enumerate() {
+        for &p in ps {
+            items.push((p, g));
+        }
+    }
+    items.sort_unstable();
+    let n = groups.len();
+    let mut have = vec![0usize; n];
+    let mut covered = 0usize;
+    let mut best: Option<u32> = None;
+    let mut l = 0usize;
+    let mut r = 0usize;
+    while r < items.len() {
+        if have[items[r].1] == 0 {
+            covered += 1;
+        }
+        have[items[r].1] += 1;
+        while covered == n {
+            best = Some(best.map_or(items[r].0 - items[l].0, |b| b.min(items[r].0 - items[l].0)));
+            have[items[l].1] -= 1;
+            if have[items[l].1] == 0 {
+                covered -= 1;
+            }
+            l += 1;
+        }
+        r += 1;
+    }
+    best
+}
+
+/// rowids donde todos los `tokens` aparecen en el mismo field dentro de una
+/// ventana de `distance` posiciones (NEAR; distancia = diferencia máxima de
+/// posición entre los términos de la ventana).
+fn near_rowids<S: NodeSource>(
+    src: &S,
+    root: PageId,
+    fts: &FtsIndexDef,
+    tokens: &[String],
+    distance: u32,
+    field: Option<u8>,
+) -> Result<Vec<i64>> {
+    if tokens.len() < 2 {
+        return Ok(Vec::new());
+    }
+    let mut per_token: Vec<std::collections::HashMap<(i64, u8), Vec<u32>>> = Vec::new();
+    for t in tokens {
+        let mut map: std::collections::HashMap<(i64, u8), Vec<u32>> =
+            std::collections::HashMap::new();
+        for (rid, fld, pos) in fts_term_postings(src, root, fts.fts_id, t)? {
+            if field.is_some_and(|f| f != fld) {
+                continue;
+            }
+            map.entry((rid, fld)).or_default().push(pos);
+        }
+        per_token.push(map);
+    }
+    let mut rowids = Vec::new();
+    for key in per_token[0].keys() {
+        if !per_token[1..].iter().all(|m| m.contains_key(key)) {
+            continue;
+        }
+        let groups: Vec<Vec<u32>> = per_token.iter().map(|m| m[key].clone()).collect();
+        if min_window_span(&groups).is_some_and(|s| s <= distance) {
+            rowids.push(key.0);
+        }
+    }
+    rowids.sort_unstable();
+    rowids.dedup();
+    Ok(rowids)
+}
+
+/// Evalúa un `Query` AST contra el índice y devuelve los rowids (ordenados,
+/// distintos). `field` restringe a una columna (filtro `col:`).
+fn eval_query<S: NodeSource>(
+    src: &S,
+    root: PageId,
+    table: &TableDef,
+    fts: &FtsIndexDef,
+    tk: &dyn crate::fts::Tokenizer,
+    q: &crate::fts::Query,
+    field: Option<u8>,
+) -> Result<Vec<i64>> {
+    use crate::fts::Query;
+    match q {
+        Query::Term { text, prefix } => {
+            let tokens = tokenize_all(tk, text);
+            if tokens.is_empty() {
+                Ok(Vec::new())
+            } else if tokens.len() == 1 {
+                let postings = if *prefix {
+                    fts_prefix_postings(src, root, fts.fts_id, &tokens[0])?
+                } else {
+                    fts_term_postings(src, root, fts.fts_id, &tokens[0])?
+                };
+                Ok(distinct_rowids(&postings, field))
+            } else {
+                // Un bareword que tokeniza en varios ⇒ frase de esos tokens.
+                phrase_rowids(src, root, fts, &tokens, field)
+            }
+        }
+        Query::Phrase(words) => {
+            let mut tokens = Vec::new();
+            for w in words {
+                tokens.extend(tokenize_all(tk, w));
+            }
+            phrase_rowids(src, root, fts, &tokens, field)
+        }
+        Query::Near { terms, distance } => {
+            let mut tokens = Vec::new();
+            for t in terms {
+                tokens.extend(tokenize_all(tk, t));
+            }
+            near_rowids(src, root, fts, &tokens, *distance, field)
+        }
+        Query::Column { column, query } => {
+            let pos = table
+                .columns
+                .iter()
+                .position(|c| c.name == *column)
+                .ok_or_else(|| Error::Sql {
+                    msg: format!("columna «{column}» desconocida en filtro MATCH"),
+                    pos: None,
+                })?;
+            if !fts.columns.contains(&pos) {
+                return Err(Error::Sql {
+                    msg: format!("la columna «{column}» no está en el índice FTS"),
+                    pos: None,
+                });
+            }
+            eval_query(src, root, table, fts, tk, query, Some(pos as u8))
+        }
+        Query::And(a, b) => {
+            let ra = eval_query(src, root, table, fts, tk, a, field)?;
+            let rb = eval_query(src, root, table, fts, tk, b, field)?;
+            Ok(intersect_sorted(&ra, &rb))
+        }
+        Query::Or(a, b) => {
+            let ra = eval_query(src, root, table, fts, tk, a, field)?;
+            let rb = eval_query(src, root, table, fts, tk, b, field)?;
+            Ok(union_sorted(&ra, &rb))
+        }
+        Query::Not(a, b) => {
+            let ra = eval_query(src, root, table, fts, tk, a, field)?;
+            let rb = eval_query(src, root, table, fts, tk, b, field)?;
+            Ok(difference_sorted(&ra, &rb))
+        }
+    }
+}
+
+/// Busca en un índice FTS con un `Query` ya parseado y devuelve los rowids que
+/// casan (ordenados, distintos). Entrada que usará el planner para
+/// `col MATCH 'consulta'`.
+pub fn fts_search<S: NodeSource>(
+    src: &S,
+    root: PageId,
+    table: &TableDef,
+    fts: &FtsIndexDef,
+    query: &crate::fts::Query,
+) -> Result<Vec<i64>> {
+    let tk = crate::fts::tokenizer_for(&fts.tokenizer)?;
+    eval_query(src, root, table, fts, tk.as_ref(), query, None)
+}
+
 /// rowids cuyas columnas indexadas valen exactamente `values` (igualdad). El
 /// planificador lo usa para `WHERE col = const`; luego `get_row` por cada rowid.
 pub fn index_scan_eq<S: NodeSource>(
@@ -2985,6 +3331,51 @@ mod tests {
                 .is_empty()
         );
         assert_eq!(fts_global_stats(&s, root, fts_id).unwrap(), (0, 0));
+    }
+
+    fn seed_corpus(s: &mut MemStore) -> (PageId, TableDef) {
+        let (mut root, def) = create_table(s, NO_ROOT, &mail_spec()).unwrap();
+        root = insert_mail(s, root, &def, "hola mundo", "el mundo es grande");
+        root = insert_mail(s, root, &def, "adios planeta", "mundo cruel y frio");
+        root = insert_mail(s, root, &def, "noticias", "el planeta tierra");
+        root = create_fts_index(s, root, "mail", "fts_mail", &[1, 2], "unicode").unwrap();
+        let def = get_table(s, root, "mail").unwrap().unwrap();
+        (root, def)
+    }
+
+    fn search(s: &MemStore, root: PageId, def: &TableDef, q: &str) -> Vec<i64> {
+        let query = crate::fts::parse_query(q).unwrap();
+        fts_search(s, root, def, &def.fts_indexes[0], &query).unwrap()
+    }
+
+    #[test]
+    fn fts_search_boolean_and_prefix() {
+        let mut s = MemStore::new();
+        let (root, def) = seed_corpus(&mut s);
+        assert_eq!(search(&s, root, &def, "mundo"), vec![1, 2]);
+        assert_eq!(search(&s, root, &def, "planeta"), vec![2, 3]);
+        assert_eq!(search(&s, root, &def, "mundo AND planeta"), vec![2]);
+        assert_eq!(search(&s, root, &def, "mundo OR planeta"), vec![1, 2, 3]);
+        assert_eq!(search(&s, root, &def, "mundo NOT planeta"), vec![1]);
+        assert_eq!(search(&s, root, &def, "mun*"), vec![1, 2]);
+        assert!(search(&s, root, &def, "inexistente").is_empty());
+    }
+
+    #[test]
+    fn fts_search_phrase_near_and_column() {
+        let mut s = MemStore::new();
+        let (root, def) = seed_corpus(&mut s);
+        // Frase: "el mundo" adyacente solo en el body de la fila 1.
+        assert_eq!(search(&s, root, &def, "\"el mundo\""), vec![1]);
+        assert_eq!(search(&s, root, &def, "\"el planeta\""), vec![3]);
+        // NEAR: mundo y grande a ≤5 posiciones (fila 1: pos 1 y 3).
+        assert_eq!(search(&s, root, &def, "NEAR(mundo grande, 5)"), vec![1]);
+        // …pero no a ≤1.
+        assert!(search(&s, root, &def, "NEAR(mundo grande, 1)").is_empty());
+        // Filtro por columna: mundo en subject ⇒ fila 1; en body ⇒ filas 1 y 2.
+        assert_eq!(search(&s, root, &def, "subject:mundo"), vec![1]);
+        assert_eq!(search(&s, root, &def, "body:mundo"), vec![1, 2]);
+        assert_eq!(search(&s, root, &def, "body:planeta"), vec![3]);
     }
 
     #[test]

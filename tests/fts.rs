@@ -12,18 +12,22 @@ fn db() -> (tempfile::TempDir, Database) {
     (dir, db)
 }
 
-/// ids (col 0) de una consulta, ordenados.
+/// ids (col 0) de una consulta, ordenados (para comparar conjuntos).
 fn ids(conn: &Connection, sql: &str) -> Vec<i64> {
-    let mut v: Vec<i64> = conn
-        .query(sql, &[])
+    let mut v = ids_ordered(conn, sql);
+    v.sort_unstable();
+    v
+}
+
+/// ids (col 0) **en el orden que devuelve la consulta** (para verificar ORDER BY).
+fn ids_ordered(conn: &Connection, sql: &str) -> Vec<i64> {
+    conn.query(sql, &[])
         .unwrap()
         .map(|r| {
             let id: i64 = r.unwrap().get(0).unwrap();
             id
         })
-        .collect();
-    v.sort_unstable();
-    v
+        .collect()
 }
 
 #[test]
@@ -253,6 +257,51 @@ fn snippet_and_highlight_via_sql() {
         .query("SELECT highlight(folder, 'x') FROM mail WHERE id = 1", &[])
         .and_then(|rows| rows.map(|r| r.map(|_| ())).collect::<Result<Vec<()>, _>>());
     assert!(matches!(bad, Err(Error::Sql { .. })));
+}
+
+#[test]
+fn bm25_ranks_by_relevance() {
+    let (_d, db) = db();
+    let conn = db.connect().unwrap();
+    conn.execute("CREATE TABLE docs (id INTEGER PRIMARY KEY, body TEXT)", &[])
+        .unwrap();
+    conn.execute("CREATE FULLTEXT INDEX f ON docs (body)", &[])
+        .unwrap();
+    // 1: el término 3 veces en un doc corto → más relevante.
+    // 2: una vez en un doc más largo. 3: no aparece.
+    for body in [
+        "rust rust rust",
+        "rust programming language systems",
+        "python java go",
+    ] {
+        conn.execute("INSERT INTO docs (body) VALUES (?1)", &params![body])
+            .unwrap();
+    }
+
+    // ORDER BY relevancia descendente: el doc 1 antes que el doc 2.
+    let ranked = ids_ordered(
+        &conn,
+        "SELECT id FROM docs WHERE body MATCH 'rust' ORDER BY bm25(body, 'rust') DESC",
+    );
+    assert_eq!(ranked, vec![1, 2]);
+
+    // Las puntuaciones son positivas y doc1 > doc2.
+    let scores: Vec<f64> = conn
+        .query(
+            "SELECT bm25(body, 'rust') FROM docs WHERE body MATCH 'rust' ORDER BY id",
+            &[],
+        )
+        .unwrap()
+        .map(|r| {
+            let s: f64 = r.unwrap().get(0).unwrap();
+            s
+        })
+        .collect();
+    assert_eq!(scores.len(), 2);
+    assert!(
+        scores[0] > scores[1] && scores[1] > 0.0,
+        "bm25 scores: {scores:?}"
+    );
 }
 
 #[test]

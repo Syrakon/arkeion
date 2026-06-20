@@ -1,17 +1,19 @@
 # 12 — Full-text search (FTS): `MATCH` + índice invertido (diseño + plan)
 
-> **Estado: EN CURSO — `MATCH` ya BUSCA (F1–F4 hechas).** En `feat/fts`,
-> testeado: F1 tokenizer, F2 índice invertido + stats BM25 + `CREATE/DROP
-> FULLTEXT INDEX` con mantenimiento en insert/update/delete/bulk, F3 operador
-> `MATCH` + parser del mini-lenguaje de consulta, F4 evaluación (`fts_search`
-> contra el índice **+** eval per-fila para que `MATCH` funcione en cualquier
-> posición del WHERE —OR/NOT/combinado—). `SELECT … WHERE col MATCH 'a AND b'`
-> **devuelve filas**. Falta: **narrowing** (que el planner use el índice para no
-> hacer full scan), F5 ranking `bm25` + `snippet`/`highlight`, F6 bordes
-> (`AS OF`, vacuum). Paridad funcional con FTS5 de SQLite, pero **nativo** (no
-> virtual table — Arkeion no tiene vtabs) y **versionado/auditable**: el índice
-> vive en el mismo árbol copy-on-write ⇒ `… MATCH 'x' AS OF VERSION n` busca en
-> el pasado.
+> **Estado: EN CURSO — F1–F5 hechas (búsqueda + ranking + extractos).** En
+> `feat/fts`, testeado: F1 tokenizer, F2 índice invertido + stats BM25 +
+> `CREATE/DROP FULLTEXT INDEX` con mantenimiento en insert/update/delete/bulk,
+> F3 operador `MATCH` + parser del mini-lenguaje, F4 evaluación (`fts_search`
+> contra el índice + eval per-fila → `MATCH` en cualquier posición del WHERE) **y
+> narrowing** (el planner usa el índice en SELECT/UPDATE/DELETE, sin full scan),
+> F5 **ranking `bm25(col,q)`** (`ORDER BY bm25(…) DESC`, IDF+tf+avgdl; stats
+> precomputadas en `run_select` y colgadas del `QuerySchema`) **+ `snippet()` /
+> `highlight()`** (extractos con términos resaltados, mismo tokenizer del índice).
+> `SELECT id, snippet(body,'a'), bm25(body,'a') FROM t WHERE body MATCH 'a' ORDER
+> BY bm25(body,'a') DESC` funciona. Falta: F6 bordes (`MATCH … AS OF`, vacuum) +
+> tokenizer email-aware + merge a main. Paridad funcional con FTS5 de SQLite,
+> pero **nativo** (no virtual table) y **versionado/auditable**: el índice vive en
+> el mismo árbol copy-on-write ⇒ `… MATCH 'x' AS OF VERSION n` busca en el pasado.
 
 Primer consumidor real: **papaya** (correo del usuario) para la búsqueda de
 mensajes. La migración del store de papaya a Arkeion **no** depende de esto; FTS

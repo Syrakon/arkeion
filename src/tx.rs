@@ -1483,6 +1483,21 @@ impl Snapshot {
     ) -> Result<Vec<i64>> {
         catalog::index_scan_range(self, self.data_root, idx, lo, hi)
     }
+
+    /// rowids que casan una consulta `MATCH` vía el índice full-text.
+    pub fn fts_search(
+        &self,
+        def: &TableDef,
+        fts: &FtsIndexDef,
+        query: &crate::fts::Query,
+    ) -> Result<Vec<i64>> {
+        catalog::fts_search(self, self.data_root, def, fts, query)
+    }
+
+    /// Stats BM25 de una consulta: `df` por término + globales `(N, Σ tokens)`.
+    pub fn fts_stats(&self, fts_id: u32, terms: &[String]) -> Result<(Vec<u64>, u64, u64)> {
+        catalog::fts_query_stats(self, self.data_root, fts_id, terms)
+    }
 }
 
 // --- estado de páginas de una transacción ---
@@ -1949,6 +1964,11 @@ impl WriteTx {
         query: &crate::fts::Query,
     ) -> Result<Vec<i64>> {
         catalog::fts_search(&self.ts, self.data_root, def, fts, query)
+    }
+
+    /// Stats BM25 de una consulta: `df` por término + globales `(N, Σ tokens)`.
+    pub fn fts_stats(&self, fts_id: u32, terms: &[String]) -> Result<(Vec<u64>, u64, u64)> {
+        catalog::fts_query_stats(&self.ts, self.data_root, fts_id, terms)
     }
 
     pub fn drop_table(&mut self, name: &str) -> Result<bool> {

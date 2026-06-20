@@ -12,7 +12,7 @@ mod excerpt;
 mod query;
 mod tokenizer;
 
-pub use excerpt::{highlight, snippet};
+pub use excerpt::{highlight, query_terms, snippet};
 pub use query::{Query, parse_query};
 pub use tokenizer::{AsciiTokenizer, Token, Tokenizer, UnicodeTokenizer};
 

@@ -6,11 +6,11 @@
 //! no una coerción silenciosa. Única promoción: INTEGER ↔ REAL.
 
 use std::cmp::Ordering;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::catalog::{
-    self, ColType, ColumnDef, ColumnSpec, IndexDef, TableDef, TableSpec, TriggerDef, TriggerEvent,
-    TriggerForEach, TriggerTiming,
+    self, ColType, ColumnDef, ColumnSpec, FtsIndexDef, IndexDef, TableDef, TableSpec, TriggerDef,
+    TriggerEvent, TriggerForEach, TriggerTiming,
 };
 use crate::error::{Error, Result};
 use crate::record::Value;
@@ -47,6 +47,16 @@ pub trait DataSource {
     /// El SELECT (texto) de una vista con ese nombre, o `None`. Lo usa el overlay
     /// que materializa las vistas.
     fn view(&self, name: &str) -> Result<Option<String>>;
+    /// rowids que casan una consulta `MATCH` vía el índice full-text (narrowing).
+    fn fts_search(
+        &self,
+        table: &TableDef,
+        fts: &FtsIndexDef,
+        query: &crate::fts::Query,
+    ) -> Result<Vec<i64>>;
+    /// Stats BM25 de una consulta: `df` por término (en orden) + globales
+    /// `(N docs, Σ tokens)`.
+    fn fts_stats(&self, fts_id: u32, terms: &[String]) -> Result<(Vec<u64>, u64, u64)>;
 }
 
 impl DataSource for Snapshot {
@@ -85,6 +95,19 @@ impl DataSource for Snapshot {
 
     fn view(&self, name: &str) -> Result<Option<String>> {
         Snapshot::view(self, name)
+    }
+
+    fn fts_search(
+        &self,
+        table: &TableDef,
+        fts: &FtsIndexDef,
+        query: &crate::fts::Query,
+    ) -> Result<Vec<i64>> {
+        Snapshot::fts_search(self, table, fts, query)
+    }
+
+    fn fts_stats(&self, fts_id: u32, terms: &[String]) -> Result<(Vec<u64>, u64, u64)> {
+        Snapshot::fts_stats(self, fts_id, terms)
     }
 }
 
@@ -125,6 +148,19 @@ impl DataSource for WriteTx {
     fn view(&self, name: &str) -> Result<Option<String>> {
         WriteTx::view(self, name)
     }
+
+    fn fts_search(
+        &self,
+        table: &TableDef,
+        fts: &FtsIndexDef,
+        query: &crate::fts::Query,
+    ) -> Result<Vec<i64>> {
+        WriteTx::fts_search(self, table, fts, query)
+    }
+
+    fn fts_stats(&self, fts_id: u32, terms: &[String]) -> Result<(Vec<u64>, u64, u64)> {
+        WriteTx::fts_stats(self, fts_id, terms)
+    }
 }
 
 fn sql_err(msg: impl Into<String>) -> Error {
@@ -141,6 +177,17 @@ fn sql_err(msg: impl Into<String>) -> Error {
 /// tabla en orden de aparición.
 struct QuerySchema {
     tables: Vec<SchemaTable>,
+    /// Contexto BM25 precomputado por `(fts_id, texto de consulta)`: lo llena
+    /// `run_select` (que tiene acceso al store) antes del bucle de filas, y lo lee
+    /// `eval` de `bm25(col, q)` (que solo tiene la fila + este esquema).
+    fts_rank: HashMap<(u32, String), FtsRankCtx>,
+}
+
+/// Pesos IDF (por término normalizado) y longitud media de documento de una
+/// consulta BM25; constantes en todas las filas.
+struct FtsRankCtx {
+    idf: HashMap<String, f64>,
+    avgdl: f64,
 }
 
 struct SchemaTable {
@@ -151,7 +198,10 @@ struct SchemaTable {
 
 impl QuerySchema {
     fn new() -> QuerySchema {
-        QuerySchema { tables: Vec::new() }
+        QuerySchema {
+            tables: Vec::new(),
+            fts_rank: HashMap::new(),
+        }
     }
 
     fn single(qualifier: &str, def: TableDef) -> QuerySchema {
@@ -856,6 +906,172 @@ fn find_match_conjunct(e: &Expr) -> Option<&Expr> {
         Expr::Binary(a, BinOp::And, b) => find_match_conjunct(a).or_else(|| find_match_conjunct(b)),
         _ => None,
     }
+}
+
+/// Narrowing FTS para `run_select`: si el WHERE tiene un `MATCH` no negado de
+/// nivel superior sobre una columna indexada con consulta constante, devuelve las
+/// filas que casan vía el índice (evita el full scan). El WHERE completo se
+/// re-aplica por fila después, así que basta con un superconjunto exacto.
+fn fts_plan(
+    src: &impl DataSource,
+    def: &TableDef,
+    where_clause: Option<&Expr>,
+    params: &[Value],
+) -> Result<Option<Vec<Vec<Value>>>> {
+    let Some(Expr::Match {
+        column,
+        query,
+        negated,
+    }) = where_clause.and_then(find_match_conjunct)
+    else {
+        return Ok(None);
+    };
+    if *negated {
+        return Ok(None);
+    }
+    let Expr::Column { name, .. } = column.as_ref() else {
+        return Ok(None);
+    };
+    let Some(local_pos) = def
+        .columns
+        .iter()
+        .position(|c| !c.dropped && c.name == *name)
+    else {
+        return Ok(None);
+    };
+    let Some(fts) = def
+        .fts_indexes
+        .iter()
+        .find(|f| f.columns.contains(&local_pos))
+    else {
+        return Ok(None);
+    };
+    let Value::Text(q_str) = eval_const(query, params)? else {
+        return Ok(None);
+    };
+    let q = crate::fts::parse_query(&q_str)?;
+    let mut rows = Vec::new();
+    for rowid in src.fts_search(def, fts, &q)? {
+        if let Some(row) = src.get_row(def, rowid)? {
+            rows.push(row);
+        }
+    }
+    Ok(Some(rows))
+}
+
+/// Recolecta las llamadas `bm25(col, q)` de una expresión.
+fn collect_bm25<'a>(e: &'a Expr, out: &mut Vec<(&'a Expr, &'a Expr)>) {
+    match e {
+        Expr::Function { name, args } if name == "bm25" && args.len() == 2 => {
+            out.push((&args[0], &args[1]));
+        }
+        Expr::Function { args, .. } => args.iter().for_each(|a| collect_bm25(a, out)),
+        Expr::Unary(_, x) | Expr::Cast { expr: x, .. } | Expr::IsNull { expr: x, .. } => {
+            collect_bm25(x, out)
+        }
+        Expr::Binary(a, _, b) => {
+            collect_bm25(a, out);
+            collect_bm25(b, out);
+        }
+        Expr::Like { expr, pattern, .. } => {
+            collect_bm25(expr, out);
+            collect_bm25(pattern, out);
+        }
+        Expr::Match { column, query, .. } => {
+            collect_bm25(column, out);
+            collect_bm25(query, out);
+        }
+        Expr::In { expr, list, .. } => {
+            collect_bm25(expr, out);
+            list.iter().for_each(|x| collect_bm25(x, out));
+        }
+        Expr::Case {
+            operand,
+            whens,
+            else_,
+        } => {
+            if let Some(o) = operand {
+                collect_bm25(o, out);
+            }
+            whens.iter().for_each(|(c, r)| {
+                collect_bm25(c, out);
+                collect_bm25(r, out);
+            });
+            if let Some(x) = else_ {
+                collect_bm25(x, out);
+            }
+        }
+        Expr::Aggregate { arg: Some(a), .. } => collect_bm25(a, out),
+        _ => {}
+    }
+}
+
+/// Precomputa el contexto BM25 (`idf` por término + `avgdl`) de cada `bm25(col,q)`
+/// de la proyección/`ORDER BY`, leyendo las stats del índice vía `src`, y lo deja
+/// en `schema` para que `eval` lo use por fila. `idf(t) = ln(1 + (N-df+0.5)/(df+0.5))`.
+fn precompute_bm25(
+    src: &impl DataSource,
+    schema: &mut QuerySchema,
+    stmt: &SelectStmt,
+    params: &[Value],
+) -> Result<()> {
+    let mut calls: Vec<(&Expr, &Expr)> = Vec::new();
+    for item in &stmt.projection {
+        if let SelectItem::Expr { expr, .. } = item {
+            collect_bm25(expr, &mut calls);
+        }
+    }
+    for o in &stmt.order_by {
+        collect_bm25(&o.expr, &mut calls);
+    }
+    for (col, query) in calls {
+        let Expr::Column { table: tq, name } = col else {
+            return Err(sql_err(
+                "bm25(): el primer argumento debe ser una columna indexada".to_string(),
+            ));
+        };
+        let q_str = match eval_const(query, params)? {
+            Value::Text(s) => s,
+            _ => {
+                return Err(sql_err(
+                    "bm25(): la consulta debe ser texto constante".to_string(),
+                ));
+            }
+        };
+        // Resuelve la columna en un bloque para soltar el préstamo inmutable de
+        // `schema` antes de mutar `fts_rank`.
+        let (fts_id, tok_name) = {
+            let (def, local_pos, _) = schema.owner_of(tq.as_deref(), name)?;
+            let fts = def
+                .fts_indexes
+                .iter()
+                .find(|f| f.columns.contains(&local_pos))
+                .ok_or_else(|| {
+                    sql_err(format!("la columna «{name}» no tiene un índice FULLTEXT"))
+                })?;
+            (fts.fts_id, fts.tokenizer.clone())
+        };
+        if schema.fts_rank.contains_key(&(fts_id, q_str.clone())) {
+            continue;
+        }
+        let tk = crate::fts::tokenizer_for(&tok_name)?;
+        let q = crate::fts::parse_query(&q_str)?;
+        let terms = crate::fts::query_terms(&q, tk.as_ref());
+        let (df, n, total) = src.fts_stats(fts_id, &terms)?;
+        let nf = n as f64;
+        let avgdl = if n > 0 { total as f64 / nf } else { 0.0 };
+        let idf: HashMap<String, f64> = terms
+            .into_iter()
+            .zip(df.iter().map(|&d| {
+                let d = d as f64;
+                (1.0 + (nf - d + 0.5) / (d + 0.5)).ln()
+            }))
+            .collect();
+        schema
+            .fts_rank
+            .insert((fts_id, q_str), FtsRankCtx { idf, avgdl });
+    }
+    Ok(())
 }
 
 /// Re-parsea los predicados `CHECK` de una tabla (guardados como texto) a `Expr`,
@@ -1915,6 +2131,9 @@ pub fn run_select(src: &impl DataSource, stmt: &SelectStmt, params: &[Value]) ->
     };
     let from_def = lookup(src, from_ref)?;
     let mut schema = QuerySchema::single(from_ref.qualifier(), from_def.clone());
+    // Precomputa el contexto BM25 de las llamadas `bm25(col, q)` (necesita stats
+    // del índice, disponibles aquí vía `src`); `eval` lo lee por fila del schema.
+    precompute_bm25(src, &mut schema, stmt, params)?;
 
     // Planificador (solo sin joins): point lookup por PK (`alias_rowid = const`),
     // si no, index scan por un índice secundario (`col_indexada = const`), si no,
@@ -1933,6 +2152,11 @@ pub fn run_select(src: &impl DataSource, stmt: &SelectStmt, params: &[Value]) ->
             index_range_plan(&schema, stmt.where_clause.as_ref())
         {
             index_range_rows(src, &from_def, idx, op, const_expr, params)?
+        } else if let Some(fts_rows) = fts_plan(src, &from_def, stmt.where_clause.as_ref(), params)?
+        {
+            // Narrowing FTS: un `MATCH` no negado de nivel superior usa el índice
+            // en vez del full scan. El WHERE completo se re-aplica por fila.
+            fts_rows
         } else {
             src.scan_rows(&from_def)?
         }
@@ -2357,6 +2581,19 @@ impl DataSource for CteSource<'_> {
     fn view(&self, name: &str) -> Result<Option<String>> {
         self.inner.view(name)
     }
+
+    fn fts_search(
+        &self,
+        table: &TableDef,
+        fts: &FtsIndexDef,
+        query: &crate::fts::Query,
+    ) -> Result<Vec<i64>> {
+        self.inner.fts_search(table, fts, query)
+    }
+
+    fn fts_stats(&self, fts_id: u32, terms: &[String]) -> Result<(Vec<u64>, u64, u64)> {
+        self.inner.fts_stats(fts_id, terms)
+    }
 }
 
 // --- vistas (`CREATE VIEW`): SELECT con nombre, materializado bajo demanda ---
@@ -2484,6 +2721,19 @@ impl DataSource for ViewSource<'_> {
     }
     fn view(&self, name: &str) -> Result<Option<String>> {
         self.inner.view(name)
+    }
+
+    fn fts_search(
+        &self,
+        table: &TableDef,
+        fts: &FtsIndexDef,
+        query: &crate::fts::Query,
+    ) -> Result<Vec<i64>> {
+        self.inner.fts_search(table, fts, query)
+    }
+
+    fn fts_stats(&self, fts_id: u32, terms: &[String]) -> Result<(Vec<u64>, u64, u64)> {
+        self.inner.fts_stats(fts_id, terms)
     }
 }
 
@@ -4882,6 +5132,75 @@ fn eval_excerpt(
     }
 }
 
+/// `bm25(col, q)`: relevancia Okapi BM25 de la fila (mayor = más relevante). Usa
+/// el contexto precomputado (`idf`/`avgdl`) del `schema` + la frecuencia de
+/// término y la longitud del documento de esta fila (todas sus columnas
+/// indexadas). `ORDER BY bm25(col, q) DESC` ordena por relevancia.
+fn eval_bm25(
+    args: &[Expr],
+    row: Option<(&QuerySchema, &[Value])>,
+    params: &[Value],
+) -> Result<Value> {
+    const K1: f64 = 1.2;
+    const B: f64 = 0.75;
+    let Some((schema, full_row)) = row else {
+        return Err(sql_err("bm25() necesita una fila".to_string()));
+    };
+    if args.len() != 2 {
+        return Err(sql_err(
+            "bm25(columna, consulta) requiere 2 argumentos".to_string(),
+        ));
+    }
+    let Expr::Column { table: tq, name } = &args[0] else {
+        return Err(sql_err(
+            "bm25(): el primer argumento debe ser una columna indexada".to_string(),
+        ));
+    };
+    let q_str = match eval(&args[1], row, params)? {
+        Value::Text(s) => s,
+        Value::Null => return Ok(Value::Null),
+        _ => return Err(sql_err("bm25(): la consulta debe ser texto".to_string())),
+    };
+    let (def, local_pos, offset) = schema.owner_of(tq.as_deref(), name)?;
+    let fts = def
+        .fts_indexes
+        .iter()
+        .find(|f| f.columns.contains(&local_pos))
+        .ok_or_else(|| sql_err(format!("la columna «{name}» no tiene un índice FULLTEXT")))?;
+    let ctx = schema.fts_rank.get(&(fts.fts_id, q_str)).ok_or_else(|| {
+        sql_err("bm25() solo se admite en un SELECT directo (sin join/subconsulta)".to_string())
+    })?;
+    // Documento = tokens de todas las columnas indexadas de esta fila.
+    let tk = crate::fts::tokenizer_for(&fts.tokenizer)?;
+    let local = &full_row[offset..offset + def.columns.len()];
+    let mut tf: HashMap<String, u32> = HashMap::new();
+    let mut dl: u64 = 0;
+    let mut buf = Vec::new();
+    for &col in &fts.columns {
+        buf.clear();
+        if let Some(Value::Text(text)) = local.get(col) {
+            tk.tokenize(text, &mut buf);
+        }
+        for token in &buf {
+            dl += 1;
+            if ctx.idf.contains_key(&token.text) {
+                *tf.entry(token.text.clone()).or_insert(0) += 1;
+            }
+        }
+    }
+    let dl = dl as f64;
+    let mut score = 0.0;
+    for (term, idf) in &ctx.idf {
+        let f = *tf.get(term).unwrap_or(&0) as f64;
+        if f == 0.0 {
+            continue;
+        }
+        let norm = if ctx.avgdl > 0.0 { dl / ctx.avgdl } else { 1.0 };
+        score += idf * (f * (K1 + 1.0)) / (f + K1 * (1.0 - B + B * norm));
+    }
+    Ok(Value::Real(score))
+}
+
 fn eval(e: &Expr, row: Option<(&QuerySchema, &[Value])>, params: &[Value]) -> Result<Value> {
     match e {
         Expr::Literal(v) => Ok(v.clone()),
@@ -5041,6 +5360,7 @@ fn eval(e: &Expr, row: Option<(&QuerySchema, &[Value])>, params: &[Value]) -> Re
         Expr::Function { name, args } if matches!(name.as_str(), "snippet" | "highlight") => {
             eval_excerpt(name, args, row, params)
         }
+        Expr::Function { name, args } if name == "bm25" => eval_bm25(args, row, params),
         Expr::Function { name, args } => {
             let vals: Vec<Value> = args
                 .iter()

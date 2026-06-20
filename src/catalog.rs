@@ -2035,6 +2035,22 @@ pub fn fts_global_stats<S: NodeSource>(src: &S, root: PageId, fts_id: u32) -> Re
     fts_read_global(src, root, fts_id)
 }
 
+/// Stats que necesita BM25 para una consulta: `df` por cada término (en orden) y
+/// las globales `(N docs, Σ tokens)`. Una sola pasada de lecturas.
+pub fn fts_query_stats<S: NodeSource>(
+    src: &S,
+    root: PageId,
+    fts_id: u32,
+    terms: &[String],
+) -> Result<(Vec<u64>, u64, u64)> {
+    let df = terms
+        .iter()
+        .map(|t| fts_doc_freq(src, root, fts_id, t))
+        .collect::<Result<Vec<u64>>>()?;
+    let (n, total) = fts_global_stats(src, root, fts_id)?;
+    Ok((df, n, total))
+}
+
 // --- evaluación de consultas MATCH contra el índice (docs/12-fts.md, fase 4) ---
 
 /// Decodifica el sufijo `rowid BE(8) ‖ field(1) ‖ pos(varint)` de un posting.

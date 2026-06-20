@@ -47,6 +47,18 @@ fn highlight_targets(q: &Query, tk: &dyn Tokenizer) -> Vec<(String, bool)> {
     out
 }
 
+/// Términos normalizados y deduplicados de la consulta para ranking BM25: las
+/// hojas positivas, tokenizadas (se ignora el flag de prefijo a efectos de IDF).
+pub fn query_terms(q: &Query, tk: &dyn Tokenizer) -> Vec<String> {
+    let mut out: Vec<String> = highlight_targets(q, tk)
+        .into_iter()
+        .map(|(t, _)| t)
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
 fn token_matches(tok: &str, targets: &[(String, bool)]) -> bool {
     targets.iter().any(|(t, prefix)| {
         if *prefix {

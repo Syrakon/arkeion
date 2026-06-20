@@ -1,9 +1,11 @@
 # 12 — Full-text search (FTS): `MATCH` + índice invertido (diseño + plan)
 
-> **Estado: EN CURSO.** Fase 1 (tokenizer) en marcha en `feat/fts`. El resto
-> (almacenamiento invertido, operador `MATCH`, planner, ranking `bm25` y
-> auxiliares `snippet`/`highlight`) planificado abajo. Paridad funcional con
-> FTS5 de SQLite, pero **nativo** (no virtual table — Arkeion no tiene vtabs) y
+> **Estado: EN CURSO (Fase 2 de 6 completa).** Hechas y testeadas en `feat/fts`:
+> F1 tokenizer, F2 índice invertido + stats BM25 + `CREATE/DROP FULLTEXT INDEX`
+> end-to-end por SQL con mantenimiento consistente en insert/update/delete/bulk.
+> Falta: F3 operador `MATCH` + parser de query, F4 planner, F5 ranking `bm25` y
+> auxiliares `snippet`/`highlight`, F6 bordes. Paridad funcional con FTS5 de
+> SQLite, pero **nativo** (no virtual table — Arkeion no tiene vtabs) y
 > **versionado/auditable**: el índice vive en el mismo árbol copy-on-write que los
 > datos ⇒ `... WHERE col MATCH 'x' AS OF VERSION n` busca en el pasado.
 

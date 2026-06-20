@@ -502,14 +502,40 @@ pub fn run_execute(tx: &mut WriteTx, stmt: &Stmt, params: &[Value]) -> Result<us
             }
             Ok(0)
         }
-        // La ejecución real de los índices FTS (backfill, postings, stats) llega
-        // en la fase 2c; aquí solo se parsea la sentencia (fase 2b).
-        Stmt::CreateFtsIndex { .. } => Err(sql_err(
-            "CREATE FULLTEXT INDEX: ejecución pendiente (fase 2c)".to_string(),
-        )),
-        Stmt::DropFtsIndex { .. } => Err(sql_err(
-            "DROP FULLTEXT INDEX: ejecución pendiente (fase 2c)".to_string(),
-        )),
+        Stmt::CreateFtsIndex {
+            if_not_exists,
+            name,
+            table,
+            columns,
+            tokenizer,
+        } => {
+            if *if_not_exists && tx.fts_index_exists(name)? {
+                return Ok(0);
+            }
+            let def = tx
+                .table(table)?
+                .ok_or_else(|| sql_err(format!("tabla desconocida: {table}")))?;
+            let mut positions = Vec::with_capacity(columns.len());
+            for cname in columns {
+                let pos = def
+                    .columns
+                    .iter()
+                    .position(|c| &c.name == cname)
+                    .ok_or_else(|| sql_err(format!("columna desconocida: {cname}")))?;
+                positions.push(pos);
+            }
+            // Sin `USING` ⇒ tokenizer por defecto.
+            let tok = tokenizer.as_deref().unwrap_or("unicode");
+            tx.create_fts_index(table, name, &positions, tok)?;
+            Ok(0)
+        }
+        Stmt::DropFtsIndex { if_exists, name } => {
+            let dropped = tx.drop_fts_index(name)?;
+            if !dropped && !if_exists {
+                return Err(sql_err(format!("índice FTS desconocido: {name}")));
+            }
+            Ok(0)
+        }
         Stmt::Insert {
             table,
             columns,

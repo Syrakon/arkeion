@@ -1890,6 +1890,40 @@ impl WriteTx {
         catalog::index_exists(&self.ts, self.data_root, name)
     }
 
+    /// Crea un índice full-text sobre `columns` (TEXT) con el tokenizer dado y lo
+    /// rellena con las filas existentes.
+    pub fn create_fts_index(
+        &mut self,
+        table: &str,
+        name: &str,
+        columns: &[usize],
+        tokenizer: &str,
+    ) -> Result<()> {
+        self.schema_cache.clear();
+        self.data_root = catalog::create_fts_index(
+            &mut self.ts,
+            self.data_root,
+            table,
+            name,
+            columns,
+            tokenizer,
+        )?;
+        Ok(())
+    }
+
+    /// Borra un índice FTS por su nombre global. `false` si no existía.
+    pub fn drop_fts_index(&mut self, name: &str) -> Result<bool> {
+        self.schema_cache.clear();
+        let (root, dropped) = catalog::drop_fts_index(&mut self.ts, self.data_root, name)?;
+        self.data_root = root;
+        Ok(dropped)
+    }
+
+    /// `true` si existe un índice FTS con ese nombre (para `IF NOT EXISTS`).
+    pub fn fts_index_exists(&self, name: &str) -> Result<bool> {
+        catalog::fts_index_exists(&self.ts, self.data_root, name)
+    }
+
     /// rowids cuyas columnas indexadas valen `values` (igualdad, una entrada por
     /// columna del índice), vía el índice.
     pub fn index_lookup(&self, idx: &IndexDef, values: &[Value]) -> Result<Vec<i64>> {
@@ -2061,6 +2095,20 @@ impl WriteTx {
             )?;
             for (idx, entries) in def.indexes.iter().zip(&mut pending) {
                 entries.push(catalog::resolved_index_entry(&def, values, idx, rowid)?);
+            }
+            // El FTS no se difiere (la tokenización es por fila): se mantiene en
+            // línea para que el bulk-load no deje el índice full-text a medias.
+            // Materializa el registro (defaults incl.) para coincidir con el
+            // camino normal.
+            if !def.fts_indexes.is_empty() {
+                self.data_root = catalog::insert_fts_entries_bulk(
+                    &mut self.ts,
+                    self.data_root,
+                    &def,
+                    rowid,
+                    values,
+                    &mut self.rec_buf,
+                )?;
             }
             n += 1;
         }

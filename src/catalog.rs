@@ -1863,6 +1863,23 @@ pub fn insert_fts_entries<S: NodeStore>(
     Ok(root)
 }
 
+/// Igual que [`insert_fts_entries`] pero **materializa** el registro desde los
+/// valores crudos del bulk-load (rellena defaults y normaliza vía
+/// [`validate_record_into`]) antes de tokenizar, para que un bulk-insert que
+/// omita una columna TEXT con `DEFAULT` produzca exactamente los mismos postings
+/// que el camino normal. Reutiliza `rec_buf`.
+pub(crate) fn insert_fts_entries_bulk<S: NodeStore>(
+    s: &mut S,
+    root: PageId,
+    table: &TableDef,
+    rowid: i64,
+    values: &[Value],
+    rec_buf: &mut Vec<Value>,
+) -> Result<PageId> {
+    validate_record_into(table, values, rec_buf)?;
+    insert_fts_entries(s, root, table, rowid, rec_buf)
+}
+
 /// Borra las entradas FTS de una fila (todos los índices FTS de la tabla).
 pub fn delete_fts_entries<S: NodeStore>(
     s: &mut S,
@@ -2248,6 +2265,9 @@ pub(crate) fn put_row<S: NodeStore>(
     if !table.indexes.is_empty() {
         root = insert_index_entries(s, root, table, rowid, &record)?;
     }
+    if !table.fts_indexes.is_empty() {
+        root = insert_fts_entries(s, root, table, rowid, &record)?;
+    }
     Ok(root)
 }
 
@@ -2263,18 +2283,25 @@ pub(crate) fn put_row_buffered<S: NodeStore>(
     rec_buf: &mut Vec<Value>,
     enc_buf: &mut Vec<u8>,
 ) -> Result<PageId> {
-    if table.indexes.is_empty() {
+    if table.indexes.is_empty() && table.fts_indexes.is_empty() {
         // Sin índices (el caso del bulk-load típico): valida y codifica en una
         // pasada sobre los valores prestados, sin clonar texto/blob por fila
         // ni materializar el registro (M10-perf, fase 2).
         return put_row_data(s, root, table, rowid, values, enc_buf);
     }
-    // Con índices: las entradas necesitan el registro materializado (claves de
-    // índice, dup-check UNIQUE); se reutilizan los buffers.
+    // Con índices (normales o FTS): las entradas necesitan el registro
+    // materializado (claves de índice, dup-check UNIQUE, tokens FTS); se
+    // reutilizan los buffers.
     validate_record_into(table, values, rec_buf)?;
     record::encode_values_into(rec_buf, enc_buf);
-    let root = btree::insert(s, root, &row_key(table.table_id, rowid), enc_buf)?;
-    insert_index_entries(s, root, table, rowid, rec_buf.as_slice())
+    let mut root = btree::insert(s, root, &row_key(table.table_id, rowid), enc_buf)?;
+    if !table.indexes.is_empty() {
+        root = insert_index_entries(s, root, table, rowid, rec_buf.as_slice())?;
+    }
+    if !table.fts_indexes.is_empty() {
+        root = insert_fts_entries(s, root, table, rowid, rec_buf.as_slice())?;
+    }
+    Ok(root)
 }
 
 /// Valida y escribe **solo la fila** (sin entradas de índice), codificando en
@@ -2397,14 +2424,22 @@ pub fn update_row<S: NodeStore>(
     };
     let record = validated_record(table, values)?;
     let mut root = root;
-    // Quita las entradas de índice de la fila vieja antes de sobrescribir.
-    if !table.indexes.is_empty() {
+    // Quita las entradas (índice y FTS) de la fila vieja antes de sobrescribir.
+    if !table.indexes.is_empty() || !table.fts_indexes.is_empty() {
         let old = finish_row(table, rowid, record::decode_values(&old_bytes)?)?;
-        root = delete_index_entries(s, root, table, rowid, &old)?;
+        if !table.indexes.is_empty() {
+            root = delete_index_entries(s, root, table, rowid, &old)?;
+        }
+        if !table.fts_indexes.is_empty() {
+            root = delete_fts_entries(s, root, table, rowid, &old)?;
+        }
     }
     root = btree::insert(s, root, &key, &record::encode_values(&record))?;
     if !table.indexes.is_empty() {
         root = insert_index_entries(s, root, table, rowid, &record)?;
+    }
+    if !table.fts_indexes.is_empty() {
+        root = insert_fts_entries(s, root, table, rowid, &record)?;
     }
     Ok((root, true))
 }
@@ -2432,16 +2467,21 @@ pub fn delete_row<S: NodeStore>(
     rowid: i64,
 ) -> Result<(PageId, bool)> {
     let key = row_key(table.table_id, rowid);
-    if table.indexes.is_empty() {
+    if table.indexes.is_empty() && table.fts_indexes.is_empty() {
         return btree::delete(s, root, &key);
     }
-    // Con índices: hay que leer la fila para quitar sus entradas.
+    // Con índices (normales o FTS): hay que leer la fila para quitar sus entradas.
     let Some(bytes) = btree::get(s, root, &key)? else {
         return Ok((root, false));
     };
     let record = finish_row(table, rowid, record::decode_values(&bytes)?)?;
     let (mut root, _) = btree::delete(s, root, &key)?;
-    root = delete_index_entries(s, root, table, rowid, &record)?;
+    if !table.indexes.is_empty() {
+        root = delete_index_entries(s, root, table, rowid, &record)?;
+    }
+    if !table.fts_indexes.is_empty() {
+        root = delete_fts_entries(s, root, table, rowid, &record)?;
+    }
     Ok((root, true))
 }
 
@@ -2880,6 +2920,71 @@ mod tests {
             create_fts_index(&mut s, root, "mail", "fx", &[2], "unicode"),
             Err(Error::Constraint(_))
         ));
+    }
+
+    #[test]
+    fn fts_row_ops_maintain_index() {
+        let mut s = MemStore::new();
+        let (mut root, _) = create_table(&mut s, NO_ROOT, &mail_spec()).unwrap();
+        root = create_fts_index(&mut s, root, "mail", "fts_mail", &[1, 2], "unicode").unwrap();
+        let def = get_table(&s, root, "mail").unwrap().unwrap();
+        let fts_id = def.fts_indexes[0].fts_id;
+
+        // INSERT mantiene el índice (hook en put_row).
+        let (r, rid) = insert_row(
+            &mut s,
+            root,
+            &def,
+            &[
+                Value::Null,
+                Value::Text("hola mundo".into()),
+                Value::Text("texto".into()),
+            ],
+        )
+        .unwrap();
+        root = r;
+        assert_eq!(
+            fts_term_rowids(&s, root, fts_id, "mundo").unwrap(),
+            vec![rid]
+        );
+        assert_eq!(fts_global_stats(&s, root, fts_id).unwrap(), (1, 3));
+
+        // UPDATE re-tokeniza: quita los términos viejos y mete los nuevos.
+        let (r, ok) = update_row(
+            &mut s,
+            root,
+            &def,
+            rid,
+            &[
+                Value::Integer(rid),
+                Value::Text("adios".into()),
+                Value::Text("planeta".into()),
+            ],
+        )
+        .unwrap();
+        root = r;
+        assert!(ok);
+        assert!(
+            fts_term_rowids(&s, root, fts_id, "mundo")
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            fts_term_rowids(&s, root, fts_id, "planeta").unwrap(),
+            vec![rid]
+        );
+        assert_eq!(fts_global_stats(&s, root, fts_id).unwrap(), (1, 2));
+
+        // DELETE limpia las entradas de la fila.
+        let (r, ok) = delete_row(&mut s, root, &def, rid).unwrap();
+        root = r;
+        assert!(ok);
+        assert!(
+            fts_term_rowids(&s, root, fts_id, "planeta")
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(fts_global_stats(&s, root, fts_id).unwrap(), (0, 0));
     }
 
     #[test]

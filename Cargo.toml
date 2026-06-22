@@ -48,3 +48,16 @@ bench-sqlite = ["dep:rusqlite"]
 [[bench]]
 name = "crud"
 harness = false
+
+# Benchmark vectorial (KNN exacto + IVF/ANN) sobre datasets reales tipo SIFT,
+# con recall@k contra ground-truth. Lee rutas por variables de entorno; emite
+# JSON. Comparación cruzada (pgvector/Qdrant) en `bench/` fuera del crate.
+[[bench]]
+name = "vec_bench"
+harness = false
+
+# Benchmark FTS sobre passages reales (MS MARCO): Arkeion MATCH+bm25 vs SQLite
+# FTS5 (con `--features bench-sqlite`). Emite JSON.
+[[bench]]
+name = "fts_bench"
+harness = false

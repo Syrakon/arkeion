@@ -2710,7 +2710,7 @@ fn alloc_vidx_id<S: NodeStore>(s: &mut S, root: PageId) -> Result<(u32, PageId)>
 }
 
 fn vec_l2_sq(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b).map(|(&x, &y)| (x - y) * (x - y)).sum()
+    crate::vector::l2_sq(a, b)
 }
 
 /// Vector f32 de la columna indexada de una fila; `None` si NULL/no-blob.

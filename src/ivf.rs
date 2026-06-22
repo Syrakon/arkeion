@@ -13,9 +13,10 @@
 //! 1 antes (entonces el orden por L2 coincide con el de coseno). Ver
 //! `docs/13-vectores.md`.
 
-/// Distancia euclídea al cuadrado (basta para ordenar; evita la raíz).
+/// Distancia euclídea al cuadrado (basta para ordenar; evita la raíz). Kernel f32
+/// multi-acumulador compartido con el re-rank de candidatos (ver `vector::l2_sq`).
 fn dist2(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b).map(|(&x, &y)| (x - y) * (x - y)).sum()
+    crate::vector::l2_sq(a, b)
 }
 
 /// Índice del centroide más cercano a `v`.

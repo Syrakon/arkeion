@@ -99,40 +99,72 @@ fn pair(a: &[u8], b: &[u8]) -> Result<(Vec<f32>, Vec<f32>)> {
     Ok((va, vb))
 }
 
-fn dot_f(a: &[f32], b: &[f32]) -> f64 {
-    a.iter().zip(b).map(|(&x, &y)| x as f64 * y as f64).sum()
+/// Producto interno `a·b` con **8 acumuladores f32 independientes**. El truco de
+/// rendimiento: un `.sum()` mono-acumulador es una cadena de dependencia serial
+/// (cada `add` espera al anterior) que el compilador NO puede vectorizar; con 8
+/// acumuladores independientes sí emite SIMD (8 lanes a la vez). 2–4× sobre el
+/// escalar en KNN/re-rank, que es donde el coseno/L2 se llaman millones de veces.
+pub fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
+    let n = a.len().min(b.len());
+    let mut acc = [0.0f32; 8];
+    let mut ia = a[..n].chunks_exact(8);
+    let mut ib = b[..n].chunks_exact(8);
+    for (qa, qb) in ia.by_ref().zip(ib.by_ref()) {
+        for j in 0..8 {
+            acc[j] += qa[j] * qb[j];
+        }
+    }
+    let mut s = acc.iter().sum::<f32>();
+    for (x, y) in ia.remainder().iter().zip(ib.remainder()) {
+        s += x * y;
+    }
+    s
+}
+
+/// Distancia euclídea al cuadrado `‖a − b‖₂²` con 8 acumuladores f32 (ver
+/// [`dot_f32`]). Basta para ordenar (evita la raíz); la usan el IVF (centroides +
+/// k-means) y el re-rank de candidatos.
+pub fn l2_sq(a: &[f32], b: &[f32]) -> f32 {
+    let n = a.len().min(b.len());
+    let mut acc = [0.0f32; 8];
+    let mut ia = a[..n].chunks_exact(8);
+    let mut ib = b[..n].chunks_exact(8);
+    for (qa, qb) in ia.by_ref().zip(ib.by_ref()) {
+        for j in 0..8 {
+            let d = qa[j] - qb[j];
+            acc[j] += d * d;
+        }
+    }
+    let mut s = acc.iter().sum::<f32>();
+    for (x, y) in ia.remainder().iter().zip(ib.remainder()) {
+        let d = x - y;
+        s += d * d;
+    }
+    s
 }
 
 /// Producto interno `a·b` (mayor = más parecido).
 pub fn dot(a: &[u8], b: &[u8]) -> Result<f64> {
     let (va, vb) = pair(a, b)?;
-    Ok(dot_f(&va, &vb))
+    Ok(dot_f32(&va, &vb) as f64)
 }
 
 /// Distancia euclídea `‖a − b‖₂` (menor = más parecido).
 pub fn l2_distance(a: &[u8], b: &[u8]) -> Result<f64> {
     let (va, vb) = pair(a, b)?;
-    let s: f64 = va
-        .iter()
-        .zip(&vb)
-        .map(|(&x, &y)| {
-            let d = x as f64 - y as f64;
-            d * d
-        })
-        .sum();
-    Ok(s.sqrt())
+    Ok((l2_sq(&va, &vb) as f64).sqrt())
 }
 
 /// Distancia coseno `1 − cos(a, b)` ∈ [0, 2] (menor = más parecido). Si alguno
 /// tiene norma 0 (indefinido) devuelve `1.0`.
 pub fn cosine_distance(a: &[u8], b: &[u8]) -> Result<f64> {
     let (va, vb) = pair(a, b)?;
-    let na = dot_f(&va, &va).sqrt();
-    let nb = dot_f(&vb, &vb).sqrt();
+    let na = dot_f32(&va, &va).sqrt();
+    let nb = dot_f32(&vb, &vb).sqrt();
     if na == 0.0 || nb == 0.0 {
         return Ok(1.0);
     }
-    Ok(1.0 - dot_f(&va, &vb) / (na * nb))
+    Ok(1.0 - (dot_f32(&va, &vb) / (na * nb)) as f64)
 }
 
 #[cfg(test)]
@@ -221,5 +253,54 @@ mod tests {
         let exact = cosine_distance(&a, &b_f).unwrap();
         let approx = cosine_distance(&a, &b_q).unwrap();
         assert!((exact - approx).abs() < 0.01, "{exact} vs {approx}");
+    }
+
+    /// Micro-bench manual del kernel: escalar (mono-acumulador, lo que el
+    /// compilador NO vectoriza por la no-asociatividad del f32) vs `l2_sq` (8
+    /// acumuladores → SIMD). Correr: `cargo test --release -- --ignored
+    /// bench_l2_kernel --nocapture`.
+    #[test]
+    #[ignore = "micro-bench manual de la distancia f32 multi-acumulador"]
+    fn bench_l2_kernel() {
+        use std::hint::black_box;
+        use std::time::Instant;
+        let dim = 128;
+        let mk = |seed: u64| -> Vec<f32> {
+            let mut s = seed;
+            (0..dim)
+                .map(|_| {
+                    s ^= s << 13;
+                    s ^= s >> 7;
+                    s ^= s << 17;
+                    (s % 512) as f32 - 256.0
+                })
+                .collect()
+        };
+        let (a, b) = (mk(1), mk(2));
+        fn scalar(a: &[f32], b: &[f32]) -> f32 {
+            a.iter().zip(b).map(|(&x, &y)| (x - y) * (x - y)).sum()
+        }
+        let iters = 20_000_000u64;
+        let t = Instant::now();
+        let mut s1 = 0.0f32;
+        for _ in 0..iters {
+            s1 += scalar(black_box(a.as_slice()), black_box(b.as_slice()));
+        }
+        let t_scalar = t.elapsed().as_secs_f64();
+        black_box(s1);
+        let t = Instant::now();
+        let mut s2 = 0.0f32;
+        for _ in 0..iters {
+            s2 += l2_sq(black_box(a.as_slice()), black_box(b.as_slice()));
+        }
+        let t_multi = t.elapsed().as_secs_f64();
+        black_box(s2);
+        // Correctitud (una llamada): mismo valor que el escalar salvo redondeo f32.
+        let (one_s, one_m) = (scalar(&a, &b), l2_sq(&a, &b));
+        assert!((one_s - one_m).abs() / one_s.abs() < 1e-4, "{one_s} vs {one_m}");
+        eprintln!(
+            "l2 dim={dim} ×{iters}: escalar {t_scalar:.3}s · multi-acum {t_multi:.3}s · speedup {:.2}×",
+            t_scalar / t_multi
+        );
     }
 }

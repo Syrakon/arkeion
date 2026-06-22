@@ -1109,7 +1109,189 @@ fn range_valid(lo: Option<&[u8]>, hi: Option<&[u8]>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testutil::{CowMemStore, MemStore};
+    use crate::testutil::{CowMemStore, CursorStore, MemStore};
+
+    /// Stress que **replica `apply_fts_row` a nivel b-tree** sobre `CursorStore`
+    /// (CoW + cursor de append, como `TxStore`): rows `0x01` → freeze → por doc,
+    /// postings `0x00` + `df` `0x03` (read-modify-write con varint creciente, en
+    /// orden SEMBRADO que imita el `HashSet`) + doclen `0x01` + global `0x02`. Tras
+    /// construir, escanea todas las hojas (`parse_leaf` detecta desorden). Ejercita
+    /// el camino O(1) del **cursor de append**, que en producción solo toca `TxStore`
+    /// (ningún otro test lo cubría). `FTS_STRESS_DOCS` (env) ajusta la escala;
+    /// `FTS_STRESS_SEED` el orden; el `chk=` impreso es determinista por seed.
+    ///
+    /// HISTORIA: un benchmark a 1M docs vio `CREATE FULLTEXT INDEX` corromper el
+    /// b-tree. Este stress lo persiguió y demostró que **NO es un bug del código**:
+    /// el build es determinista byte-a-byte (mismo `chk=` en ejecuciones repetidas)
+    /// y `#![forbid(unsafe_code)]` hace imposible el UB, pero la corrupción aparecía
+    /// en páginas ALEATORIAS como **flips de 1 bit** (XOR potencia de 2) → corrupción
+    /// de MEMORIA del entorno (RAM no-ECC / sandbox), no del b-tree. En hardware
+    /// estable no debe fallar nunca; un fallo aquí = bit-flip de memoria.
+    #[test]
+    #[ignore = "stress largo; canario de determinismo del b-tree (correr a mano con FTS_STRESS_DOCS)"]
+    fn fts_pattern_stress() {
+        use crate::format::put_varint;
+        use crate::keyenc::encode_index_value_ref;
+        use crate::record::{ValueRef, rowid_be};
+
+        const FTS_ID: [u8; 4] = [0, 0, 0, 1];
+        let sub = |s: u8| -> Vec<u8> {
+            let mut k = vec![0x03u8];
+            k.extend_from_slice(&FTS_ID);
+            k.push(s);
+            k
+        };
+        let term_enc = |t: &str| -> Vec<u8> {
+            let mut k = Vec::new();
+            encode_index_value_ref(ValueRef::Text(t), &mut k);
+            k
+        };
+        let posting = |t: &str, rid: i64, pos: u32| -> Vec<u8> {
+            let mut k = sub(0x00);
+            k.extend_from_slice(&term_enc(t));
+            k.extend_from_slice(&rowid_be(rid));
+            k.push(0); // field
+            put_varint(&mut k, pos as u64);
+            k
+        };
+        let dfk = |t: &str| -> Vec<u8> {
+            let mut k = sub(0x03);
+            k.extend_from_slice(&term_enc(t));
+            k
+        };
+        let doclenk = |rid: i64| -> Vec<u8> {
+            let mut k = sub(0x01);
+            k.extend_from_slice(&rowid_be(rid));
+            k
+        };
+        let globalk = sub(0x02);
+
+        let ndocs: i64 = std::env::var("FTS_STRESS_DOCS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(300_000);
+        let mut seed: u64 = std::env::var("FTS_STRESS_SEED")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0x1234_5678_9ABC_DEF0);
+        // Bisección: validar el árbol cada `VALIDATE_EVERY` docs a partir de
+        // `VALIDATE_FROM` (escaneo = O(árbol), por eso configurable).
+        let validate_every: i64 = std::env::var("FTS_STRESS_VALIDATE_EVERY")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(50_000);
+        let validate_from: i64 = std::env::var("FTS_STRESS_VALIDATE_FROM")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        let mut rng = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        const VOCAB: usize = 20_000;
+        const TOKENS: usize = 40;
+        // Términos de LONGITUD VARIABLE (como palabras reales): claves con
+        // relaciones de prefijo entre sí, que las claves de longitud fija ocultan y
+        // que estresan la comparación `key > last_key` del cursor de append.
+        let vocab: Vec<String> = (0..VOCAB)
+            .map(|i| {
+                let len = 1 + ((i * 2654435761usize) >> 8) % 14; // 1..=14 chars, pseudo
+                let mut w = String::with_capacity(len);
+                let mut x = i as u64 + 1;
+                for _ in 0..len {
+                    x = x.wrapping_mul(6364136223846793005).wrapping_add(1);
+                    w.push((b'a' + (x >> 33) as u8 % 26) as char);
+                }
+                w
+            })
+            .collect();
+
+        let mut s = CursorStore::new();
+        let mut root = NO_ROOT;
+        // Tabla: una fila por doc (keyspace 0x01 — a la izquierda del índice FTS).
+        for doc in 0..ndocs {
+            let mut rowkey = vec![0x01u8];
+            rowkey.extend_from_slice(&rowid_be(doc));
+            root = insert(&mut s, root, &rowkey, &[b'x'; 80]).unwrap();
+        }
+        s.freeze(); // la tabla queda «commiteada»; el índice se construye sobre ella (CoW)
+
+        let mut df: std::collections::HashMap<usize, u64> = std::collections::HashMap::new();
+        let mut total: u64 = 0;
+        for doc in 0..ndocs {
+            // tokens sesgados a comunes (Zipf-ish): 1/3 del top-200 (df crece mucho
+            // ⇒ varints crecen ⇒ overwrites con payload mayor, como el texto real).
+            let mut terms: Vec<usize> = Vec::with_capacity(TOKENS);
+            for pos in 0..TOKENS {
+                let r = rng() as usize;
+                let t = if r.is_multiple_of(3) {
+                    r % 200
+                } else {
+                    r % VOCAB
+                };
+                root = insert(&mut s, root, &posting(&vocab[t], doc, pos as u32), b"").unwrap();
+                terms.push(t);
+            }
+            // distintos, en orden SEMBRADO-shuffle (imita iteración de HashSet).
+            terms.sort_unstable();
+            terms.dedup();
+            for i in (1..terms.len()).rev() {
+                let j = (rng() as usize) % (i + 1);
+                terms.swap(i, j);
+            }
+            for &t in &terms {
+                let key = dfk(&vocab[t]);
+                let _ = get(&s, root, &key).unwrap(); // read-modify-write como fts_adjust_varint
+                let c = df.entry(t).or_insert(0);
+                *c += 1;
+                let mut val = Vec::new();
+                put_varint(&mut val, *c);
+                root = insert(&mut s, root, &key, &val).unwrap();
+            }
+            let mut dl = Vec::new();
+            put_varint(&mut dl, TOKENS as u64);
+            root = insert(&mut s, root, &doclenk(doc), &dl).unwrap();
+            let _ = get(&s, root, &globalk).unwrap();
+            total += TOKENS as u64;
+            let mut g = Vec::new();
+            put_varint(&mut g, doc as u64 + 1);
+            put_varint(&mut g, total);
+            root = insert(&mut s, root, &globalk, &g).unwrap();
+
+            // Escaneo periódico (es O(árbol)): parsea todas las hojas ⇒ detecta
+            // corrupción pronto. Intervalo/arranque configurables para bisecar.
+            if doc >= validate_from && (doc + 1) % validate_every == 0 {
+                let mut n = 0u64;
+                // Escaneo = O(árbol): parsea cada hoja ⇒ detecta corrupción de orden.
+                // Además, checksum FNV-1a del árbol entero: con el mismo seed este
+                // valor es determinista byte-a-byte (el build no lee estado no
+                // determinista). Sirve de canario: si dos ejecuciones del mismo seed
+                // dan checksums distintos, hay corrupción de MEMORIA (bit-flips), no
+                // un bug del código —el b-tree es puro y `#![forbid(unsafe_code)]`—.
+                let mut chk = 0xcbf2_9ce4_8422_2325u64;
+                for r in scan(&s, root).unwrap() {
+                    let (k, v) = r.unwrap(); // unwrap = panic si parse ve corrupción
+                    for &b in &k {
+                        chk = (chk ^ b as u64).wrapping_mul(0x0000_0100_0000_01b3);
+                    }
+                    chk = chk.rotate_left(7);
+                    for &b in &v {
+                        chk = (chk ^ b as u64).wrapping_mul(0x0000_0100_0000_01b3);
+                    }
+                    n += 1;
+                }
+                eprintln!("  doc {} / {ndocs} · {n} claves · chk={chk:016x} · OK", doc + 1);
+            }
+        }
+        let mut n = 0u64;
+        for r in scan(&s, root).unwrap() {
+            r.unwrap();
+            n += 1;
+        }
+        eprintln!("fts_pattern_stress OK: docs={ndocs} claves_escaneadas={n}");
+    }
 
     fn k(i: u32) -> Vec<u8> {
         format!("clave-{i:06}").into_bytes()

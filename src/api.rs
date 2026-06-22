@@ -871,6 +871,49 @@ impl TableReader {
     pub fn version(&self) -> u64 {
         self.snap.version()
     }
+
+    /// KNN aproximado vía el índice vectorial IVF `index`: los `k` rowids más
+    /// cercanos a `query`, escaneando `nprobe` clusters y re-rankeando los
+    /// candidatos por distancia exacta. Sin SQL: índice → postings → re-rank.
+    ///
+    /// `nprobe` es la palanca recall/velocidad **en consulta** (más clusters =
+    /// más recall, más lento), independiente del valor por defecto del índice —
+    /// el análogo de `ivfflat.probes` (pgvector) o `hnsw_ef` (Qdrant). Devuelve
+    /// los rowids ordenados de más cercano a más lejano.
+    pub fn vector_search(
+        &self,
+        index: &str,
+        query: &[f32],
+        k: usize,
+        nprobe: usize,
+    ) -> Result<Vec<i64>> {
+        let vidx = self
+            .def
+            .vector_indexes
+            .iter()
+            .find(|i| i.name == index)
+            .ok_or_else(|| sql_err(format!("índice vectorial desconocido: {index}")))?;
+        let col = vidx.column;
+        let qpacked = crate::vector::pack_f32(query);
+        let candidates = self.snap.vector_search(vidx, query, nprobe)?;
+        let mut scored: Vec<(f64, i64)> = Vec::with_capacity(candidates.len());
+        for rid in candidates {
+            if let Some(row) = self.snap.get_row(&self.def, rid)?
+                && let Value::Blob(b) = &row[col]
+            {
+                let d = match vidx.metric {
+                    crate::catalog::VectorMetric::Cosine => {
+                        crate::vector::cosine_distance(b, &qpacked)?
+                    }
+                    crate::catalog::VectorMetric::L2 => crate::vector::l2_distance(b, &qpacked)?,
+                };
+                scored.push((d, rid));
+            }
+        }
+        scored.sort_by(|a, b| a.0.total_cmp(&b.0));
+        scored.truncate(k);
+        Ok(scored.into_iter().map(|(_, r)| r).collect())
+    }
 }
 
 /// Scan proyectado sin asignación por fila (ver [`TableReader::scan_columns`]).

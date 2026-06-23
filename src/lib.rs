@@ -97,6 +97,7 @@ pub mod ivf;
 pub mod keyenc;
 #[doc(hidden)]
 pub mod pager;
+pub mod pq;
 #[doc(hidden)]
 pub mod record;
 #[doc(hidden)]

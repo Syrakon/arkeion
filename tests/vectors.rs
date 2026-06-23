@@ -309,3 +309,54 @@ fn dimension_mismatch_errors() {
         .and_then(|rows| rows.map(|r| r.map(|_| ())).collect::<Result<Vec<()>, _>>());
     assert!(matches!(r, Err(Error::InvalidInput(_))));
 }
+
+/// Recall a escala del re-rank int8 inline (#3): con clusters con MUCHOS miembros
+/// (donde el shortlist sí trunca y el int8 sí afecta), el top-k del índice IVF debe
+/// coincidir casi exacto con el KNN por fuerza bruta. Determinista (datos sembrados).
+#[test]
+fn ivf_int8_rerank_recall_at_scale() {
+    let (_d, db) = db();
+    let conn = db.connect().unwrap();
+    conn.execute("CREATE TABLE docs (id INTEGER PRIMARY KEY, emb BLOB)", &[])
+        .unwrap();
+    let (nc, per, dim) = (30usize, 12usize, 8usize);
+    let mut st = 0x2024u64;
+    let mut rnd = || {
+        st ^= st << 13;
+        st ^= st >> 7;
+        st ^= st << 17;
+        (st >> 40) as f32 / (1u64 << 24) as f32
+    };
+    let fmt = |v: &[f32]| v.iter().map(|x| format!("{x:.4}")).collect::<Vec<_>>().join(", ");
+    let mut all: Vec<Vec<f32>> = Vec::new();
+    for c in 0..nc {
+        let center: Vec<f32> = (0..dim).map(|d| ((c * 5 + d * 7) % 19) as f32).collect();
+        for _ in 0..per {
+            let v: Vec<f32> = center.iter().map(|&x| x + (rnd() - 0.5) * 0.5).collect();
+            conn.execute(
+                &format!("INSERT INTO docs (emb) VALUES (vector({}))", fmt(&v)),
+                &[],
+            )
+            .unwrap();
+            all.push(v);
+        }
+    }
+    // Query = un punto perturbado. Exact top-10 ANTES del índice (full scan = exacto).
+    let qs = fmt(&all[100]);
+    let sql = format!("SELECT id FROM docs ORDER BY cosine_distance(emb, vector({qs})) LIMIT 10");
+    let exact = ids_ordered(&conn, &sql);
+    assert_eq!(exact.len(), 10);
+    // Con índice IVF: rutea al índice (re-rank int8 + shortlist), re-rank exacto fuera.
+    conn.execute(
+        "CREATE VECTOR INDEX vi ON docs (emb) USING cosine LISTS 30 PROBES 8",
+        &[],
+    )
+    .unwrap();
+    let ann = ids_ordered(&conn, &sql);
+    let truth: std::collections::HashSet<i64> = exact.iter().copied().collect();
+    let hits = ann.iter().filter(|i| truth.contains(i)).count();
+    assert!(
+        hits >= 8,
+        "recall@10 = {hits}/10 (≥ 8 esperado)\n exact={exact:?}\n ann={ann:?}"
+    );
+}

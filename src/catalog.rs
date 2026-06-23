@@ -2772,11 +2772,13 @@ fn build_vector_clusters<S: NodeStore>(
     }
     for (cid, members) in assignments.iter().enumerate() {
         for &i in members {
+            // El VALOR del posting es el vector int8 (v10): el re-rank ANN lo lee
+            // contiguo del índice sin fetchear la fila (#3).
             root = btree::insert(
                 s,
                 root,
                 &vec_posting_key(vidx_id, cid as u16, rowids[i]),
-                &[],
+                &crate::vector::pack_i8(&vectors[i]),
             )?;
         }
     }
@@ -2957,6 +2959,7 @@ pub fn vector_search<S: NodeSource>(
     vidx: &VectorIndexDef,
     query_raw: &[f32],
     nprobe: usize,
+    limit: usize,
 ) -> Result<Vec<i64>> {
     let centroids = read_centroids(src, root, vidx.vidx_id)?;
     if centroids.is_empty() {
@@ -2975,19 +2978,42 @@ pub fn vector_search<S: NodeSource>(
     cents.sort_by(|a, b| a.0.total_cmp(&b.0));
     let probe = nprobe.clamp(1, cents.len());
 
-    let mut rowids = Vec::new();
+    // Re-rank int8 INLINE (#3): por cada cluster sondeado recorre sus postings
+    // leyendo el vector int8 del VALOR y calcula la distancia aproximada SIN
+    // fetchear filas (el cuello de latencia ANN era el fetch disperso por fila).
+    // Devuelve el shortlist de los `limit` candidatos más cercanos; el `ORDER BY`
+    // exacto de SQL re-rankea solo esos (fetcheando ya pocas filas).
+    let mut cands: Vec<(f32, i64)> = Vec::new();
     for &(_, cid) in cents.iter().take(probe) {
         let pp = vec_cluster_prefix(vidx.vidx_id, cid as u16);
-        btree::for_each_prefix(src, root, &pp, |key| {
-            let rid = key
-                .get(key.len() - 8..)
-                .and_then(record::rowid_from_be)
-                .ok_or(Error::CorruptRecord("rowid en posting vectorial"))?;
-            rowids.push(rid);
-            Ok(())
-        })?;
+        let mut st = btree::scan_state(src, root, Some(&pp))?;
+        loop {
+            let step = st.advance_view(src, |key, value| {
+                if !key.starts_with(&pp) {
+                    return Ok(None);
+                }
+                let rid = key
+                    .get(key.len() - 8..)
+                    .and_then(record::rowid_from_be)
+                    .ok_or(Error::CorruptRecord("rowid en posting vectorial"))?;
+                let d = crate::vector::l2_sq_packed_i8(value, &query).ok_or(
+                    Error::CorruptRecord("posting vectorial sin vector int8 (índice antiguo: REBUILD)"),
+                )?;
+                Ok(Some((d, rid)))
+            })?;
+            match step {
+                None | Some(None) => break,
+                Some(Some(c)) => cands.push(c),
+            }
+        }
     }
-    Ok(rowids)
+    let limit = limit.max(1);
+    if cands.len() > limit {
+        cands.select_nth_unstable_by(limit, |a, b| a.0.total_cmp(&b.0));
+        cands.truncate(limit);
+    }
+    cands.sort_by(|a, b| a.0.total_cmp(&b.0));
+    Ok(cands.into_iter().map(|(_, rid)| rid).collect())
 }
 
 /// Índice del centroide más cercano a `v` (argmin L2).
@@ -3026,7 +3052,8 @@ fn apply_vector_row<S: NodeStore>(
     let cid = nearest_centroid(&centroids, &v) as u16;
     let key = vec_posting_key(vidx.vidx_id, cid, rowid);
     if add {
-        btree::insert(s, root, &key, &[])
+        // Valor del posting = vector int8 (v10), para el re-rank inline (#3).
+        btree::insert(s, root, &key, &crate::vector::pack_i8(&v))
     } else {
         Ok(btree::delete(s, root, &key)?.0)
     }
@@ -3872,12 +3899,12 @@ mod tests {
         assert_eq!(vidx.dim, 2);
 
         // Query cerca de A: nprobe=1 ⇒ candidatos solo del cluster A.
-        let mut near_a = vector_search(&s, root, &vidx, &[0.05, 0.05], 1).unwrap();
+        let mut near_a = vector_search(&s, root, &vidx, &[0.05, 0.05], 1, usize::MAX).unwrap();
         near_a.sort_unstable();
         assert_eq!(near_a, vec![1, 2, 3]);
         // nprobe = nº de listas ⇒ candidatos de todos los clusters (los 6).
         assert_eq!(
-            vector_search(&s, root, &vidx, &[0.05, 0.05], 2)
+            vector_search(&s, root, &vidx, &[0.05, 0.05], 2, usize::MAX)
                 .unwrap()
                 .len(),
             6
@@ -3896,7 +3923,7 @@ mod tests {
         );
         assert!(!vector_index_exists(&s, root, "v_idx").unwrap());
         assert!(
-            vector_search(&s, root, &vidx, &[0.05, 0.05], 2)
+            vector_search(&s, root, &vidx, &[0.05, 0.05], 2, usize::MAX)
                 .unwrap()
                 .is_empty()
         );
@@ -3952,7 +3979,7 @@ mod tests {
         .unwrap();
         root = r;
         assert!(
-            vector_search(&s, root, &vidx, &[0.05, 0.05], 1)
+            vector_search(&s, root, &vidx, &[0.05, 0.05], 1, usize::MAX)
                 .unwrap()
                 .contains(&rid),
             "la fila nueva debería caer en el cluster A"
@@ -3962,7 +3989,7 @@ mod tests {
         let (root, ok) = delete_row(&mut s, root, &def, rid).unwrap();
         assert!(ok);
         assert!(
-            !vector_search(&s, root, &vidx, &[0.05, 0.05], 1)
+            !vector_search(&s, root, &vidx, &[0.05, 0.05], 1, usize::MAX)
                 .unwrap()
                 .contains(&rid)
         );

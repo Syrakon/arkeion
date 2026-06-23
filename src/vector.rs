@@ -143,6 +143,37 @@ pub fn l2_sq(a: &[f32], b: &[f32]) -> f32 {
     s
 }
 
+/// L2² entre un vector **int8 empaquetado** (`pack_i8`: `[TAG_I8, escala(4 LE),
+/// int8…]`) y una query f32, **sin desempaquetar a `Vec`** (dequantiza al vuelo)
+/// y con 8 acumuladores. Es el camino caliente del re-rank ANN (#3): lee el int8
+/// contiguo del posting y NO fetchea la fila. `None` si el blob no es int8 o la
+/// dimensión no casa.
+pub fn l2_sq_packed_i8(packed: &[u8], query: &[f32]) -> Option<f32> {
+    if packed.first() != Some(&TAG_I8) || packed.len() < 5 {
+        return None;
+    }
+    let scale = f32::from_le_bytes([packed[1], packed[2], packed[3], packed[4]]);
+    let q = &packed[5..];
+    if q.len() != query.len() {
+        return None;
+    }
+    let mut acc = [0.0f32; 8];
+    let mut iq = q.chunks_exact(8);
+    let mut ie = query.chunks_exact(8);
+    for (cq, ce) in iq.by_ref().zip(ie.by_ref()) {
+        for j in 0..8 {
+            let d = (cq[j] as i8 as f32) * scale - ce[j];
+            acc[j] += d * d;
+        }
+    }
+    let mut s = acc.iter().sum::<f32>();
+    for (&qb, &e) in iq.remainder().iter().zip(ie.remainder()) {
+        let d = (qb as i8 as f32) * scale - e;
+        s += d * d;
+    }
+    Some(s)
+}
+
 /// Producto interno `a·b` (mayor = más parecido).
 pub fn dot(a: &[u8], b: &[u8]) -> Result<f64> {
     let (va, vb) = pair(a, b)?;

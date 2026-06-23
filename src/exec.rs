@@ -64,6 +64,7 @@ pub trait DataSource {
         vidx: &VectorIndexDef,
         query: &[f32],
         nprobe: usize,
+        limit: usize,
     ) -> Result<Vec<i64>>;
 }
 
@@ -123,8 +124,9 @@ impl DataSource for Snapshot {
         vidx: &VectorIndexDef,
         query: &[f32],
         nprobe: usize,
+        limit: usize,
     ) -> Result<Vec<i64>> {
-        Snapshot::vector_search(self, vidx, query, nprobe)
+        Snapshot::vector_search(self, vidx, query, nprobe, limit)
     }
 }
 
@@ -184,8 +186,9 @@ impl DataSource for WriteTx {
         vidx: &VectorIndexDef,
         query: &[f32],
         nprobe: usize,
+        limit: usize,
     ) -> Result<Vec<i64>> {
-        WriteTx::vector_search(self, vidx, query, nprobe)
+        WriteTx::vector_search(self, vidx, query, nprobe, limit)
     }
 }
 
@@ -1084,8 +1087,16 @@ fn vector_plan(
     let query = crate::vector::to_f32(&qb)?;
     // nprobe del índice (recall vs velocidad), fijado al crearlo con `PROBES`.
     let nprobe = (vidx.nprobe as usize).max(1);
+    // Shortlist: el índice rankea aprox por int8 y devuelve k·8 candidatos (cota
+    // de recall); el `ORDER BY` exacto de abajo elige los k finales fetcheando solo
+    // esas pocas filas (antes fetcheaba TODOS los candidatos de los clusters).
+    let k = match &stmt.limit {
+        Some(e) => usize_const(e, params, "LIMIT")?,
+        None => return Ok(None),
+    };
+    let limit = k.saturating_mul(8).max(64);
     let mut rows = Vec::new();
-    for rowid in src.vector_search(vidx, &query, nprobe)? {
+    for rowid in src.vector_search(vidx, &query, nprobe, limit)? {
         if let Some(row) = src.get_row(def, rowid)? {
             rows.push(row);
         }
@@ -2748,8 +2759,9 @@ impl DataSource for CteSource<'_> {
         vidx: &VectorIndexDef,
         query: &[f32],
         nprobe: usize,
+        limit: usize,
     ) -> Result<Vec<i64>> {
-        self.inner.vector_search(vidx, query, nprobe)
+        self.inner.vector_search(vidx, query, nprobe, limit)
     }
 }
 
@@ -2898,8 +2910,9 @@ impl DataSource for ViewSource<'_> {
         vidx: &VectorIndexDef,
         query: &[f32],
         nprobe: usize,
+        limit: usize,
     ) -> Result<Vec<i64>> {
-        self.inner.vector_search(vidx, query, nprobe)
+        self.inner.vector_search(vidx, query, nprobe, limit)
     }
 }
 

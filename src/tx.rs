@@ -1506,8 +1506,9 @@ impl Snapshot {
         vidx: &VectorIndexDef,
         query: &[f32],
         nprobe: usize,
+        limit: usize,
     ) -> Result<Vec<i64>> {
-        catalog::vector_search(self, self.data_root, vidx, query, nprobe)
+        catalog::vector_search(self, self.data_root, vidx, query, nprobe, limit)
     }
 }
 
@@ -2036,8 +2037,9 @@ impl WriteTx {
         vidx: &VectorIndexDef,
         query: &[f32],
         nprobe: usize,
+        limit: usize,
     ) -> Result<Vec<i64>> {
-        catalog::vector_search(&self.ts, self.data_root, vidx, query, nprobe)
+        catalog::vector_search(&self.ts, self.data_root, vidx, query, nprobe, limit)
     }
 
     pub fn drop_table(&mut self, name: &str) -> Result<bool> {

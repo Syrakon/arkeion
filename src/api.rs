@@ -895,7 +895,11 @@ impl TableReader {
             .ok_or_else(|| sql_err(format!("índice vectorial desconocido: {index}")))?;
         let col = vidx.column;
         let qpacked = crate::vector::pack_f32(query);
-        let candidates = self.snap.vector_search(vidx, query, nprobe)?;
+        // El índice rankea aprox por int8 y devuelve un shortlist (k·8); aquí se
+        // re-rankea exacto y se corta a k (antes fetcheaba TODOS los candidatos).
+        let candidates = self
+            .snap
+            .vector_search(vidx, query, nprobe, k.saturating_mul(8).max(64))?;
         let mut scored: Vec<(f64, i64)> = Vec::with_capacity(candidates.len());
         for rid in candidates {
             if let Some(row) = self.snap.get_row(&self.def, rid)?

@@ -49,7 +49,10 @@
 //! prepared statements). La API se estabiliza milestone a milestone; lo marcado
 //! `#[doc(hidden)]` es interno.
 
-#![forbid(unsafe_code)]
+// EXPERIMENTO (rama experiment/simd): `forbid`→`deny` para permitir UN módulo
+// `simd` con `#[allow(unsafe_code)]` aislado (kernel AVX2 a mano). El resto del
+// crate sigue prohibiendo unsafe. Revertir a `forbid` si no se adopta.
+#![deny(unsafe_code)]
 
 mod api;
 mod branch;
@@ -98,6 +101,7 @@ pub mod keyenc;
 #[doc(hidden)]
 pub mod pager;
 pub mod pq;
+pub mod simd; // EXPERIMENTAL (experiment/simd): kernel SIMD a mano; único unsafe
 #[doc(hidden)]
 pub mod record;
 #[doc(hidden)]

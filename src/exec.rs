@@ -1094,7 +1094,7 @@ fn vector_plan(
         Some(e) => usize_const(e, params, "LIMIT")?,
         None => return Ok(None),
     };
-    let limit = k.saturating_mul(8).max(64);
+    let limit = k.saturating_mul(32).max(64);
     let mut rows = Vec::new();
     for rowid in src.vector_search(vidx, &query, nprobe, limit)? {
         if let Some(row) = src.get_row(def, rowid)? {

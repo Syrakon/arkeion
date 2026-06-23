@@ -899,7 +899,7 @@ impl TableReader {
         // re-rankea exacto y se corta a k (antes fetcheaba TODOS los candidatos).
         let candidates = self
             .snap
-            .vector_search(vidx, query, nprobe, k.saturating_mul(8).max(64))?;
+            .vector_search(vidx, query, nprobe, k.saturating_mul(32).max(64))?;
         let mut scored: Vec<(f64, i64)> = Vec::with_capacity(candidates.len());
         for rid in candidates {
             if let Some(row) = self.snap.get_row(&self.def, rid)?

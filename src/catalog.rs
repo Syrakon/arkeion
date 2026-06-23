@@ -56,7 +56,8 @@ const FTS_GLOBAL: u8 = 0x02; // → {N docs, Σ tokens} (dos varints) para avgdl
 const FTS_DF: u8 = 0x03; // ‖ term → nº de docs con el término (varint)
 // Sub-tipos dentro de un índice vectorial, tras `[0x04, vidx_id BE]`:
 const VEC_CENTROID: u8 = 0x00; // ‖ centroid_id BE(2) → vector f32 del centroide
-const VEC_POSTING: u8 = 0x01; // ‖ centroid_id BE(2) ‖ rowid BE(8) → vacío
+const VEC_POSTING: u8 = 0x01; // ‖ centroid_id BE(2) ‖ rowid BE(8) → código PQ (IVFPQ)
+const VEC_PQ: u8 = 0x02; // → codebooks PQ del índice (Pq::to_bytes)
 
 /// v2: el esquema serializado incluye la lista de índices de la tabla.
 // v3 añade el orden lógico de columnas (reorden de presentación) al final del
@@ -2696,6 +2697,18 @@ fn vec_posting_key(vidx_id: u32, cid: u16, rowid: i64) -> Vec<u8> {
     k
 }
 
+/// Clave `[0x04, vidx_id, 0x02]` de los codebooks PQ del índice (uno por índice).
+fn vec_pq_key(vidx_id: u32) -> Vec<u8> {
+    let mut k = vidx_prefix(vidx_id).to_vec();
+    k.push(VEC_PQ);
+    k
+}
+
+/// Lee los codebooks PQ del índice (`None` si no hay — índice sin PQ).
+fn read_pq<S: NodeSource>(src: &S, root: PageId, vidx_id: u32) -> Result<Option<crate::pq::Pq>> {
+    Ok(btree::get(src, root, &vec_pq_key(vidx_id))?.and_then(|b| crate::pq::Pq::from_bytes(&b)))
+}
+
 fn alloc_vidx_id<S: NodeStore>(s: &mut S, root: PageId) -> Result<(u32, PageId)> {
     let next = match btree::get(s, root, &vector_counter_key())? {
         Some(v) => u32::from_le_bytes(
@@ -2762,6 +2775,11 @@ fn build_vector_clusters<S: NodeStore>(
     // Núcleo IVF: entrena los centroides y asigna cada vector a su cluster.
     let centroids = crate::ivf::train(&vectors, lists as usize, 25);
     let assignments = crate::ivf::assign(&vectors, &centroids);
+    // PQ (IVFPQ): codebooks para el re-rank por tablas de lookup (ADC). M ≈ dim/8
+    // (sub-dim ~8); el código son M bytes vs el vector entero ⇒ índice ~8× menor y
+    // re-rank por sumas de lookups en vez de distancia completa.
+    let pqm = (dim / 8).clamp(1, dim.max(1));
+    let pq = crate::pq::Pq::train(&vectors, pqm, 15);
     for (cid, c) in centroids.iter().enumerate() {
         root = btree::insert(
             s,
@@ -2770,15 +2788,16 @@ fn build_vector_clusters<S: NodeStore>(
             &crate::vector::pack_f32(c),
         )?;
     }
+    root = btree::insert(s, root, &vec_pq_key(vidx_id), &pq.to_bytes())?;
     for (cid, members) in assignments.iter().enumerate() {
         for &i in members {
-            // El VALOR del posting es el vector int8 (v10): el re-rank ANN lo lee
-            // contiguo del índice sin fetchear la fila (#3).
+            // El VALOR del posting es el CÓDIGO PQ: el re-rank ADC lo lee del índice
+            // sin fetchear la fila, con tablas de lookup (IVFPQ).
             root = btree::insert(
                 s,
                 root,
                 &vec_posting_key(vidx_id, cid as u16, rowids[i]),
-                &crate::vector::pack_i8(&vectors[i]),
+                &pq.encode(&vectors[i]),
             )?;
         }
     }
@@ -2978,11 +2997,13 @@ pub fn vector_search<S: NodeSource>(
     cents.sort_by(|a, b| a.0.total_cmp(&b.0));
     let probe = nprobe.clamp(1, cents.len());
 
-    // Re-rank int8 INLINE (#3): por cada cluster sondeado recorre sus postings
-    // leyendo el vector int8 del VALOR y calcula la distancia aproximada SIN
-    // fetchear filas (el cuello de latencia ANN era el fetch disperso por fila).
-    // Devuelve el shortlist de los `limit` candidatos más cercanos; el `ORDER BY`
-    // exacto de SQL re-rankea solo esos (fetcheando ya pocas filas).
+    // Re-rank INLINE sin fetchear filas (el cuello de latencia ANN era el fetch
+    // disperso por fila). Con PQ (IVFPQ) la distancia de cada candidato se calcula
+    // por TABLA de lookup (ADC), precalculada UNA vez por query (256·M); fallback a
+    // int8 (#3) si el índice no tiene codebooks. Devuelve el shortlist de los
+    // `limit` más cercanos; el `ORDER BY` exacto de SQL re-rankea solo esos.
+    let pq = read_pq(src, root, vidx.vidx_id)?;
+    let adc_table: Option<Vec<Vec<f32>>> = pq.as_ref().map(|p| p.adc_table(&query));
     let mut cands: Vec<(f32, i64)> = Vec::new();
     for &(_, cid) in cents.iter().take(probe) {
         let pp = vec_cluster_prefix(vidx.vidx_id, cid as u16);
@@ -2996,9 +3017,12 @@ pub fn vector_search<S: NodeSource>(
                     .get(key.len() - 8..)
                     .and_then(record::rowid_from_be)
                     .ok_or(Error::CorruptRecord("rowid en posting vectorial"))?;
-                let d = crate::vector::l2_sq_packed_i8(value, &query).ok_or(
-                    Error::CorruptRecord("posting vectorial sin vector int8 (índice antiguo: REBUILD)"),
-                )?;
+                let d = match &adc_table {
+                    Some(table) => crate::pq::Pq::adc_distance(table, value),
+                    None => crate::vector::l2_sq_packed_i8(value, &query).ok_or(
+                        Error::CorruptRecord("posting vectorial sin código (índice antiguo: REBUILD)"),
+                    )?,
+                };
                 Ok(Some((d, rid)))
             })?;
             match step {
@@ -3052,8 +3076,13 @@ fn apply_vector_row<S: NodeStore>(
     let cid = nearest_centroid(&centroids, &v) as u16;
     let key = vec_posting_key(vidx.vidx_id, cid, rowid);
     if add {
-        // Valor del posting = vector int8 (v10), para el re-rank inline (#3).
-        btree::insert(s, root, &key, &crate::vector::pack_i8(&v))
+        // Valor del posting = código PQ (IVFPQ); fallback a int8 si el índice no
+        // tiene codebooks (índice pre-PQ, formato #3).
+        let value = match read_pq(s, root, vidx.vidx_id)? {
+            Some(pq) => pq.encode(&v),
+            None => crate::vector::pack_i8(&v),
+        };
+        btree::insert(s, root, &key, &value)
     } else {
         Ok(btree::delete(s, root, &key)?.0)
     }

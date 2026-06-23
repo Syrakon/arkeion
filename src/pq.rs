@@ -93,6 +93,61 @@ impl Pq {
             .map(|(&c, row)| row[c as usize])
             .sum()
     }
+
+    /// Serializa los codebooks: `[m u16][dim u16]` y por subespacio
+    /// `[ncentroides u16][centroides f32…]`. Las fronteras se recomputan de `m`/`dim`.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&(self.m as u16).to_le_bytes());
+        out.extend_from_slice(&(self.dim as u16).to_le_bytes());
+        for cb in &self.codebooks {
+            out.extend_from_slice(&(cb.len() as u16).to_le_bytes());
+            for c in cb {
+                for &x in c {
+                    out.extend_from_slice(&x.to_le_bytes());
+                }
+            }
+        }
+        out
+    }
+
+    /// Reconstruye los codebooks de `to_bytes`. `None` si el blob está truncado.
+    pub fn from_bytes(b: &[u8]) -> Option<Pq> {
+        if b.len() < 4 {
+            return None;
+        }
+        let m = u16::from_le_bytes([b[0], b[1]]) as usize;
+        let dim = u16::from_le_bytes([b[2], b[3]]) as usize;
+        let bounds: Vec<usize> = (0..=m).map(|i| i * dim / m.max(1)).collect();
+        let mut pos = 4;
+        let mut codebooks = Vec::with_capacity(m);
+        for s in 0..m {
+            let sub_dim = bounds[s + 1] - bounds[s];
+            let nc = u16::from_le_bytes([*b.get(pos)?, *b.get(pos + 1)?]) as usize;
+            pos += 2;
+            let mut cb = Vec::with_capacity(nc);
+            for _ in 0..nc {
+                if pos + sub_dim * 4 > b.len() {
+                    return None;
+                }
+                let c: Vec<f32> = (0..sub_dim)
+                    .map(|j| {
+                        let o = pos + j * 4;
+                        f32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]])
+                    })
+                    .collect();
+                pos += sub_dim * 4;
+                cb.push(c);
+            }
+            codebooks.push(cb);
+        }
+        Some(Pq {
+            m,
+            dim,
+            bounds,
+            codebooks,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -179,5 +234,18 @@ mod tests {
         }
         let recall = hits as f64 / total as f64;
         assert!(recall >= 0.80, "recall ADC@{k} = {recall:.3} (≥ 0.80)");
+    }
+
+    #[test]
+    fn serialize_roundtrip() {
+        let data = clustered(8, 10, 16);
+        let pq = Pq::train(&data, 4, 15);
+        let pq2 = Pq::from_bytes(&pq.to_bytes()).expect("deserializa");
+        assert_eq!(pq2.m, pq.m);
+        assert_eq!(pq2.dim, pq.dim);
+        for v in &data {
+            assert_eq!(pq.encode(v), pq2.encode(v));
+            assert_eq!(pq.adc_table(v), pq2.adc_table(v));
+        }
     }
 }

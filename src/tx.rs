@@ -1523,6 +1523,11 @@ impl Snapshot {
     ) -> Result<Vec<i64>> {
         catalog::knn_exact(self, self.data_root, table, col, query, metric, k)
     }
+
+    /// BLOB de la columna `col` de una fila (point lookup, solo esa columna).
+    pub fn get_col_blob(&self, table: &TableDef, col: usize, rowid: i64) -> Result<Option<Vec<u8>>> {
+        catalog::get_col_blob(self, self.data_root, table, col, rowid)
+    }
 }
 
 // --- estado de páginas de una transacción ---
@@ -2066,6 +2071,11 @@ impl WriteTx {
         k: usize,
     ) -> Result<Vec<i64>> {
         catalog::knn_exact(&self.ts, self.data_root, table, col, query, metric, k)
+    }
+
+    /// BLOB de la columna `col` de una fila (point lookup, solo esa columna).
+    pub fn get_col_blob(&self, table: &TableDef, col: usize, rowid: i64) -> Result<Option<Vec<u8>>> {
+        catalog::get_col_blob(&self.ts, self.data_root, table, col, rowid)
     }
 
     pub fn drop_table(&mut self, name: &str) -> Result<bool> {

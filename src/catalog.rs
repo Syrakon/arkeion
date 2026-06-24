@@ -3558,6 +3558,23 @@ pub fn get_row<S: NodeSource>(
     }
 }
 
+/// Bytes del BLOB de la columna `col` de una fila (point lookup) decodificando
+/// **solo** esa columna, no la fila entera. Para el re-rank ANN del shortlist:
+/// evita materializar las columnas de metadata de los candidatos descartados.
+/// `None` si la fila no existe / la columna es NULL / no-blob.
+pub fn get_col_blob<S: NodeSource>(
+    src: &S,
+    root: PageId,
+    table: &TableDef,
+    col: usize,
+    rowid: i64,
+) -> Result<Option<Vec<u8>>> {
+    match btree::get(src, root, &row_key(table.table_id, rowid))? {
+        Some(bytes) => Ok(record::col_blob_bytes(&bytes, col)?.map(|b| b.to_vec())),
+        None => Ok(None),
+    }
+}
+
 pub fn delete_row<S: NodeStore>(
     s: &mut S,
     root: PageId,

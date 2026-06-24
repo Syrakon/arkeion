@@ -360,3 +360,43 @@ fn ivf_int8_rerank_recall_at_scale() {
         "recall@10 = {hits}/10 (≥ 8 esperado)\n exact={exact:?}\n ann={ann:?}"
     );
 }
+
+/// Re-rank ANN **solo-columna** sobre tabla ANCHA: el vector NO es la 1ª columna y
+/// hay metadata; el re-rank del shortlist debe decodificar solo el vector (saltando
+/// `label`) y la salida final traer todas las columnas correctas.
+#[test]
+fn ann_rerank_wide_table() {
+    let (_d, db) = db();
+    let conn = db.connect().unwrap();
+    conn.execute(
+        "CREATE TABLE docs (id INTEGER PRIMARY KEY, label TEXT, emb BLOB, score INTEGER)",
+        &[],
+    )
+    .unwrap();
+    for (lbl, vals, sc) in [("a", "1.0, 0.0", 10), ("b", "0.0, 1.0", 20), ("c", "0.95, 0.05", 30)]
+    {
+        conn.execute(
+            &format!("INSERT INTO docs (label, emb, score) VALUES ('{lbl}', vector({vals}), {sc})"),
+            &[],
+        )
+        .unwrap();
+    }
+    conn.execute(
+        "CREATE VECTOR INDEX vi ON docs (emb) USING cosine LISTS 2 PROBES 2",
+        &[],
+    )
+    .unwrap();
+    // top-2 más cercanos a (1,0): id 1 (a, cos 0) y 3 (c, cos≈0.05); id 2 (b) es ortogonal.
+    let rows: Vec<(i64, String, i64)> = conn
+        .query(
+            "SELECT id, label, score FROM docs ORDER BY cosine_distance(emb, vector(1.0, 0.0)) LIMIT 2",
+            &[],
+        )
+        .unwrap()
+        .map(|r| {
+            let r = r.unwrap();
+            (r.get(0).unwrap(), r.get(1).unwrap(), r.get(2).unwrap())
+        })
+        .collect();
+    assert_eq!(rows, vec![(1, "a".to_string(), 10), (3, "c".to_string(), 30)]);
+}

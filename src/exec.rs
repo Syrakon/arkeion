@@ -75,6 +75,9 @@ pub trait DataSource {
         metric: VectorMetric,
         k: usize,
     ) -> Result<Vec<i64>>;
+    /// BLOB de la columna `col` de una fila (point lookup, solo esa columna): el
+    /// re-rank ANN del shortlist sin materializar las columnas de metadata.
+    fn get_col_blob(&self, table: &TableDef, col: usize, rowid: i64) -> Result<Option<Vec<u8>>>;
 }
 
 impl DataSource for Snapshot {
@@ -147,6 +150,9 @@ impl DataSource for Snapshot {
     ) -> Result<Vec<i64>> {
         Snapshot::knn_exact(self, table, col, query, metric, k)
     }
+    fn get_col_blob(&self, table: &TableDef, col: usize, rowid: i64) -> Result<Option<Vec<u8>>> {
+        Snapshot::get_col_blob(self, table, col, rowid)
+    }
 }
 
 impl DataSource for WriteTx {
@@ -218,6 +224,9 @@ impl DataSource for WriteTx {
         k: usize,
     ) -> Result<Vec<i64>> {
         WriteTx::knn_exact(self, table, col, query, metric, k)
+    }
+    fn get_col_blob(&self, table: &TableDef, col: usize, rowid: i64) -> Result<Option<Vec<u8>>> {
+        WriteTx::get_col_blob(self, table, col, rowid)
     }
 }
 
@@ -1124,8 +1133,62 @@ fn vector_plan(
         None => return Ok(None),
     };
     let limit = k.saturating_mul(32).max(64);
+    let shortlist = src.vector_search(vidx, &query, nprobe, limit)?;
+
+    // Caso simple (pre-limitable): re-rank EXACTO leyendo SOLO la columna del vector
+    // de cada candidato (`get_col_blob`, no la fila entera), top-k, y solo entonces
+    // se materializan las `k` filas finales. Ahorra (shortlist − k) decodes de fila
+    // completa — clave en tablas anchas (RAG: vector + texto + metadata).
+    if stmt.joins.is_empty()
+        && !stmt.distinct
+        && stmt.group_by.is_empty()
+        && stmt.having.is_none()
+        && stmt.offset.is_none()
+        && stmt.compound.is_empty()
+    {
+        let qn = crate::vector::dot_f32(&query, &query).sqrt();
+        let mut scored: Vec<(f32, i64)> = Vec::new();
+        let mut scratch: Vec<f32> = Vec::new();
+        for rowid in shortlist {
+            let Some(blob) = src.get_col_blob(def, col_pos, rowid)? else {
+                continue;
+            };
+            crate::vector::unpack_into(&blob, &mut scratch)?;
+            if scratch.len() != query.len() {
+                continue;
+            }
+            let d = match metric {
+                VectorMetric::L2 => crate::vector::l2_sq(&scratch, &query),
+                VectorMetric::Cosine => {
+                    let sn = crate::vector::dot_f32(&scratch, &scratch).sqrt();
+                    if sn == 0.0 || qn == 0.0 {
+                        1.0
+                    } else {
+                        1.0 - crate::vector::dot_f32(&scratch, &query) / (sn * qn)
+                    }
+                }
+            };
+            scored.push((d, rowid));
+        }
+        let kk = k.max(1);
+        if scored.len() > kk {
+            scored.select_nth_unstable_by(kk, |a, b| a.0.total_cmp(&b.0));
+            scored.truncate(kk);
+        }
+        scored.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let mut rows = Vec::new();
+        for (_, rowid) in scored {
+            if let Some(row) = src.get_row(def, rowid)? {
+                rows.push(row);
+            }
+        }
+        return Ok(Some(rows));
+    }
+
+    // Con join/distinct/etc.: devuelve TODOS los candidatos; el ORDER BY/LIMIT de
+    // run_select los rankea y recorta (sin pre-limitar ⇒ seguro con join).
     let mut rows = Vec::new();
-    for rowid in src.vector_search(vidx, &query, nprobe, limit)? {
+    for rowid in shortlist {
         if let Some(row) = src.get_row(def, rowid)? {
             rows.push(row);
         }
@@ -2866,6 +2929,9 @@ impl DataSource for CteSource<'_> {
     ) -> Result<Vec<i64>> {
         self.inner.knn_exact(table, col, query, metric, k)
     }
+    fn get_col_blob(&self, table: &TableDef, col: usize, rowid: i64) -> Result<Option<Vec<u8>>> {
+        self.inner.get_col_blob(table, col, rowid)
+    }
 }
 
 // --- vistas (`CREATE VIEW`): SELECT con nombre, materializado bajo demanda ---
@@ -3026,6 +3092,9 @@ impl DataSource for ViewSource<'_> {
         k: usize,
     ) -> Result<Vec<i64>> {
         self.inner.knn_exact(table, col, query, metric, k)
+    }
+    fn get_col_blob(&self, table: &TableDef, col: usize, rowid: i64) -> Result<Option<Vec<u8>>> {
+        self.inner.get_col_blob(table, col, rowid)
     }
 }
 

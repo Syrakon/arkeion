@@ -227,6 +227,29 @@ fn skip_payload(buf: &[u8], pos: &mut usize, tag: u8) -> Result<()> {
     Ok(())
 }
 
+/// Bytes **prestados** del valor de la columna `col` si es un BLOB (sin asignar),
+/// o `None` si es NULL / no-blob / más allá del registro. El camino caliente del
+/// KNN: leer el vector empaquetado sin materializar un `Vec` por fila.
+pub fn col_blob_bytes(buf: &[u8], col: usize) -> Result<Option<&[u8]>> {
+    let bad = |r: &'static str| Error::CorruptRecord(r);
+    let mut pos = 0usize;
+    let ncols = take_varint(buf, &mut pos).ok_or(bad("cabecera de registro truncada"))? as usize;
+    if col >= ncols {
+        return Ok(None);
+    }
+    let tags = buf.get(pos..pos + ncols).ok_or(bad("tags truncados"))?;
+    let col_tag = tags[col];
+    pos += ncols;
+    for &tag in &tags[..col] {
+        skip_payload(buf, &mut pos, tag)?;
+    }
+    if col_tag != TAG_BLOB {
+        return Ok(None);
+    }
+    let len = take_varint(buf, &mut pos).ok_or(bad("longitud de blob truncada"))? as usize;
+    Ok(Some(buf.get(pos..pos + len).ok_or(bad("blob truncado"))?))
+}
+
 /// Decodifica SOLO las columnas `wanted` (índices **estrictamente crecientes**)
 /// de un registro, en una pasada: los payloads no pedidos se saltan sin
 /// materializar y la pasada corta tras la última pedida. Las columnas más allá

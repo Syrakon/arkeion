@@ -62,6 +62,33 @@ pub fn to_f32(b: &[u8]) -> Result<Vec<f32>> {
     unpack(b)
 }
 
+/// Como [`to_f32`] pero decodifica en un `Vec` **reutilizado** (sin asignar por
+/// llamada): el camino caliente del KNN exacto, fila tras fila.
+pub fn unpack_into(b: &[u8], out: &mut Vec<f32>) -> Result<()> {
+    out.clear();
+    match b.split_first() {
+        Some((&TAG_F32, rest)) => {
+            if !rest.len().is_multiple_of(4) {
+                return Err(Error::InvalidInput("BLOB de vector f32 mal formado"));
+            }
+            out.extend(
+                rest.chunks_exact(4)
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])),
+            );
+            Ok(())
+        }
+        Some((&TAG_I8, rest)) => {
+            let sb = rest
+                .get(0..4)
+                .ok_or(Error::InvalidInput("BLOB de vector int8 sin escala"))?;
+            let scale = f32::from_le_bytes([sb[0], sb[1], sb[2], sb[3]]);
+            out.extend(rest[4..].iter().map(|&q| q as i8 as f32 * scale));
+            Ok(())
+        }
+        _ => Err(Error::InvalidInput("BLOB de vector con tag desconocido")),
+    }
+}
+
 /// Desempaqueta cualquier formato (f32 o int8) a `Vec<f32>`.
 fn unpack(b: &[u8]) -> Result<Vec<f32>> {
     match b.split_first() {
@@ -90,13 +117,71 @@ fn unpack(b: &[u8]) -> Result<Vec<f32>> {
     }
 }
 
-/// Desempaqueta ambos vectores y valida que tengan la misma dimensión.
-fn pair(a: &[u8], b: &[u8]) -> Result<(Vec<f32>, Vec<f32>)> {
-    let (va, vb) = (unpack(a)?, unpack(b)?);
-    if va.len() != vb.len() {
+/// Formato de un blob ya parseado: f32 (bytes LE) o int8 (escala + bytes), para
+/// leer componentes **al vuelo sin asignar** un `Vec`.
+enum Fmt<'a> {
+    F32(&'a [u8]),
+    I8 { scale: f32, q: &'a [u8] },
+}
+
+/// Parsea el tag y devuelve `(dim, formato)` sin copiar el payload.
+fn parse_fmt(b: &[u8]) -> Result<(usize, Fmt<'_>)> {
+    match b.split_first() {
+        Some((&TAG_F32, rest)) => {
+            if !rest.len().is_multiple_of(4) {
+                return Err(Error::InvalidInput("BLOB de vector f32 mal formado"));
+            }
+            Ok((rest.len() / 4, Fmt::F32(rest)))
+        }
+        Some((&TAG_I8, rest)) => {
+            let sb = rest
+                .get(0..4)
+                .ok_or(Error::InvalidInput("BLOB de vector int8 sin escala"))?;
+            let scale = f32::from_le_bytes([sb[0], sb[1], sb[2], sb[3]]);
+            Ok((rest.len() - 4, Fmt::I8 { scale, q: &rest[4..] }))
+        }
+        _ => Err(Error::InvalidInput("BLOB de vector con tag desconocido")),
+    }
+}
+
+impl Fmt<'_> {
+    #[inline]
+    fn at(&self, i: usize) -> f32 {
+        match self {
+            Fmt::F32(b) => f32::from_le_bytes([b[i * 4], b[i * 4 + 1], b[i * 4 + 2], b[i * 4 + 3]]),
+            Fmt::I8 { scale, q } => q[i] as i8 as f32 * scale,
+        }
+    }
+}
+
+/// `(‖a‖², ‖b‖², a·b)` en UNA pasada, decodificando los blobs **al vuelo SIN
+/// asignar** (antes se desempaquetaban 2 `Vec` por llamada — millones por query en
+/// el KNN exacto y el re-rank). El caso f32×f32 (el común) va por un bucle tenso
+/// que el compilador autovectoriza; los mixtos por el `at()` genérico.
+fn three_sums(a: &[u8], b: &[u8]) -> Result<(f64, f64, f64)> {
+    let (da, fa) = parse_fmt(a)?;
+    let (db, fb) = parse_fmt(b)?;
+    if da != db {
         return Err(Error::InvalidInput("vectores de distinta dimensión"));
     }
-    Ok((va, vb))
+    let (mut sa, mut sb, mut sab) = (0.0f64, 0.0f64, 0.0f64);
+    if let (Fmt::F32(pa), Fmt::F32(pb)) = (&fa, &fb) {
+        for i in 0..da {
+            let x = f32::from_le_bytes([pa[i * 4], pa[i * 4 + 1], pa[i * 4 + 2], pa[i * 4 + 3]]);
+            let y = f32::from_le_bytes([pb[i * 4], pb[i * 4 + 1], pb[i * 4 + 2], pb[i * 4 + 3]]);
+            sa += (x * x) as f64;
+            sb += (y * y) as f64;
+            sab += (x * y) as f64;
+        }
+    } else {
+        for i in 0..da {
+            let (x, y) = (fa.at(i), fb.at(i));
+            sa += (x * x) as f64;
+            sb += (y * y) as f64;
+            sab += (x * y) as f64;
+        }
+    }
+    Ok((sa, sb, sab))
 }
 
 /// Producto interno `a·b` con **8 acumuladores f32 independientes**. El truco de
@@ -174,28 +259,45 @@ pub fn l2_sq_packed_i8(packed: &[u8], query: &[f32]) -> Option<f32> {
     Some(s)
 }
 
-/// Producto interno `a·b` (mayor = más parecido).
+/// Producto interno `a·b` (mayor = más parecido). Zero-alloc.
 pub fn dot(a: &[u8], b: &[u8]) -> Result<f64> {
-    let (va, vb) = pair(a, b)?;
-    Ok(dot_f32(&va, &vb) as f64)
+    Ok(three_sums(a, b)?.2)
 }
 
-/// Distancia euclídea `‖a − b‖₂` (menor = más parecido).
+/// Distancia euclídea `‖a − b‖₂` (menor = más parecido). Zero-alloc y **directa**
+/// `Σ(aᵢ−bᵢ)²` (no `‖a‖²+‖b‖²−2ab`, que cancela y pierde precisión en vectores
+/// cercanos — daba recall <1.0 en el KNN exacto).
 pub fn l2_distance(a: &[u8], b: &[u8]) -> Result<f64> {
-    let (va, vb) = pair(a, b)?;
-    Ok((l2_sq(&va, &vb) as f64).sqrt())
+    let (da, fa) = parse_fmt(a)?;
+    let (db, fb) = parse_fmt(b)?;
+    if da != db {
+        return Err(Error::InvalidInput("vectores de distinta dimensión"));
+    }
+    let mut s = 0.0f64;
+    if let (Fmt::F32(pa), Fmt::F32(pb)) = (&fa, &fb) {
+        for i in 0..da {
+            let x = f32::from_le_bytes([pa[i * 4], pa[i * 4 + 1], pa[i * 4 + 2], pa[i * 4 + 3]]);
+            let y = f32::from_le_bytes([pb[i * 4], pb[i * 4 + 1], pb[i * 4 + 2], pb[i * 4 + 3]]);
+            let d = (x - y) as f64;
+            s += d * d;
+        }
+    } else {
+        for i in 0..da {
+            let d = (fa.at(i) - fb.at(i)) as f64;
+            s += d * d;
+        }
+    }
+    Ok(s.sqrt())
 }
 
 /// Distancia coseno `1 − cos(a, b)` ∈ [0, 2] (menor = más parecido). Si alguno
-/// tiene norma 0 (indefinido) devuelve `1.0`.
+/// tiene norma 0 (indefinido) devuelve `1.0`. Zero-alloc.
 pub fn cosine_distance(a: &[u8], b: &[u8]) -> Result<f64> {
-    let (va, vb) = pair(a, b)?;
-    let na = dot_f32(&va, &va).sqrt();
-    let nb = dot_f32(&vb, &vb).sqrt();
-    if na == 0.0 || nb == 0.0 {
+    let (sa, sb, sab) = three_sums(a, b)?;
+    if sa == 0.0 || sb == 0.0 {
         return Ok(1.0);
     }
-    Ok(1.0 - (dot_f32(&va, &vb) / (na * nb)) as f64)
+    Ok(1.0 - sab / (sa.sqrt() * sb.sqrt()))
 }
 
 #[cfg(test)]

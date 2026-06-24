@@ -1510,6 +1510,19 @@ impl Snapshot {
     ) -> Result<Vec<i64>> {
         catalog::vector_search(self, self.data_root, vidx, query, nprobe, limit)
     }
+
+    /// Top-k rowids por distancia EXACTA (KNN sin índice): full scan en streaming
+    /// decodificando solo la columna del vector, sin materializar las filas.
+    pub fn knn_exact(
+        &self,
+        table: &TableDef,
+        col: usize,
+        query: &[u8],
+        metric: catalog::VectorMetric,
+        k: usize,
+    ) -> Result<Vec<i64>> {
+        catalog::knn_exact(self, self.data_root, table, col, query, metric, k)
+    }
 }
 
 // --- estado de páginas de una transacción ---
@@ -2040,6 +2053,19 @@ impl WriteTx {
         limit: usize,
     ) -> Result<Vec<i64>> {
         catalog::vector_search(&self.ts, self.data_root, vidx, query, nprobe, limit)
+    }
+
+    /// Top-k rowids por distancia EXACTA (KNN sin índice): full scan en streaming
+    /// decodificando solo la columna del vector, sin materializar las filas.
+    pub fn knn_exact(
+        &self,
+        table: &TableDef,
+        col: usize,
+        query: &[u8],
+        metric: catalog::VectorMetric,
+        k: usize,
+    ) -> Result<Vec<i64>> {
+        catalog::knn_exact(&self.ts, self.data_root, table, col, query, metric, k)
     }
 
     pub fn drop_table(&mut self, name: &str) -> Result<bool> {

@@ -3744,6 +3744,75 @@ pub struct TableScan<'s, S: NodeSource> {
     done: bool,
 }
 
+/// Top-`k` rowids por distancia EXACTA `metric(col, query)` ASC, **en streaming**:
+/// escanea la tabla decodificando SOLO la columna del vector (`decode_cols_sorted`,
+/// no la fila entera) y queda con los `k` candidatos más cercanos — sin materializar
+/// 1M filas ni alocar un `Vec` por fila. Es la vía del KNN exacto sin índice (full
+/// scan); arregla el cuello: el coste era construir cada fila completa, no la
+/// distancia. NULL/no-blob se ignoran.
+pub fn knn_exact<S: NodeSource>(
+    src: &S,
+    root: PageId,
+    table: &TableDef,
+    col: usize,
+    query: &[u8],
+    metric: VectorMetric,
+    k: usize,
+) -> Result<Vec<i64>> {
+    let prefix = row_prefix(table.table_id);
+    let mut st = btree::scan_state(src, root, Some(&prefix))?;
+    // Query desempaquetada UNA vez (+ su norma para coseno); `scratch` reutilizado
+    // ⇒ cero alloc por fila. La distancia va por el kernel SIMD `l2_sq`/`dot_f32`.
+    let q = crate::vector::to_f32(query)?;
+    let qn = crate::vector::dot_f32(&q, &q).sqrt();
+    let mut scratch: Vec<f32> = Vec::new();
+    let mut cands: Vec<(f32, i64)> = Vec::new();
+    let mut stop = false;
+    while !stop {
+        let got = st.advance_view(src, |key, payload| {
+            if !key.starts_with(&prefix) {
+                stop = true;
+                return Ok(None);
+            }
+            let rowid = decode_row_key(key)
+                .ok_or(Error::CorruptRecord("clave de fila mal formada"))?
+                .1;
+            let Some(emb) = record::col_blob_bytes(payload, col)? else {
+                return Ok(None); // NULL / no-blob: no se rankea
+            };
+            crate::vector::unpack_into(emb, &mut scratch)?;
+            if scratch.len() != q.len() {
+                return Ok(None); // dimensión distinta: se ignora
+            }
+            let d = match metric {
+                // `l2_sq` = Σ(a−b)² directo (exacto; ordena igual que L2).
+                VectorMetric::L2 => crate::vector::l2_sq(&scratch, &q),
+                VectorMetric::Cosine => {
+                    let sn = crate::vector::dot_f32(&scratch, &scratch).sqrt();
+                    if sn == 0.0 || qn == 0.0 {
+                        1.0
+                    } else {
+                        1.0 - crate::vector::dot_f32(&scratch, &q) / (sn * qn)
+                    }
+                }
+            };
+            Ok(Some((d, rowid)))
+        })?;
+        match got {
+            None => break,
+            Some(None) => {}
+            Some(Some(c)) => cands.push(c),
+        }
+    }
+    let k = k.max(1);
+    if cands.len() > k {
+        cands.select_nth_unstable_by(k, |a, b| a.0.total_cmp(&b.0));
+        cands.truncate(k);
+    }
+    cands.sort_by(|a, b| a.0.total_cmp(&b.0));
+    Ok(cands.into_iter().map(|(_, r)| r).collect())
+}
+
 pub fn scan_table<'s, S: NodeSource>(
     src: &'s S,
     root: PageId,

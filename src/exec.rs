@@ -66,6 +66,15 @@ pub trait DataSource {
         nprobe: usize,
         limit: usize,
     ) -> Result<Vec<i64>>;
+    /// Top-k rowids por distancia EXACTA `metric(col, query)` (KNN sin índice).
+    fn knn_exact(
+        &self,
+        table: &TableDef,
+        col: usize,
+        query: &[u8],
+        metric: VectorMetric,
+        k: usize,
+    ) -> Result<Vec<i64>>;
 }
 
 impl DataSource for Snapshot {
@@ -128,6 +137,16 @@ impl DataSource for Snapshot {
     ) -> Result<Vec<i64>> {
         Snapshot::vector_search(self, vidx, query, nprobe, limit)
     }
+    fn knn_exact(
+        &self,
+        table: &TableDef,
+        col: usize,
+        query: &[u8],
+        metric: VectorMetric,
+        k: usize,
+    ) -> Result<Vec<i64>> {
+        Snapshot::knn_exact(self, table, col, query, metric, k)
+    }
 }
 
 impl DataSource for WriteTx {
@@ -189,6 +208,16 @@ impl DataSource for WriteTx {
         limit: usize,
     ) -> Result<Vec<i64>> {
         WriteTx::vector_search(self, vidx, query, nprobe, limit)
+    }
+    fn knn_exact(
+        &self,
+        table: &TableDef,
+        col: usize,
+        query: &[u8],
+        metric: VectorMetric,
+        k: usize,
+    ) -> Result<Vec<i64>> {
+        WriteTx::knn_exact(self, table, col, query, metric, k)
     }
 }
 
@@ -1097,6 +1126,67 @@ fn vector_plan(
     let limit = k.saturating_mul(32).max(64);
     let mut rows = Vec::new();
     for rowid in src.vector_search(vidx, &query, nprobe, limit)? {
+        if let Some(row) = src.get_row(def, rowid)? {
+            rows.push(row);
+        }
+    }
+    Ok(Some(rows))
+}
+
+/// Plan KNN **EXACTO** (sin índice IVF): `ORDER BY cosine_distance|l2_distance(col,
+/// qvec) ASC LIMIT k` sin WHERE/JOIN/etc. ⇒ top-k en **streaming** vía
+/// `knn_exact` (decodifica solo la columna del vector, no materializa la tabla).
+/// Devuelve solo las `k` filas (`get_row`). Gateado estricto: como pre-limita a k,
+/// cualquier cosa que cambie la cardinalidad después (join, distinct, group by,
+/// having, offset, union) lo desactiva y cae al full scan general.
+fn exact_knn_plan(
+    src: &impl DataSource,
+    def: &TableDef,
+    stmt: &SelectStmt,
+    params: &[Value],
+) -> Result<Option<Vec<Vec<Value>>>> {
+    if stmt.where_clause.is_some()
+        || stmt.limit.is_none()
+        || stmt.order_by.len() != 1
+        || !stmt.joins.is_empty()
+        || !stmt.group_by.is_empty()
+        || stmt.having.is_some()
+        || stmt.distinct
+        || stmt.offset.is_some()
+        || !stmt.compound.is_empty()
+    {
+        return Ok(None);
+    }
+    let ob = &stmt.order_by[0];
+    if ob.desc {
+        return Ok(None);
+    }
+    let Expr::Function { name, args } = &ob.expr else {
+        return Ok(None);
+    };
+    let metric = match name.as_str() {
+        "cosine_distance" => VectorMetric::Cosine,
+        "l2_distance" => VectorMetric::L2,
+        _ => return Ok(None),
+    };
+    if args.len() != 2 {
+        return Ok(None);
+    }
+    let Expr::Column { name: col, .. } = &args[0] else {
+        return Ok(None);
+    };
+    let Some(col_pos) = def.columns.iter().position(|c| !c.dropped && c.name == *col) else {
+        return Ok(None);
+    };
+    let Value::Blob(qb) = eval_const(&args[1], params)? else {
+        return Ok(None);
+    };
+    let k = match &stmt.limit {
+        Some(e) => usize_const(e, params, "LIMIT")?,
+        None => return Ok(None),
+    };
+    let mut rows = Vec::new();
+    for rowid in src.knn_exact(def, col_pos, &qb, metric, k)? {
         if let Some(row) = src.get_row(def, rowid)? {
             rows.push(row);
         }
@@ -2316,6 +2406,9 @@ pub fn run_select(src: &impl DataSource, stmt: &SelectStmt, params: &[Value]) ->
             // KNN por índice IVF (ANN): candidatos de los clusters más cercanos;
             // el ORDER BY/LIMIT los rankea exacto después.
             vec_rows
+        } else if let Some(knn_rows) = exact_knn_plan(src, &from_def, stmt, params)? {
+            // KNN EXACTO sin índice: top-k en streaming, sin materializar la tabla.
+            knn_rows
         } else {
             src.scan_rows(&from_def)?
         }
@@ -2763,6 +2856,16 @@ impl DataSource for CteSource<'_> {
     ) -> Result<Vec<i64>> {
         self.inner.vector_search(vidx, query, nprobe, limit)
     }
+    fn knn_exact(
+        &self,
+        table: &TableDef,
+        col: usize,
+        query: &[u8],
+        metric: VectorMetric,
+        k: usize,
+    ) -> Result<Vec<i64>> {
+        self.inner.knn_exact(table, col, query, metric, k)
+    }
 }
 
 // --- vistas (`CREATE VIEW`): SELECT con nombre, materializado bajo demanda ---
@@ -2913,6 +3016,16 @@ impl DataSource for ViewSource<'_> {
         limit: usize,
     ) -> Result<Vec<i64>> {
         self.inner.vector_search(vidx, query, nprobe, limit)
+    }
+    fn knn_exact(
+        &self,
+        table: &TableDef,
+        col: usize,
+        query: &[u8],
+        metric: VectorMetric,
+        k: usize,
+    ) -> Result<Vec<i64>> {
+        self.inner.knn_exact(table, col, query, metric, k)
     }
 }
 

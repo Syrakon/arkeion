@@ -15,7 +15,8 @@
 //!     order-preserving de longitud variable; sin byte de namespace — la
 //!     cabecera 0x80+ de table_id ya lo distingue de 0x00/0x02)
 //! [0x02, index_id BE, valor*, rowid BE*] → entrada de índice (valor memcomparable)
-//! [0x03, fts_id BE, 0x00, term, rowid BE, field, pos] → posting full-text (docs/12)
+//! [0x03, fts_id BE, 0x00, term_id BE, rowid BE, field, pos] → posting full-text (docs/12)
+//! [0x03, fts_id BE, 0x04, term] → term_id BE(4) (diccionario); [0x03, fts_id BE, 0x05] → contador
 //! [0x03, fts_id BE, 0x01|0x02|0x03, …]    → stats BM25 (doclen / globales / df)
 //! ```
 
@@ -50,10 +51,12 @@ const CAT_FTS_REF: u8 = 0x08;
 const CAT_VECTOR_COUNTER: u8 = 0x09;
 const CAT_VECTOR_REF: u8 = 0x0A;
 // Sub-tipos dentro de un índice FTS, tras `[0x03, fts_id BE]`:
-const FTS_POSTING: u8 = 0x00; // ‖ term ‖ rowid BE ‖ field ‖ pos varint → vacío
+const FTS_POSTING: u8 = 0x00; // ‖ term_id BE(4) ‖ rowid BE ‖ field ‖ pos varint → vacío
 const FTS_DOCLEN: u8 = 0x01; // ‖ rowid BE → nº de tokens del doc (varint)
 const FTS_GLOBAL: u8 = 0x02; // → {N docs, Σ tokens} (dos varints) para avgdl
 const FTS_DF: u8 = 0x03; // ‖ term → nº de docs con el término (varint)
+const FTS_TERM_DICT: u8 = 0x04; // ‖ term → term_id BE(4): el término se guarda UNA vez
+const FTS_TERM_COUNTER: u8 = 0x05; // → próximo term_id (u32 LE) de este índice
 // Sub-tipos dentro de un índice vectorial, tras `[0x04, vidx_id BE]`:
 const VEC_CENTROID: u8 = 0x00; // ‖ centroid_id BE(2) → vector f32 del centroide
 const VEC_POSTING: u8 = 0x01; // ‖ centroid_id BE(2) ‖ rowid BE(8) → código PQ (IVFPQ)
@@ -1784,16 +1787,80 @@ fn fts_sub_prefix(fts_id: u32, sub: u8) -> Vec<u8> {
     k
 }
 
-/// Clave de un posting: `[0x03, fts_id, 0x00, term, rowid BE, field, pos]`. El
-/// `term` va memcomparable (self-delimitado), así el `rowid` que sigue no se
-/// confunde con su cola de longitud variable.
-fn fts_posting_key(fts_id: u32, term: &str, rowid: i64, field: u8, pos: u32) -> Vec<u8> {
-    let mut k = fts_sub_prefix(fts_id, FTS_POSTING);
-    keyenc::encode_index_value_ref(ValueRef::Text(term), &mut k);
+/// Clave de un posting: `[0x03, fts_id, 0x00, term_id BE(4), rowid BE(8), field, pos]`.
+/// El `term_id` (del diccionario, [`fts_alloc_term_id`]) sustituye a la cadena del
+/// término —que antes se repetía entera en CADA posting— por 4 bytes fijos.
+fn fts_posting_key(fts_id: u32, term_id: u32, rowid: i64, field: u8, pos: u32) -> Vec<u8> {
+    let mut k = fts_term_posting_prefix(fts_id, term_id);
     k.extend_from_slice(&record::rowid_be(rowid));
     k.push(field);
     put_varint(&mut k, pos as u64);
     k
+}
+
+/// Prefijo `[0x03, fts_id, 0x00, term_id BE(4)]`: todos los postings de un término.
+fn fts_term_posting_prefix(fts_id: u32, term_id: u32) -> Vec<u8> {
+    let mut k = fts_sub_prefix(fts_id, FTS_POSTING);
+    k.extend_from_slice(&term_id.to_be_bytes());
+    k
+}
+
+/// Clave del diccionario: `[0x03, fts_id, 0x04, term]` → `term_id` BE(4). El término
+/// se guarda **una sola vez** aquí (memcomparable, self-delimitado), no por posting.
+fn fts_term_dict_key(fts_id: u32, term: &str) -> Vec<u8> {
+    let mut k = fts_sub_prefix(fts_id, FTS_TERM_DICT);
+    keyenc::encode_index_value_ref(ValueRef::Text(term), &mut k);
+    k
+}
+
+/// Contador `[0x03, fts_id, 0x05]` → próximo `term_id` (u32 LE) del índice.
+fn fts_term_counter_key(fts_id: u32) -> Vec<u8> {
+    fts_sub_prefix(fts_id, FTS_TERM_COUNTER)
+}
+
+/// `term_id` de `term` si ya está en el diccionario; `None` si nunca se indexó.
+fn fts_lookup_term_id<S: NodeSource>(
+    src: &S,
+    root: PageId,
+    fts_id: u32,
+    term: &str,
+) -> Result<Option<u32>> {
+    match btree::get(src, root, &fts_term_dict_key(fts_id, term))? {
+        Some(v) => {
+            let arr: [u8; 4] = v
+                .as_slice()
+                .try_into()
+                .map_err(|_| Error::CorruptRecord("term_id en diccionario FTS"))?;
+            Ok(Some(u32::from_be_bytes(arr)))
+        }
+        None => Ok(None),
+    }
+}
+
+/// `term_id` de `term`, asignándolo desde el contador del índice si es nuevo.
+/// Estable: re-resolver el mismo término da el mismo id (los términos no se
+/// reciclan), así que revertir un documento reconstruye exactamente sus claves.
+fn fts_alloc_term_id<S: NodeStore>(
+    s: &mut S,
+    root: PageId,
+    fts_id: u32,
+    term: &str,
+) -> Result<(u32, PageId)> {
+    if let Some(id) = fts_lookup_term_id(s, root, fts_id, term)? {
+        return Ok((id, root));
+    }
+    let ckey = fts_term_counter_key(fts_id);
+    let next = match btree::get(s, root, &ckey)? {
+        Some(v) => u32::from_le_bytes(
+            v.as_slice()
+                .try_into()
+                .map_err(|_| Error::CorruptRecord("contador de términos FTS"))?,
+        ),
+        None => 1,
+    };
+    let mut root = btree::insert(s, root, &ckey, &(next + 1).to_le_bytes())?;
+    root = btree::insert(s, root, &fts_term_dict_key(fts_id, term), &next.to_be_bytes())?;
+    Ok((next, root))
 }
 
 fn fts_doclen_key(fts_id: u32, rowid: i64) -> Vec<u8> {
@@ -1922,11 +1989,23 @@ fn apply_fts_row<S: NodeStore>(
             tk.tokenize(text, &mut buf);
         }
         for token in &buf {
-            let key = fts_posting_key(fts.fts_id, &token.text, rowid, col as u8, token.position);
-            if add {
-                root = btree::insert(s, root, &key, &[])?;
+            // El posting va por `term_id` (diccionario): al insertar se asigna, al
+            // borrar se busca (siempre existe, porque se insertó antes). Si por algún
+            // motivo no estuviera, no hay posting que borrar; las stats igual cuadran.
+            let term_id = if add {
+                let (id, r) = fts_alloc_term_id(s, root, fts.fts_id, &token.text)?;
+                root = r;
+                Some(id)
             } else {
-                (root, _) = btree::delete(s, root, &key)?;
+                fts_lookup_term_id(s, root, fts.fts_id, &token.text)?
+            };
+            if let Some(term_id) = term_id {
+                let key = fts_posting_key(fts.fts_id, term_id, rowid, col as u8, token.position);
+                if add {
+                    root = btree::insert(s, root, &key, &[])?;
+                } else {
+                    (root, _) = btree::delete(s, root, &key)?;
+                }
             }
             doclen += 1;
             doc_terms.insert(token.text.clone());
@@ -2103,8 +2182,10 @@ pub fn fts_term_rowids<S: NodeSource>(
     fts_id: u32,
     term: &str,
 ) -> Result<Vec<i64>> {
-    let mut prefix = fts_sub_prefix(fts_id, FTS_POSTING);
-    keyenc::encode_index_value_ref(ValueRef::Text(term), &mut prefix);
+    let Some(term_id) = fts_lookup_term_id(src, root, fts_id, term)? else {
+        return Ok(Vec::new());
+    };
+    let prefix = fts_term_posting_prefix(fts_id, term_id);
     let plen = prefix.len();
     let mut rowids = Vec::new();
     let mut last: Option<i64> = None;
@@ -2176,8 +2257,10 @@ fn fts_term_postings<S: NodeSource>(
     fts_id: u32,
     term: &str,
 ) -> Result<Vec<(i64, u8, u32)>> {
-    let mut prefix = fts_sub_prefix(fts_id, FTS_POSTING);
-    keyenc::encode_index_value_ref(ValueRef::Text(term), &mut prefix);
+    let Some(term_id) = fts_lookup_term_id(src, root, fts_id, term)? else {
+        return Ok(Vec::new());
+    };
+    let prefix = fts_term_posting_prefix(fts_id, term_id);
     let plen = prefix.len();
     let mut out = Vec::new();
     btree::for_each_prefix(src, root, &prefix, |key| {
@@ -2187,30 +2270,41 @@ fn fts_term_postings<S: NodeSource>(
     Ok(out)
 }
 
-/// Postings de los términos que empiezan por `prefix_text` (`term*`). Los tokens
-/// son texto normalizado sin `0x00`, así que el terminador del término es el
-/// primer `0x00 0x00` tras el prefijo de escaneo.
+/// Postings de los términos que empiezan por `prefix_text` (`term*`). Resuelve el
+/// prefijo contra el **diccionario** (`term*` → conjunto de `term_id`) y junta los
+/// postings de cada uno. Antes el prefijo se escaneaba sobre los propios postings y
+/// había que localizar el terminador `0x00 0x00` del término en cada clave.
 fn fts_prefix_postings<S: NodeSource>(
     src: &S,
     root: PageId,
     fts_id: u32,
     prefix_text: &str,
 ) -> Result<Vec<(i64, u8, u32)>> {
-    let mut scan = fts_sub_prefix(fts_id, FTS_POSTING);
-    keyenc::encode_text_prefix(prefix_text, &mut scan);
-    let slen = scan.len();
+    // 1) términos del diccionario que empiezan por `prefix_text` → sus `term_id`.
+    let mut dscan = fts_sub_prefix(fts_id, FTS_TERM_DICT);
+    keyenc::encode_text_prefix(prefix_text, &mut dscan);
+    let mut term_ids = Vec::new();
+    for item in btree::scan_from(src, root, &dscan)? {
+        let (k, v) = item?;
+        if !k.starts_with(&dscan) {
+            break;
+        }
+        let arr: [u8; 4] = v
+            .as_slice()
+            .try_into()
+            .map_err(|_| Error::CorruptRecord("term_id en diccionario FTS"))?;
+        term_ids.push(u32::from_be_bytes(arr));
+    }
+    // 2) postings de cada término que casa el prefijo.
     let mut out = Vec::new();
-    btree::for_each_prefix(src, root, &scan, |key| {
-        let tail = key
-            .get(slen..)
-            .ok_or(Error::CorruptRecord("posting FTS truncado"))?;
-        let term_end = tail
-            .windows(2)
-            .position(|w| w == [0x00, 0x00])
-            .ok_or(Error::CorruptRecord("terminador de término FTS"))?;
-        out.push(decode_posting_suffix(&tail[term_end + 2..])?);
-        Ok(())
-    })?;
+    for term_id in term_ids {
+        let prefix = fts_term_posting_prefix(fts_id, term_id);
+        let plen = prefix.len();
+        btree::for_each_prefix(src, root, &prefix, |key| {
+            out.push(decode_posting_suffix(&key[plen..])?);
+            Ok(())
+        })?;
+    }
     Ok(out)
 }
 

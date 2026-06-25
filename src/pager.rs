@@ -51,8 +51,9 @@ pub struct Pager {
     /// `Some` = on (cada página de datos lleva un byte de método). Se decide al
     /// crear (bit `FLAG_COMPRESSED`) y se lee del header al abrir.
     compressor: Option<Arc<dyn Compressor>>,
-    /// Caché acotada de páginas inmutables (M9): LRU aproximada con tope.
-    cache: Mutex<PageCache>,
+    /// Caché acotada de páginas inmutables (M9): CLOCK aproximada con tope,
+    /// **shardeada** para no serializar las lecturas concurrentes (ver `ShardedCache`).
+    cache: ShardedCache,
     state: Mutex<AppendState>,
 }
 
@@ -132,6 +133,66 @@ impl PageCache {
     #[cfg(test)]
     fn len(&self) -> usize {
         self.slots.len()
+    }
+}
+
+/// Caché de páginas **shardeada**: N subcachés CLOCK independientes, cada una con su
+/// propio `Mutex`. Una página cae siempre en el mismo shard (hash de su id), así que
+/// lectores concurrentes que tocan páginas distintas **no contienden** por un lock
+/// global. El `Mutex<PageCache>` único serializaba TODA lectura —incluido el *hit*,
+/// que marca el bit de referencia (`get(&mut self)`)—, y limitaba el escalado a ~3-4×
+/// pese a tener más núcleos. El nº de shards es potencia de 2 (~2× núcleos, acotado a
+/// 64 y a no más que la capacidad) y la capacidad total se reparte entre ellos.
+struct ShardedCache {
+    shards: Vec<Mutex<PageCache>>,
+    mask: usize,
+}
+
+impl ShardedCache {
+    fn new(cap: usize) -> ShardedCache {
+        let cap = cap.max(1);
+        let cores = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
+        // Potencia de 2; ni más shards que núcleos·2, ni que 64, ni que páginas
+        // (cada shard ≥ 1 página para no degradar a una caché inútil).
+        let mut nshards = (cores * 2).next_power_of_two().clamp(1, 64);
+        while nshards > cap {
+            nshards /= 2;
+        }
+        let per = cap.div_ceil(nshards);
+        let shards = (0..nshards).map(|_| Mutex::new(PageCache::new(per))).collect();
+        ShardedCache {
+            shards,
+            mask: nshards - 1,
+        }
+    }
+
+    /// Shard de una página: hash multiplicativo (Fibonacci) del id; los bits altos se
+    /// distribuyen bien aunque los ids sean casi secuenciales (recorridos de B-tree).
+    #[inline]
+    fn shard(&self, id: PageId) -> &Mutex<PageCache> {
+        let h = id.0.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        &self.shards[(h >> 58) as usize & self.mask]
+    }
+
+    fn get(&self, id: PageId) -> Option<Arc<PageBuf>> {
+        self.shard(id).lock().expect("caché envenenada").get(id)
+    }
+
+    fn insert(&self, id: PageId, page: Arc<PageBuf>) {
+        self.shard(id)
+            .lock()
+            .expect("caché envenenada")
+            .insert(id, page);
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.shards
+            .iter()
+            .map(|s| s.lock().expect("caché envenenada").len())
+            .sum()
     }
 }
 
@@ -270,7 +331,7 @@ impl Pager {
             plain: PlainProvider,
             crypto,
             compressor,
-            cache: Mutex::new(PageCache::new(cache_pages)),
+            cache: ShardedCache::new(cache_pages),
             state: Mutex::new(AppendState {
                 next_page: FIRST_DATA_PAGE.0,
                 nonce_counter: 0,
@@ -368,7 +429,7 @@ impl Pager {
             plain: PlainProvider,
             crypto,
             compressor,
-            cache: Mutex::new(PageCache::new(cache_pages)),
+            cache: ShardedCache::new(cache_pages),
             state: Mutex::new(AppendState {
                 next_page: FIRST_DATA_PAGE.0,
                 nonce_counter: 0,
@@ -464,10 +525,7 @@ impl Pager {
         state.write_offset = offset + framed.len() as u64;
         drop(state);
 
-        self.cache
-            .lock()
-            .expect("caché envenenada")
-            .insert(id, cached);
+        self.cache.insert(id, cached);
         Ok(id)
     }
 
@@ -492,7 +550,7 @@ impl Pager {
                 reason: "página sin entrada en el directorio",
             })?
         };
-        if let Some(p) = self.cache.lock().expect("caché envenenada").get(id) {
+        if let Some(p) = self.cache.get(id) {
             return Ok(p);
         }
 
@@ -502,10 +560,7 @@ impl Pager {
         let mut page = PageBuf::zeroed();
         page.body_mut()[..body.len()].copy_from_slice(&body);
         let page = Arc::new(page);
-        self.cache
-            .lock()
-            .expect("caché envenenada")
-            .insert(id, page.clone());
+        self.cache.insert(id, page.clone());
         Ok(page)
     }
 
@@ -735,10 +790,7 @@ impl Pager {
     /// las páginas recién escritas se relean sin tocar disco; sobreescribe
     /// entradas obsoletas de una cola rota anterior.
     pub fn cache_insert(&self, id: PageId, page: Arc<PageBuf>) {
-        self.cache
-            .lock()
-            .expect("caché envenenada")
-            .insert(id, page);
+        self.cache.insert(id, page);
     }
 
     /// Longitud física del archivo en bytes (EOF físico). Acota la cola rota en
@@ -841,7 +893,7 @@ impl Pager {
 
     #[cfg(test)]
     fn cache_len(&self) -> usize {
-        self.cache.lock().expect("caché envenenada").len()
+        self.cache.len()
     }
 }
 

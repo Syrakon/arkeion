@@ -2638,6 +2638,107 @@ pub fn fts_search<S: NodeSource>(
     eval_query(src, root, table, fts, tk.as_ref(), query, None)
 }
 
+// --- ranking BM25 (compartido con `exec::eval_bm25` para no divergir) ---
+
+/// IDF de Robertson/BM25: `ln(1 + (N - df + 0.5) / (df + 0.5))`.
+pub(crate) fn bm25_idf(n: u64, df: u64) -> f64 {
+    let n = n as f64;
+    let d = df as f64;
+    (1.0 + (n - d + 0.5) / (d + 0.5)).ln()
+}
+
+/// Contribución de un término a la puntuación BM25 de un documento (K1=1.2, B=0.75).
+pub(crate) fn bm25_term(idf: f64, tf: f64, dl: f64, avgdl: f64) -> f64 {
+    const K1: f64 = 1.2;
+    const B: f64 = 0.75;
+    if tf == 0.0 {
+        return 0.0;
+    }
+    let norm = if avgdl > 0.0 { dl / avgdl } else { 1.0 };
+    idf * (tf * (K1 + 1.0)) / (tf + K1 * (1.0 - B + B * norm))
+}
+
+/// `(rowid, tf)` por documento de un término: una celda por (término, doc), y el
+/// `tf` es el nº total de posiciones del valor (suma de los `count` por field).
+fn fts_term_doc_tf<S: NodeSource>(
+    src: &S,
+    root: PageId,
+    fts_id: u32,
+    term: &str,
+) -> Result<Vec<(i64, u32)>> {
+    let Some(term_id) = fts_lookup_term_id(src, root, fts_id, term)? else {
+        return Ok(Vec::new());
+    };
+    let prefix = fts_term_posting_prefix(fts_id, term_id);
+    let plen = prefix.len();
+    let mut out = Vec::new();
+    for item in btree::scan_from(src, root, &prefix)? {
+        let (k, v) = item?;
+        if !k.starts_with(&prefix) {
+            break;
+        }
+        let rid = k
+            .get(plen..plen + 8)
+            .and_then(record::rowid_from_be)
+            .ok_or(Error::CorruptRecord("rowid en posting FTS"))?;
+        let mut tf = 0u32;
+        decode_posting_value(&v, |_field, _pos| tf += 1)?;
+        out.push((rid, tf));
+    }
+    Ok(out)
+}
+
+/// Top-`want` rowids de un `MATCH` rankeados por BM25 **desde el índice** (sin leer
+/// ni re-tokenizar filas): candidatos vía [`eval_query`], `tf` del valor del posting,
+/// `dl` de la clave de doclen, `idf`/`avgdl` de stats. Devuelve un shortlist (orden
+/// score desc, rowid asc) que el llamador re-rankea exacto sobre pocas filas. Es la
+/// versión FTS de [`fn@crate::catalog::knn_exact`]/`vector_search`.
+pub fn fts_bm25_topk<S: NodeSource>(
+    src: &S,
+    root: PageId,
+    table: &TableDef,
+    fts: &FtsIndexDef,
+    query: &crate::fts::Query,
+    want: usize,
+) -> Result<Vec<i64>> {
+    let tk = crate::fts::tokenizer_for(&fts.tokenizer)?;
+    let candidates = eval_query(src, root, table, fts, tk.as_ref(), query, None)?;
+    if candidates.is_empty() {
+        return Ok(Vec::new());
+    }
+    let (n, total) = fts_global_stats(src, root, fts.fts_id)?;
+    let avgdl = if n > 0 { total as f64 / n as f64 } else { 0.0 };
+    let mut score: std::collections::HashMap<i64, f64> =
+        candidates.iter().map(|&r| (r, 0.0)).collect();
+    let mut dl_cache: std::collections::HashMap<i64, f64> = std::collections::HashMap::new();
+    let mut seen = std::collections::HashSet::new();
+    for term in crate::fts::query_terms(query, tk.as_ref()) {
+        if !seen.insert(term.clone()) {
+            continue; // idf una vez por término distinto
+        }
+        let idf = bm25_idf(n, fts_doc_freq(src, root, fts.fts_id, &term)?);
+        for (rid, tf) in fts_term_doc_tf(src, root, fts.fts_id, &term)? {
+            if let Some(s) = score.get_mut(&rid) {
+                let dl = match dl_cache.get(&rid) {
+                    Some(&d) => d,
+                    None => {
+                        let d = fts_doc_len(src, root, fts.fts_id, rid)? as f64;
+                        dl_cache.insert(rid, d);
+                        d
+                    }
+                };
+                *s += bm25_term(idf, f64::from(tf), dl, avgdl);
+            }
+        }
+    }
+    // Shortlist: top-`want` por (score desc, rowid asc). El sort es de escalares
+    // (sin datos de fila), barato frente a los fetch de fila que evitamos.
+    let mut scored: Vec<(f64, i64)> = score.into_iter().map(|(r, s)| (s, r)).collect();
+    scored.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+    scored.truncate(want);
+    Ok(scored.into_iter().map(|(_, r)| r).collect())
+}
+
 // --- evaluación de MATCH contra una sola fila (sin índice): el planner re-aplica
 // el WHERE por fila, y así `MATCH` funciona en cualquier posición (OR/NOT). El
 // índice queda como optimización de narrowing aparte. ---

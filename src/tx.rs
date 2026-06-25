@@ -1511,6 +1511,18 @@ impl Snapshot {
         catalog::vector_search(self, self.data_root, vidx, query, nprobe, limit)
     }
 
+    /// Top-`want` rowids de un `MATCH` rankeados por BM25 desde el índice (shortlist
+    /// para re-rank exacto), sin materializar ni re-tokenizar las filas que casan.
+    pub fn fts_bm25_topk(
+        &self,
+        def: &TableDef,
+        fts: &FtsIndexDef,
+        query: &crate::fts::Query,
+        want: usize,
+    ) -> Result<Vec<i64>> {
+        catalog::fts_bm25_topk(self, self.data_root, def, fts, query, want)
+    }
+
     /// Top-k rowids por distancia EXACTA (KNN sin índice): full scan en streaming
     /// decodificando solo la columna del vector, sin materializar las filas.
     pub fn knn_exact(
@@ -2058,6 +2070,18 @@ impl WriteTx {
         limit: usize,
     ) -> Result<Vec<i64>> {
         catalog::vector_search(&self.ts, self.data_root, vidx, query, nprobe, limit)
+    }
+
+    /// Top-`want` rowids de un `MATCH` rankeados por BM25 desde el índice (shortlist
+    /// para re-rank exacto), sin materializar ni re-tokenizar las filas que casan.
+    pub fn fts_bm25_topk(
+        &self,
+        def: &TableDef,
+        fts: &FtsIndexDef,
+        query: &crate::fts::Query,
+        want: usize,
+    ) -> Result<Vec<i64>> {
+        catalog::fts_bm25_topk(&self.ts, self.data_root, def, fts, query, want)
     }
 
     /// Top-k rowids por distancia EXACTA (KNN sin índice): full scan en streaming

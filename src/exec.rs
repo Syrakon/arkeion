@@ -57,6 +57,15 @@ pub trait DataSource {
     /// Stats BM25 de una consulta: `df` por término (en orden) + globales
     /// `(N docs, Σ tokens)`.
     fn fts_stats(&self, fts_id: u32, terms: &[String]) -> Result<(Vec<u64>, u64, u64)>;
+    /// Top-`want` rowids de un `MATCH` rankeados por BM25 desde el índice (shortlist
+    /// para re-rank exacto), sin leer ni re-tokenizar filas.
+    fn fts_bm25_topk(
+        &self,
+        table: &TableDef,
+        fts: &FtsIndexDef,
+        query: &crate::fts::Query,
+        want: usize,
+    ) -> Result<Vec<i64>>;
     /// rowids candidatos del índice vectorial IVF (los `nprobe` clusters más
     /// cercanos a `query`).
     fn vector_search(
@@ -129,6 +138,16 @@ impl DataSource for Snapshot {
 
     fn fts_stats(&self, fts_id: u32, terms: &[String]) -> Result<(Vec<u64>, u64, u64)> {
         Snapshot::fts_stats(self, fts_id, terms)
+    }
+
+    fn fts_bm25_topk(
+        &self,
+        table: &TableDef,
+        fts: &FtsIndexDef,
+        query: &crate::fts::Query,
+        want: usize,
+    ) -> Result<Vec<i64>> {
+        Snapshot::fts_bm25_topk(self, table, fts, query, want)
     }
 
     fn vector_search(
@@ -204,6 +223,16 @@ impl DataSource for WriteTx {
 
     fn fts_stats(&self, fts_id: u32, terms: &[String]) -> Result<(Vec<u64>, u64, u64)> {
         WriteTx::fts_stats(self, fts_id, terms)
+    }
+
+    fn fts_bm25_topk(
+        &self,
+        table: &TableDef,
+        fts: &FtsIndexDef,
+        query: &crate::fts::Query,
+        want: usize,
+    ) -> Result<Vec<i64>> {
+        WriteTx::fts_bm25_topk(self, table, fts, query, want)
     }
 
     fn vector_search(
@@ -1073,6 +1102,100 @@ fn fts_plan(
     Ok(Some(rows))
 }
 
+/// Plan FTS top-k por relevancia: `SELECT … WHERE col MATCH 'q' ORDER BY
+/// bm25(col,'q') DESC LIMIT k` sobre una columna con índice FTS. Rankea por BM25
+/// **desde el índice** (`fts_bm25_topk`: tf del posting, dl de doclen, idf/avgdl de
+/// stats) y solo materializa un shortlist de filas, que `run_select` re-rankea exacto
+/// y recorta a k — evitando un `get_row` + re-tokenización por CADA documento que casa
+/// (lo que hace `fts_plan`). Gateado estricto: el WHERE debe ser EXACTAMENTE ese
+/// `MATCH` (otros predicados podrían dejar < k tras el recorte) y nada que cambie la
+/// cardinalidad (join/distinct/group/having/offset/union) ⇒ `None`.
+fn fts_topk_plan(
+    src: &impl DataSource,
+    def: &TableDef,
+    stmt: &SelectStmt,
+    params: &[Value],
+) -> Result<Option<Vec<Vec<Value>>>> {
+    if stmt.limit.is_none()
+        || stmt.order_by.len() != 1
+        || !stmt.joins.is_empty()
+        || !stmt.group_by.is_empty()
+        || stmt.having.is_some()
+        || stmt.distinct
+        || stmt.offset.is_some()
+        || !stmt.compound.is_empty()
+    {
+        return Ok(None);
+    }
+    let ob = &stmt.order_by[0];
+    if !ob.desc {
+        return Ok(None); // BM25: mayor score = más relevante ⇒ DESC
+    }
+    let Expr::Function { name, args } = &ob.expr else {
+        return Ok(None);
+    };
+    if name.as_str() != "bm25" || args.len() != 2 {
+        return Ok(None);
+    }
+    let Expr::Column { name: ob_col, .. } = &args[0] else {
+        return Ok(None);
+    };
+    let Value::Text(ob_q) = eval_const(&args[1], params)? else {
+        return Ok(None);
+    };
+    // El WHERE debe ser EXACTAMENTE `col MATCH 'q'` (mismo col y misma consulta que
+    // el bm25); con otros predicados, el re-filtrado por fila podría dejar < k.
+    let Some(Expr::Match {
+        column,
+        query,
+        negated,
+    }) = stmt.where_clause.as_ref()
+    else {
+        return Ok(None);
+    };
+    if *negated {
+        return Ok(None);
+    }
+    let Expr::Column { name: m_col, .. } = column.as_ref() else {
+        return Ok(None);
+    };
+    let Value::Text(m_q) = eval_const(query, params)? else {
+        return Ok(None);
+    };
+    if m_col != ob_col || m_q != ob_q {
+        return Ok(None);
+    }
+    let Some(local_pos) = def
+        .columns
+        .iter()
+        .position(|c| !c.dropped && c.name == *m_col)
+    else {
+        return Ok(None);
+    };
+    let Some(fts) = def
+        .fts_indexes
+        .iter()
+        .find(|f| f.columns.contains(&local_pos))
+    else {
+        return Ok(None);
+    };
+    let k = match &stmt.limit {
+        Some(e) => usize_const(e, params, "LIMIT")?,
+        None => return Ok(None),
+    };
+    // Shortlist generoso: el score del índice == el de `eval_bm25` (misma fórmula,
+    // mismos tf/dl/idf/avgdl), así que el top-k real cae dentro; run_select lo fija.
+    let want = k.saturating_mul(8).max(64);
+    let q = crate::fts::parse_query(&m_q)?;
+    let mut rows = Vec::new();
+    for rowid in src.fts_bm25_topk(def, fts, &q, want)? {
+        if let Some(row) = src.get_row(def, rowid)? {
+            rows.push(row);
+        }
+    }
+    Ok(Some(rows))
+}
+
 /// Plan vectorial (ANN) para `run_select`: si la consulta es un KNN
 /// —`ORDER BY cosine_distance|l2_distance(col, qvec) [ASC] LIMIT k`, sin WHERE—
 /// sobre una columna con índice IVF de la misma métrica, devuelve los candidatos
@@ -1370,10 +1493,7 @@ fn precompute_bm25(
         let avgdl = if n > 0 { total as f64 / nf } else { 0.0 };
         let idf: HashMap<String, f64> = terms
             .into_iter()
-            .zip(df.iter().map(|&d| {
-                let d = d as f64;
-                (1.0 + (nf - d + 0.5) / (d + 0.5)).ln()
-            }))
+            .zip(df.iter().map(|&d| crate::catalog::bm25_idf(n, d)))
             .collect();
         schema
             .fts_rank
@@ -2460,6 +2580,10 @@ pub fn run_select(src: &impl DataSource, stmt: &SelectStmt, params: &[Value]) ->
             index_range_plan(&schema, stmt.where_clause.as_ref())
         {
             index_range_rows(src, &from_def, idx, op, const_expr, params)?
+        } else if let Some(topk) = fts_topk_plan(src, &from_def, stmt, params)? {
+            // FTS top-k por BM25: rankea desde el índice y materializa solo un
+            // shortlist; run_select lo re-rankea exacto y recorta a LIMIT.
+            topk
         } else if let Some(fts_rows) = fts_plan(src, &from_def, stmt.where_clause.as_ref(), params)?
         {
             // Narrowing FTS: un `MATCH` no negado de nivel superior usa el índice
@@ -2910,6 +3034,16 @@ impl DataSource for CteSource<'_> {
         self.inner.fts_stats(fts_id, terms)
     }
 
+    fn fts_bm25_topk(
+        &self,
+        table: &TableDef,
+        fts: &FtsIndexDef,
+        query: &crate::fts::Query,
+        want: usize,
+    ) -> Result<Vec<i64>> {
+        self.inner.fts_bm25_topk(table, fts, query, want)
+    }
+
     fn vector_search(
         &self,
         vidx: &VectorIndexDef,
@@ -3072,6 +3206,16 @@ impl DataSource for ViewSource<'_> {
 
     fn fts_stats(&self, fts_id: u32, terms: &[String]) -> Result<(Vec<u64>, u64, u64)> {
         self.inner.fts_stats(fts_id, terms)
+    }
+
+    fn fts_bm25_topk(
+        &self,
+        table: &TableDef,
+        fts: &FtsIndexDef,
+        query: &crate::fts::Query,
+        want: usize,
+    ) -> Result<Vec<i64>> {
+        self.inner.fts_bm25_topk(table, fts, query, want)
     }
 
     fn vector_search(
@@ -5503,8 +5647,6 @@ fn eval_bm25(
     row: Option<(&QuerySchema, &[Value])>,
     params: &[Value],
 ) -> Result<Value> {
-    const K1: f64 = 1.2;
-    const B: f64 = 0.75;
     let Some((schema, full_row)) = row else {
         return Err(sql_err("bm25() necesita una fila".to_string()));
     };
@@ -5553,12 +5695,8 @@ fn eval_bm25(
     let dl = dl as f64;
     let mut score = 0.0;
     for (term, idf) in &ctx.idf {
-        let f = *tf.get(term).unwrap_or(&0) as f64;
-        if f == 0.0 {
-            continue;
-        }
-        let norm = if ctx.avgdl > 0.0 { dl / ctx.avgdl } else { 1.0 };
-        score += idf * (f * (K1 + 1.0)) / (f + K1 * (1.0 - B + B * norm));
+        let f = f64::from(*tf.get(term).unwrap_or(&0));
+        score += crate::catalog::bm25_term(*idf, f, dl, ctx.avgdl);
     }
     Ok(Value::Real(score))
 }

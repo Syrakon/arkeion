@@ -305,6 +305,55 @@ fn bm25_ranks_by_relevance() {
 }
 
 #[test]
+fn bm25_topk_plan_matches_full_ranking() {
+    let (_d, db) = db();
+    let conn = db.connect().unwrap();
+    conn.execute("CREATE TABLE docs (id INTEGER PRIMARY KEY, body TEXT)", &[])
+        .unwrap();
+    conn.execute("CREATE FULLTEXT INDEX f ON docs (body)", &[])
+        .unwrap();
+    // Relevancia por tf: doc1 (3×, corto) > doc4 (2×) > doc2 (1×, doc largo);
+    // doc3 no contiene el término (pero cuenta para avgdl).
+    for body in [
+        "rust rust rust",                         // id 1: tf=3, dl=3
+        "rust programming language systems here", // id 2: tf=1, dl=5
+        "python java go",                         // id 3: no aparece
+        "rust rust language",                     // id 4: tf=2, dl=3
+    ] {
+        conn.execute("INSERT INTO docs (body) VALUES (?1)", &params![body])
+            .unwrap();
+    }
+
+    // Referencia: SIN LIMIT ⇒ camino full-scan + eval_bm25 por fila.
+    let full = ids_ordered(
+        &conn,
+        "SELECT id FROM docs WHERE body MATCH 'rust' ORDER BY bm25(body, 'rust') DESC",
+    );
+    assert_eq!(full, vec![1, 4, 2]);
+
+    // CON LIMIT ⇒ dispara fts_topk_plan (rankea desde el índice): mismo orden.
+    let topk = ids_ordered(
+        &conn,
+        "SELECT id FROM docs WHERE body MATCH 'rust' ORDER BY bm25(body, 'rust') DESC LIMIT 2",
+    );
+    assert_eq!(topk, vec![1, 4]);
+
+    // LIMIT mayor que los hits ⇒ idéntico al full ranking.
+    let topk_all = ids_ordered(
+        &conn,
+        "SELECT id FROM docs WHERE body MATCH 'rust' ORDER BY bm25(body, 'rust') DESC LIMIT 10",
+    );
+    assert_eq!(topk_all, full);
+
+    // WHERE con un predicado extra ⇒ NO usa el plan top-k (fallback), sigue correcto.
+    let filtered = ids_ordered(
+        &conn,
+        "SELECT id FROM docs WHERE body MATCH 'rust' AND id >= 4 ORDER BY bm25(body, 'rust') DESC LIMIT 10",
+    );
+    assert_eq!(filtered, vec![4]);
+}
+
+#[test]
 fn match_on_unindexed_column_errors() {
     let (_d, db) = db();
     let conn = db.connect().unwrap();

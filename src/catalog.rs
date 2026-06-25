@@ -2793,6 +2793,18 @@ fn fts_term_doc_tf<S: NodeSource>(
     Ok(out)
 }
 
+/// Deja en `scored` los `want` mejores por (score desc, rowid asc), ya ordenados:
+/// `select_nth` (O(n)) para particionar + sort de solo `want`, en vez de un sort
+/// completo O(n log n) de todos los candidatos.
+fn select_topk(scored: &mut Vec<(f64, i64)>, want: usize) {
+    let cmp = |a: &(f64, i64), b: &(f64, i64)| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1));
+    if scored.len() > want {
+        scored.select_nth_unstable_by(want, cmp);
+        scored.truncate(want);
+    }
+    scored.sort_by(cmp);
+}
+
 /// Top-`want` rowids de un `MATCH` rankeados por BM25 **desde el índice** (sin leer
 /// ni re-tokenizar filas): candidatos vía [`eval_query`], `tf` del valor del posting,
 /// `dl` de la clave de doclen, `idf`/`avgdl` de stats. Devuelve un shortlist (orden
@@ -2807,6 +2819,25 @@ pub fn fts_bm25_topk<S: NodeSource>(
     want: usize,
 ) -> Result<Vec<i64>> {
     let tk = crate::fts::tokenizer_for(&fts.tokenizer)?;
+    // Fast path término único (sin prefijo): los candidatos SON los docs del término,
+    // así que un solo scan de su posting list da (rowid, tf). Antes se recorría dos
+    // veces —`eval_query` para los candidatos y `fts_term_doc_tf` para el `tf`—, que es
+    // el caso más común (un término) y el de peor latencia relativa vs FTS5.
+    if let crate::fts::Query::Term { text, prefix: false } = query {
+        let toks = tokenize_all(tk.as_ref(), text);
+        if toks.len() == 1 {
+            let (n, total) = fts_global_stats(src, root, fts.fts_id)?;
+            let avgdl = if n > 0 { total as f64 / n as f64 } else { 0.0 };
+            let idf = bm25_idf(n, fts_doc_freq(src, root, fts.fts_id, &toks[0])?);
+            let mut scored: Vec<(f64, i64)> = Vec::new();
+            for (rid, tf) in fts_term_doc_tf(src, root, fts.fts_id, &toks[0])? {
+                let dl = fts_doc_len(src, root, fts.fts_id, rid)? as f64;
+                scored.push((bm25_term(idf, f64::from(tf), dl, avgdl), rid));
+            }
+            select_topk(&mut scored, want);
+            return Ok(scored.into_iter().map(|(_, r)| r).collect());
+        }
+    }
     let candidates = eval_query(src, root, table, fts, tk.as_ref(), query, None)?;
     if candidates.is_empty() {
         return Ok(Vec::new());
@@ -2839,8 +2870,7 @@ pub fn fts_bm25_topk<S: NodeSource>(
     // Shortlist: top-`want` por (score desc, rowid asc). El sort es de escalares
     // (sin datos de fila), barato frente a los fetch de fila que evitamos.
     let mut scored: Vec<(f64, i64)> = score.into_iter().map(|(r, s)| (s, r)).collect();
-    scored.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
-    scored.truncate(want);
+    select_topk(&mut scored, want);
     Ok(scored.into_iter().map(|(_, r)| r).collect())
 }
 

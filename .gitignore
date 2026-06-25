@@ -2,3 +2,6 @@
 *.arkeion
 /.torii/
 /graphify-out/
+# Artefactos transitorios de investigación (no son entregables del crate):
+/VECTOR-QPS-HANDOFF.md
+/verify_determinism.sh

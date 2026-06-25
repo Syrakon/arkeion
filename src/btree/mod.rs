@@ -600,6 +600,10 @@ pub struct CursorState {
     stack: Vec<(PageId, usize)>,
     /// Hoja en curso (en streaming), o `None` si ninguna/agotada.
     leaf: Option<LeafScan>,
+    /// Buffer reutilizable para reconstruir la clave completa (`prefijo común ++
+    /// sufijo`) de hojas **comprimidas** en `advance_view`; sin uso en las hojas sin
+    /// comprimir (clave contigua ⇒ zero-copy).
+    key_buf: Vec<u8>,
 }
 
 pub fn scan<S: NodeSource>(src: &S, root: PageId) -> Result<Cursor<'_, S>> {
@@ -632,6 +636,7 @@ pub fn scan_state<S: NodeSource>(
     let mut state = CursorState {
         stack: Vec::new(),
         leaf: None,
+        key_buf: Vec::new(),
     };
     if root != NO_ROOT {
         state.descend(src, root, start)?;
@@ -753,9 +758,27 @@ impl CursorState {
         loop {
             let ready = self.leaf.as_ref().is_some_and(|ls| ls.next < ls.ncells);
             if ready {
-                let ls = self.leaf.as_mut().expect("comprobado arriba");
-                let i = ls.next;
-                ls.next += 1;
+                let (i, compressed) = {
+                    let ls = self.leaf.as_mut().expect("comprobado arriba");
+                    let i = ls.next;
+                    ls.next += 1;
+                    (i, node::leaf_is_compressed(ls.held.bytes()))
+                };
+                if compressed {
+                    // Clave reconstruida en `key_buf` (no contigua en la página); el
+                    // valor inline sí llega prestado.
+                    let view = {
+                        let ls = self.leaf.as_ref().expect("comprobado arriba");
+                        node::leaf_cell_view_into(ls.page, ls.held.bytes(), i, &mut self.key_buf)?
+                    };
+                    return match view {
+                        node::PayloadView::Inline(value) => f(&self.key_buf, value).map(Some),
+                        node::PayloadView::Overflow { total_len, first } => {
+                            let owned = read_value(src, &Payload::Overflow { total_len, first })?;
+                            f(&self.key_buf, &owned).map(Some)
+                        }
+                    };
+                }
                 let ls = self.leaf.as_ref().expect("comprobado arriba");
                 let (key, view) = node::leaf_cell_view(ls.page, ls.held.bytes(), i)?;
                 return match view {

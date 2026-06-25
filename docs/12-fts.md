@@ -18,10 +18,11 @@
 > email-aware. (FTS implementado en `feat/fts`; F5/F6 y vectores conviven en
 > `feat/vectors`, que sale de `feat/fts`.)
 >
-> **Perf (en `main`):** diccionario de términos + una celda por `(term, doc)` con
-> posiciones delta-varint + ranking BM25 *index-only* con `LIMIT` + backfill en
-> bloque ⇒ índice **2.4×** menor, build **~8×** más rápido, queries hasta **9×**
-> (ver «Rendimiento» y D-FTS6–8).
+> **Perf:** diccionario de términos + una celda por `(term, doc)` con posiciones
+> delta-varint + ranking BM25 *index-only* con `LIMIT` + backfill en bloque +
+> `rowid`/`term_id` de longitud variable + **compresión de prefijo del b-tree** ⇒
+> índice **por debajo de FTS5** (26.2 vs 27.2 MB, desde 5.4× al empezar), build
+> **~6×** más rápido, queries hasta **10×** (ver «Rendimiento» y D-FTS6–9).
 
 Primer consumidor real: **papaya** (correo del usuario) para la búsqueda de
 mensajes. La migración del store de papaya a Arkeion **no** depende de esto; FTS
@@ -152,22 +153,27 @@ cablear un `FtsMatchState` por consulta (indexado por rowid) hasta el evaluador:
 
 ## Rendimiento
 
-Optimizaciones de tamaño, build y latencia (diccionario, colapso de postings,
-ranking index-only, backfill en bloque). Medido en **MS MARCO 50k** passages,
-embebido vs SQLite **FTS5** (misma máquina, in-process):
+Optimizaciones de tamaño, build y latencia (diccionario de términos, colapso de
+postings, ranking index-only, backfill en bloque, `rowid`/`term_id` de longitud
+variable, y **compresión de prefijo del b-tree** —a nivel de hoja, beneficia a TODOS
+los índices, ver `docs/02`—). Medido en **MS MARCO 50k** passages, embebido vs SQLite
+**FTS5** (misma máquina, in-process):
 
 | | formato original | **actual** | SQLite FTS5 |
 |---|--:|--:|--:|
-| Índice | 146 MB | **62 MB** (2.4× menor) | 27 MB (2.3×) |
-| Build | 63 s | **8 s** (7.9×) | 0.6 s (13×) |
-| Query término común | 25.6 ms | **2.8 ms** (9×) | 1.1 ms (2.5×) |
-| Query prefijo / frase | 9.3 / 9.1 ms | **1.3 / 2.4 ms** | 0.6 / 0.6 ms |
+| Índice | 146 MB | **26.2 MB** (5.6× menor) | 27.2 MB (**0.96× — por debajo**) |
+| Build | 63 s | **11 s** (5.7×) | 0.6 s (18×) |
+| Query término común | 25.6 ms | **2.5 ms** (10×) | 1.1 ms (2.3×) |
+| Query prefijo / frase | 9.3 / 9.1 ms | **1.4 / 2.6 ms** | 0.5 / 0.6 ms |
 
-Resumen: el índice quedó **2.4× más pequeño** y el build **~8× más rápido** que el
-formato original, y la latencia de queries pesadas bajó hasta **9×**. El hueco que
-queda con FTS5 (índice ~2.3×, build ~13×, latencia ~2-3×) es, por diseño,
-posting-lists segmentadas (D-FTS3) y block-max WAND. _Números de sandbox — re-medir
-en hardware ECC con el kit `reverify/` (ver memoria del repo)._
+Resumen: el índice FTS quedó **por debajo de FTS5** (26.2 vs 27.2 MB) —un store
+**versionado, cifrado y con time-travel** ganando en compacidad a un motor C
+especializado y sin ninguna de esas garantías—, partiendo de 5.4× al empezar el
+sprint. La compresión de prefijo (clave de posting `[0x03,fts_id,0x00,term_id]`
+guardada una vez por hoja) fue la palanca decisiva. Lo que queda con FTS5 es el
+**build** (~18×: el modelo de una celda de b-tree por posting vs los segmentos
+empaquetados de FTS5) y la **latencia** (~2.3×: block-max WAND para saltar
+candidatos, D-FTS7). _Números de sandbox — re-medir en ECC con el kit `reverify/`._
 
 ## Decisiones
 
@@ -200,3 +206,11 @@ en hardware ECC con el kit `reverify/` (ver memoria del repo)._
   (dict/df/postings/doclen/global como mapas) y lo escribe **ordenado por clave**
   (cursor de append), no con una inserción dispersa por token. Más rápido y, de regalo,
   índice más compacto (páginas llenas en vez de partidas a media ocupación).
+- **D-FTS9 — Clave de posting mínima + compresión de prefijo.** El `rowid` y el
+  `term_id` de la clave van en `enc_oint` (longitud variable, order-preserving) en vez
+  de 8/4 B fijos, y el b-tree **comprime el prefijo común de cada hoja** (`docs/02`):
+  una hoja de postings de un mismo término comparte `[0x03,fts_id,0x00,term_id]` (~9 B),
+  que se guarda **una vez por página** en vez de por celda. Es codificación de
+  almacenamiento pura (no toca el modelo lógico, el incremental ni el versionado) y
+  beneficia a todos los índices. Es lo que llevó el índice FTS **por debajo de FTS5**
+  sin recurrir a segmentos (que romperían el incremental, D-FTS3).

@@ -124,19 +124,33 @@ aunque las páginas antiguas ya no existan.
 ## Páginas B-tree
 
 ```
-hoja (0x01):     [type u8][flags u8][ncells u16] · celdas secuenciales
-                 celda: [flags u8][klen varint][key][vlen varint][val]
-                 flags bit0 = overflow: [flags][klen][key][len total varint][primera overflow u64]
+hoja (0x01):     [type u8][flags u8][ncells u16] · [plen varint][prefijo]? · celdas · punteros
+                 node-flags bit0 = PREFIJO COMPRIMIDO: tras la cabecera va [plen varint][prefijo
+                   común de las claves], y cada celda guarda solo el SUFIJO key[plen..]; la clave
+                   completa = prefijo ++ sufijo. Sin el bit: prefijo vacío, celda = clave entera (v1).
+                 celda: [cell-flags u8][klen|slen varint][key|sufijo][vlen varint][val]
+                 cell-flags bit0 = overflow: [...][len total varint][primera overflow u64]
                  (celda inline > 1280 B ⇒ el valor va a overflow; clave máx. 1024 B)
 interna (0x02):  [type][flags][ncells u16][rightmost u64] · celdas: [klen varint][key][hijo u64]
                  cell.key = cota superior exclusiva de su hijo
 overflow (0x03): [type][flags][len u16][next u64][bytes…]
 ```
 
+Array de **punteros de celda** (v3): `u16` LE por celda creciendo desde el final del nodo hacia el
+contenido, para búsqueda binaria in-page (descenso/`get`/scan) sin materializar el nodo. Anexar la
+clave máxima sigue O(1). Coste: 2 B/celda.
+
+**Compresión de prefijo (hojas):** las claves de una hoja suelen compartir un prefijo largo
+(postings de un mismo término `[0x03,fts_id,0x00,term_id]`, entradas de un índice `[0x02,index_id]`).
+Guardarlo una vez por página en vez de por celda encoge **todos** los índices —el FTS bajó **por
+debajo de FTS5**— sin tocar el modelo lógico: las comparaciones del camino caliente «pelan» el
+prefijo del target y comparan sufijos (zero-copy); solo el cursor de scan reconstruye la clave
+completa. El cursor de append anexa el sufijo si la clave comparte el prefijo, así la rightmost
+activa puede ir comprimida con appends O(1). Bit de hoja ⇒ las páginas antiguas se leen igual.
+
 Invariantes verificados al decodificar: claves no vacías y estrictamente crecientes dentro del
-nodo. v1 decodifica nodos completos (sin array de punteros de celda in-page; reservado como
-optimización futura). `delete` no rebalancea nodos infrallenos — solo elimina nodos vacíos;
-la compactación de `vacuum` (M9) reequilibra al reescribir.
+nodo. `delete` no rebalancea nodos infrallenos — solo elimina nodos vacíos; la compactación de
+`vacuum` (M9) reequilibra al reescribir.
 
 ## Espacios de claves
 

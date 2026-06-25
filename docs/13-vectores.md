@@ -87,9 +87,10 @@ normalizados.)*
   distancias desempaquetan ambos formatos transparentemente (query f32 vs
   almacenado int8 funciona). Cuantización simétrica por vector (`max|v|/127`).
 - **V3 — IVF (ANN) — HECHO y usable por SQL.** `CREATE VECTOR INDEX vi ON docs(emb)
-  [USING cosine|l2] [LISTS k] [PROBES p]` entrena k-means (núcleo `src/ivf.rs`),
-  persiste centroides + postings por cluster en keyspace `0x04` (esquema catálogo
-  v9), mantiene el índice en insert/update/delete/bulk. El planner enruta
+  [USING cosine|l2] [LISTS k] [PROBES p] [RERANK int8]` entrena k-means (núcleo
+  `src/ivf.rs`), persiste centroides + postings por cluster en keyspace `0x04`
+  (esquema catálogo v9; **v10** añade el modo de re-rank, ver D-VEC5), mantiene el
+  índice en insert/update/delete/bulk. El planner enruta
   `ORDER BY cosine_distance(col, ?) LIMIT k` (sin WHERE) al índice: escanea
   `nprobe` clusters y el `ORDER BY`/`LIMIT` rankea exacto los candidatos. `PROBES p`
   fija nprobe por índice (recall vs velocidad; por defecto `ceil(lists/10)`, mín 1),
@@ -112,3 +113,15 @@ normalizados.)*
   reproducibilidad).
 - **D-VEC4 — Si ANN, IVF no HNSW.** Centroides-como-datos + postings por cluster
   respetan el versionado; el grafo mutable de HNSW no.
+- **D-VEC5 — Re-rank PQ (compacto) vs int8 inline (opt-in).** Por defecto el posting
+  guarda un código **PQ** (IVFPQ, M≈dim/8 bytes ⇒ índice ~8× menor); el `ORDER BY
+  distance LIMIT k` por SQL re-rankea el shortlist leyendo el f32 de cada candidato de
+  su fila (`get_col_blob`), un point-lookup de b-tree **disperso por candidato** que se
+  dispara a escala (por eso el benchmark mide la API cruda, no esta vía SQL).
+  `CREATE VECTOR INDEX … RERANK int8` guarda el vector **int8** en el posting y
+  re-rankea **inline** durante el scan del cluster (`l2_sq_packed_i8`), sin fetch de
+  fila ⇒ ANN por SQL viable a 1M, a cambio de un índice ~2× (aún ≪ pgvector). Todo el
+  stack (build, insert/update/delete incremental, REBUILD, search) keyea por la
+  presencia de codebooks PQ, así que el modo es consistente sin ramas extra. El camino
+  PQ además fetchea el shortlist en orden de rowid (acceso secuencial, no aleatorio).
+  El formato de posting cambia ⇒ **reconstruir** índices vectoriales previos.

@@ -32,6 +32,15 @@ const CELL_OVERFLOW_FLAG: u8 = 0x01;
 /// hojas sin comprimir, así que la rightmost activa nunca está comprimida.
 const LEAF_PREFIX_FLAG: u8 = 0x01;
 
+/// Umbral de compresión de prefijo: solo se comprime una hoja cuyo prefijo común
+/// sea **largo** (≥ este nº de bytes). Así las hojas de **filas de datos** (clave
+/// `enc_oint(table_id) ‖ enc_oint(rowid)`, prefijo común corto ~2-4 B) se quedan SIN
+/// comprimir —el full-scan y el bulk-load no pagan la reconstrucción de clave—,
+/// mientras que las de FTS (`[0x03,fts_id,0x00,term_id]`, ~9 B) e índices secundarios
+/// (`[0x02,index_id,…]`) sí comprimen. Dial que separa la ganancia (índices) del
+/// coste (scan de tablas).
+const LEAF_MIN_PREFIX: usize = 6;
+
 pub fn leaf_is_compressed(body: &[u8]) -> bool {
     body[1] & LEAF_PREFIX_FLAG != 0
 }
@@ -244,10 +253,11 @@ pub fn parse_leaf(page: u64, body: &[u8]) -> Result<Vec<LeafCell>> {
 /// determinista (mismo input ⇒ mismos bytes).
 pub fn encode_leaf(cells: &[LeafCell], body: &mut [u8]) -> bool {
     let n = cells.len();
-    // Comprime si hay un prefijo común que merezca la pena (≥2 B y ≥2 celdas): el
-    // prefijo se guarda UNA vez tras la cabecera y las celdas solo el sufijo.
+    // Comprime solo si el prefijo común es LARGO (≥ LEAF_MIN_PREFIX B y ≥2 celdas):
+    // el prefijo se guarda UNA vez tras la cabecera y las celdas solo el sufijo. El
+    // umbral deja las hojas de filas (prefijo corto) sin comprimir (scan rápido).
     let plen = if n >= 2 { keys_lcp(cells) } else { 0 };
-    if plen >= 2 {
+    if plen >= LEAF_MIN_PREFIX {
         let pblock = varint_len(plen as u64) + plen;
         let content_len: usize =
             pblock + cells.iter().map(|c| leaf_suffix_cell_size(c, plen)).sum::<usize>();

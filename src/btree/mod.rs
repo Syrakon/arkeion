@@ -584,6 +584,9 @@ struct LeafScan {
     /// Próxima celda a emitir (en orden de clave, vía el array de punteros).
     next: usize,
     ncells: usize,
+    /// Si la hoja está comprimida (cacheado al descender): el camino sin comprimir
+    /// del scan no paga ni el chequeo por celda ni la maquinaria de prefijo.
+    compressed: bool,
 }
 
 pub struct Cursor<'s, S: NodeSource> {
@@ -671,6 +674,7 @@ impl CursorState {
                 }
                 node::TYPE_LEAF => {
                     let ncells = node::leaf_ncells(body.bytes());
+                    let compressed = node::leaf_is_compressed(body.bytes());
                     // Posición de arranque: lower_bound de `start` (scan_from) o 0.
                     let next = match start {
                         None => 0,
@@ -687,6 +691,7 @@ impl CursorState {
                         held,
                         next,
                         ncells,
+                        compressed,
                     });
                     return Ok(());
                 }
@@ -762,7 +767,7 @@ impl CursorState {
                     let ls = self.leaf.as_mut().expect("comprobado arriba");
                     let i = ls.next;
                     ls.next += 1;
-                    (i, node::leaf_is_compressed(ls.held.bytes()))
+                    (i, ls.compressed) // cacheado al descender (no se re-chequea por celda)
                 };
                 if compressed {
                     // Clave reconstruida en `key_buf` (no contigua en la página); el

@@ -1846,10 +1846,12 @@ fn decode_posting_value(val: &[u8], mut emit: impl FnMut(u8, u32)) -> Result<()>
     Ok(())
 }
 
-/// Prefijo `[0x03, fts_id, 0x00, term_id BE(4)]`: todos los postings de un término.
+/// Prefijo `[0x03, fts_id, 0x00, enc_oint(term_id)]`: todos los postings de un
+/// término. `term_id` variable (order-preserving, self-delimitado): los términos
+/// frecuentes —asignados primero ⇒ id bajo, muchos postings— ahorran 1-2 B cada uno.
 fn fts_term_posting_prefix(fts_id: u32, term_id: u32) -> Vec<u8> {
     let mut k = fts_sub_prefix(fts_id, FTS_POSTING);
-    k.extend_from_slice(&term_id.to_be_bytes());
+    keyenc::encode_oint(i64::from(term_id), &mut k);
     k
 }
 

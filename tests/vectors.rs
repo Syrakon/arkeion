@@ -131,6 +131,48 @@ fn create_drop_vector_index_via_sql() {
 }
 
 #[test]
+fn vector_rerank_int8_via_sql() {
+    let (_d, db) = db();
+    let conn = db.connect().unwrap();
+    corpus(&conn); // doc1 = e_x, doc2 = e_y (ortogonal), doc3 ≈ e_x
+    // RERANK int8: el posting guarda el vector int8 y el re-rank es inline (sin fetch
+    // de fila por candidato). PROBES 2 ⇒ se escanean ambos clusters.
+    conn.execute(
+        "CREATE VECTOR INDEX vi ON docs (emb) USING cosine LISTS 2 PROBES 2 RERANK int8",
+        &[],
+    )
+    .unwrap();
+    // ANN por SQL: top-2 cercanos a e_x = doc1 (exacto) y doc3 (≈e_x); doc2 lejos.
+    assert_eq!(
+        ids_ordered(
+            &conn,
+            "SELECT id FROM docs ORDER BY cosine_distance(emb, vector(1.0, 0.0, 0.0)) LIMIT 2",
+        ),
+        vec![1, 3]
+    );
+    // INSERT con el índice int8 activo: el hook lo mantiene en int8 (sin codebooks PQ).
+    conn.execute("INSERT INTO docs (emb) VALUES (vector(0.95, 0.05, 0.0))", &[])
+        .unwrap();
+    // doc1 (e_x exacto) sigue siendo el más cercano, incluso con la fila nueva.
+    assert_eq!(
+        ids_ordered(
+            &conn,
+            "SELECT id FROM docs ORDER BY cosine_distance(emb, vector(1.0, 0.0, 0.0)) LIMIT 1",
+        ),
+        vec![1]
+    );
+    // REBUILD conserva el modo int8 y sigue respondiendo correcto.
+    conn.execute("REBUILD VECTOR INDEX vi", &[]).unwrap();
+    assert_eq!(
+        ids_ordered(
+            &conn,
+            "SELECT id FROM docs ORDER BY cosine_distance(emb, vector(1.0, 0.0, 0.0)) LIMIT 1",
+        ),
+        vec![1]
+    );
+}
+
+#[test]
 fn knn_routes_through_ivf_index() {
     let (_d, db) = db();
     let conn = db.connect().unwrap();

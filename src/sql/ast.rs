@@ -105,6 +105,9 @@ pub enum Stmt {
         lists: Option<u32>,
         /// Clusters a escanear por búsqueda (`PROBES n`); `None` ⇒ por defecto.
         probes: Option<u32>,
+        /// `RERANK int8`: posting int8 + re-rank inline (sin fetch de fila por
+        /// candidato). `false` por defecto (IVFPQ compacto).
+        rerank_i8: bool,
     },
     /// `DROP VECTOR INDEX [IF EXISTS] nombre`.
     DropVectorIndex {

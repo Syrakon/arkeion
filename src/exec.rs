@@ -733,6 +733,7 @@ pub fn run_execute(tx: &mut WriteTx, stmt: &Stmt, params: &[Value]) -> Result<us
             metric,
             lists,
             probes,
+            rerank_i8,
         } => {
             if *if_not_exists && tx.vector_index_exists(name)? {
                 return Ok(0);
@@ -756,7 +757,7 @@ pub fn run_execute(tx: &mut WriteTx, stmt: &Stmt, params: &[Value]) -> Result<us
             let nprobe = (*probes)
                 .unwrap_or_else(|| (lists as u32).div_ceil(10))
                 .clamp(1, u16::MAX as u32) as u16;
-            tx.create_vector_index(table, name, col, lists, metric, nprobe)?;
+            tx.create_vector_index(table, name, col, lists, metric, nprobe, *rerank_i8)?;
             Ok(0)
         }
         Stmt::DropVectorIndex { if_exists, name } => {
@@ -1255,20 +1256,43 @@ fn vector_plan(
         Some(e) => usize_const(e, params, "LIMIT")?,
         None => return Ok(None),
     };
+    let simple = stmt.joins.is_empty()
+        && !stmt.distinct
+        && stmt.group_by.is_empty()
+        && stmt.having.is_none()
+        && stmt.offset.is_none()
+        && stmt.compound.is_empty();
+
+    // RERANK int8: el índice rankea con int8 INLINE durante el scan del cluster
+    // (preciso, sin tabla ADC ni fetch de fila por candidato), así que NO hace falta
+    // el re-rank f32 disperso. Pide solo las `k` mejores y materializa esas filas;
+    // run_select las ordena por la distancia EXACTA del `ORDER BY`. Es lo que vuelve
+    // viable el ANN por SQL a escala (el f32 disperso "se disparaba" a 1M).
+    if vidx.rerank_i8 && simple {
+        let mut top = src.vector_search(vidx, &query, nprobe, k.max(1))?;
+        top.sort_unstable(); // fetch secuencial por rowid
+        let mut rows = Vec::new();
+        for rowid in top {
+            if let Some(row) = src.get_row(def, rowid)? {
+                rows.push(row);
+            }
+        }
+        return Ok(Some(rows));
+    }
+
     let limit = k.saturating_mul(32).max(64);
-    let shortlist = src.vector_search(vidx, &query, nprobe, limit)?;
+    let mut shortlist = src.vector_search(vidx, &query, nprobe, limit)?;
+    // Re-rank en orden de ROWID, no de distancia PQ: los `get_col_blob`/`get_row`
+    // del shortlist recorren el b-tree de filas en secuencia (localidad de caché de
+    // páginas) en vez de saltos aleatorios. No cambia el resultado (se re-ordena por
+    // distancia exacta abajo) ni el recall — solo el patrón de I/O del fetch.
+    shortlist.sort_unstable();
 
     // Caso simple (pre-limitable): re-rank EXACTO leyendo SOLO la columna del vector
     // de cada candidato (`get_col_blob`, no la fila entera), top-k, y solo entonces
     // se materializan las `k` filas finales. Ahorra (shortlist − k) decodes de fila
     // completa — clave en tablas anchas (RAG: vector + texto + metadata).
-    if stmt.joins.is_empty()
-        && !stmt.distinct
-        && stmt.group_by.is_empty()
-        && stmt.having.is_none()
-        && stmt.offset.is_none()
-        && stmt.compound.is_empty()
-    {
+    if simple {
         let qn = crate::vector::dot_f32(&query, &query).sqrt();
         let mut scored: Vec<(f32, i64)> = Vec::new();
         let mut scratch: Vec<f32> = Vec::new();

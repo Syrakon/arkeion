@@ -1991,6 +1991,7 @@ impl WriteTx {
         lists: u16,
         metric: catalog::VectorMetric,
         nprobe: u16,
+        rerank_i8: bool,
     ) -> Result<()> {
         self.schema_cache.clear();
         self.data_root = catalog::create_vector_index(
@@ -2002,6 +2003,7 @@ impl WriteTx {
             lists,
             metric,
             nprobe,
+            rerank_i8,
         )?;
         Ok(())
     }

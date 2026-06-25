@@ -563,6 +563,15 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
+        let rerank_i8 = if self.eat_kw(Kw::Rerank) {
+            let mode = self.ident("el modo de re-rank (int8)")?;
+            if !mode.eq_ignore_ascii_case("int8") {
+                return Err(err_at(self.pos(), "RERANK solo admite `int8`"));
+            }
+            true
+        } else {
+            false
+        };
         Ok(Stmt::CreateVectorIndex {
             if_not_exists,
             name,
@@ -571,6 +580,7 @@ impl<'a> Parser<'a> {
             metric,
             lists,
             probes,
+            rerank_i8,
         })
     }
 
@@ -1829,6 +1839,7 @@ mod tests {
             metric,
             lists,
             probes,
+            rerank_i8,
         } = parse("CREATE VECTOR INDEX v ON docs (emb) USING cosine LISTS 64 PROBES 8").unwrap()
         else {
             panic!("se esperaba CreateVectorIndex")
@@ -1840,6 +1851,14 @@ mod tests {
         );
         assert_eq!(metric.as_deref(), Some("cosine"));
         assert_eq!((lists, probes), (Some(64), Some(8)));
+        assert!(!rerank_i8); // sin RERANK ⇒ PQ por defecto
+        // `RERANK int8` activa el flag.
+        let Stmt::CreateVectorIndex { rerank_i8, .. } =
+            parse("CREATE VECTOR INDEX v ON docs (emb) USING l2 RERANK int8").unwrap()
+        else {
+            panic!("se esperaba CreateVectorIndex")
+        };
+        assert!(rerank_i8);
     }
 
     #[test]

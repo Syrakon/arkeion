@@ -69,7 +69,7 @@ const VEC_PQ: u8 = 0x02; // → codebooks PQ del índice (Pq::to_bytes)
 // ellas) se leen con `foreign_keys` vacío. v5 añade el flag `dropped` por columna
 // (DROP COLUMN lógico); v<5 lo lee como `false`. v7 añade los predicados CHECK de
 // tabla. v8 añade los índices FTS al final del registro; v<8 los lee vacíos.
-const SCHEMA_VERSION: u8 = 9;
+const SCHEMA_VERSION: u8 = 10;
 const NO_ALIAS: u8 = 0xFF;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -379,6 +379,12 @@ pub struct VectorIndexDef {
     /// Clusters a escanear por búsqueda (recall vs velocidad). El planner usa
     /// este valor; más `nprobe` ⇒ más recall, más coste.
     pub nprobe: u16,
+    /// Modo de re-rank (`CREATE VECTOR INDEX … RERANK int8`). `false` (por defecto):
+    /// el posting guarda el código PQ (índice compacto) y el ANN-SQL re-rankea
+    /// leyendo el f32 de cada fila. `true`: el posting guarda el vector int8 y el
+    /// re-rank es **inline** durante el scan del cluster (sin fetch de fila por
+    /// candidato) — índice ~2× pero ANN-SQL viable a escala. Esquema v9 → v10.
+    pub rerank_i8: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -623,6 +629,7 @@ fn encode_def(def: &TableDef) -> Vec<u8> {
         put_varint(&mut out, vi.nprobe as u64);
         put_varint(&mut out, vi.name.len() as u64);
         out.extend_from_slice(vi.name.as_bytes());
+        out.push(u8::from(vi.rerank_i8)); // v10
     }
     out
 }
@@ -652,7 +659,7 @@ fn decode_def(name: &str, buf: &[u8]) -> Result<TableDef> {
     };
 
     let version = *take(&mut pos, 1)?.first().expect("len 1");
-    if !(2..=9).contains(&version) {
+    if !(2..=10).contains(&version) {
         return Err(bad("versión de esquema desconocida"));
     }
     let table_id = u32::from_le_bytes(
@@ -865,6 +872,8 @@ fn decode_def(name: &str, buf: &[u8]) -> Result<TableDef> {
             let nlen = take_varint(buf, &mut pos).ok_or(bad("esquema truncado"))? as usize;
             let name = String::from_utf8(take(&mut pos, nlen)?.to_vec())
                 .map_err(|_| bad("nombre de índice vectorial no UTF-8"))?;
+            // v10: modo de re-rank int8 (v9 ⇒ false = PQ).
+            let rerank_i8 = version >= 10 && *take(&mut pos, 1)?.first().expect("len 1") != 0;
             vector_indexes.push(VectorIndexDef {
                 name,
                 vidx_id,
@@ -873,6 +882,7 @@ fn decode_def(name: &str, buf: &[u8]) -> Result<TableDef> {
                 metric,
                 dim,
                 nprobe,
+                rerank_i8,
             });
         }
     }
@@ -3080,6 +3090,7 @@ fn row_vector(record: &[Value], column: usize, metric: VectorMetric) -> Result<O
 /// Núcleo de construcción IVF, compartido por crear y reconstruir: escanea los
 /// vectores no-NULL de la columna, entrena k-means, asigna cada fila a su cluster
 /// y persiste centroides + postings bajo `vidx_id`. Devuelve la dimensión.
+#[allow(clippy::too_many_arguments)]
 fn build_vector_clusters<S: NodeStore>(
     s: &mut S,
     mut root: PageId,
@@ -3088,6 +3099,7 @@ fn build_vector_clusters<S: NodeStore>(
     lists: u16,
     metric: VectorMetric,
     vidx_id: u32,
+    rerank_i8: bool,
 ) -> Result<(PageId, u32)> {
     // Vectores existentes (filas con vector no-NULL de la misma dimensión).
     let mut vectors: Vec<Vec<f32>> = Vec::new();
@@ -3110,11 +3122,6 @@ fn build_vector_clusters<S: NodeStore>(
     // Núcleo IVF: entrena los centroides y asigna cada vector a su cluster.
     let centroids = crate::ivf::train(&vectors, lists as usize, 25);
     let assignments = crate::ivf::assign(&vectors, &centroids);
-    // PQ (IVFPQ): codebooks para el re-rank por tablas de lookup (ADC). M ≈ dim/8
-    // (sub-dim ~8); el código son M bytes vs el vector entero ⇒ índice ~8× menor y
-    // re-rank por sumas de lookups en vez de distancia completa.
-    let pqm = (dim / 8).clamp(1, dim.max(1));
-    let pq = crate::pq::Pq::train(&vectors, pqm, 15);
     for (cid, c) in centroids.iter().enumerate() {
         root = btree::insert(
             s,
@@ -3123,17 +3130,36 @@ fn build_vector_clusters<S: NodeStore>(
             &crate::vector::pack_f32(c),
         )?;
     }
-    root = btree::insert(s, root, &vec_pq_key(vidx_id), &pq.to_bytes())?;
-    for (cid, members) in assignments.iter().enumerate() {
-        for &i in members {
-            // El VALOR del posting es el CÓDIGO PQ: el re-rank ADC lo lee del índice
-            // sin fetchear la fila, con tablas de lookup (IVFPQ).
-            root = btree::insert(
-                s,
-                root,
-                &vec_posting_key(vidx_id, cid as u16, rowids[i]),
-                &pq.encode(&vectors[i]),
-            )?;
+    if rerank_i8 {
+        // RERANK int8: el posting guarda el VECTOR int8 (preciso). El re-rank es
+        // INLINE en el scan del cluster (`l2_sq_packed_i8`), sin fetch de fila por
+        // candidato — índice ~2× pero ANN por SQL viable a escala.
+        for (cid, members) in assignments.iter().enumerate() {
+            for &i in members {
+                root = btree::insert(
+                    s,
+                    root,
+                    &vec_posting_key(vidx_id, cid as u16, rowids[i]),
+                    &crate::vector::pack_i8(&vectors[i]),
+                )?;
+            }
+        }
+    } else {
+        // IVFPQ (por defecto, compacto): codebooks PQ (M ≈ dim/8) + código de M bytes
+        // ⇒ índice ~8× menor; el re-rank ADC ordena el shortlist y el f32 exacto se
+        // lee de la fila.
+        let pqm = (dim / 8).clamp(1, dim.max(1));
+        let pq = crate::pq::Pq::train(&vectors, pqm, 15);
+        root = btree::insert(s, root, &vec_pq_key(vidx_id), &pq.to_bytes())?;
+        for (cid, members) in assignments.iter().enumerate() {
+            for &i in members {
+                root = btree::insert(
+                    s,
+                    root,
+                    &vec_posting_key(vidx_id, cid as u16, rowids[i]),
+                    &pq.encode(&vectors[i]),
+                )?;
+            }
         }
     }
     Ok((root, dim as u32))
@@ -3152,6 +3178,7 @@ pub fn create_vector_index<S: NodeStore>(
     lists: u16,
     metric: VectorMetric,
     nprobe: u16,
+    rerank_i8: bool,
 ) -> Result<PageId> {
     validate_name(
         index_name,
@@ -3177,7 +3204,8 @@ pub fn create_vector_index<S: NodeStore>(
         ));
     }
     let (vidx_id, root) = alloc_vidx_id(s, root)?;
-    let (mut root, dim) = build_vector_clusters(s, root, &def, column, lists, metric, vidx_id)?;
+    let (mut root, dim) =
+        build_vector_clusters(s, root, &def, column, lists, metric, vidx_id, rerank_i8)?;
     let idx = VectorIndexDef {
         name: index_name.to_owned(),
         vidx_id,
@@ -3186,6 +3214,7 @@ pub fn create_vector_index<S: NodeStore>(
         metric,
         dim,
         nprobe: nprobe.max(1),
+        rerank_i8,
     };
     root = btree::insert(s, root, &vector_ref_key(index_name), table_name.as_bytes())?;
     def.vector_indexes.push(idx);
@@ -3277,6 +3306,7 @@ pub fn rebuild_vector_index<S: NodeStore>(
         vidx.lists,
         vidx.metric,
         vidx.vidx_id,
+        vidx.rerank_i8,
     )?;
     // 3. Refresca la dimensión (por si los datos cambiaron) y persiste el esquema.
     def.vector_indexes[pos].dim = dim;
@@ -4293,6 +4323,7 @@ mod tests {
             metric: VectorMetric::Cosine,
             dim: 384,
             nprobe: 4,
+            rerank_i8: true, // cubre el roundtrip del flag v10
         });
         d.vector_indexes.push(VectorIndexDef {
             name: "v_l2".into(),
@@ -4302,6 +4333,7 @@ mod tests {
             metric: VectorMetric::L2,
             dim: 768,
             nprobe: 16,
+            rerank_i8: false,
         });
         let back = decode_def(&d.name, &encode_def(&d)).unwrap();
         assert_eq!(back, d);
@@ -4342,8 +4374,8 @@ mod tests {
                 .unwrap()
                 .0;
         }
-        root =
-            create_vector_index(&mut s, root, "docs", "v_idx", 1, 2, VectorMetric::L2, 1).unwrap();
+        root = create_vector_index(&mut s, root, "docs", "v_idx", 1, 2, VectorMetric::L2, 1, false)
+            .unwrap();
         let def = get_table(&s, root, "docs").unwrap().unwrap();
         let vidx = def.vector_indexes[0].clone();
         assert_eq!(vidx.dim, 2);
@@ -4412,7 +4444,8 @@ mod tests {
             .unwrap()
             .0;
         }
-        root = create_vector_index(&mut s, root, "docs", "v", 1, 2, VectorMetric::L2, 1).unwrap();
+        root =
+            create_vector_index(&mut s, root, "docs", "v", 1, 2, VectorMetric::L2, 1, false).unwrap();
         let def = get_table(&s, root, "docs").unwrap().unwrap();
         let vidx = def.vector_indexes[0].clone();
 
@@ -4448,13 +4481,13 @@ mod tests {
     #[test]
     fn schema_v7_decodes_with_empty_fts() {
         // Compatibilidad hacia atrás: un esquema v7 (sin bloques FTS ni vectorial)
-        // debe seguir leyéndose. Degradamos un v9 con 0 índices FTS/vectoriales
-        // quitando sus dos bytes de count (vectorial v9, luego FTS v8) y marcando
-        // la versión 7.
+        // debe seguir leyéndose. Degradamos el esquema actual con 0 índices
+        // FTS/vectoriales quitando sus dos bytes de count (vectorial, luego FTS) y
+        // marcando la versión 7. (Con 0 índices vectoriales no hay byte rerank_i8.)
         let mut s = MemStore::new();
         let (_, def) = create_table(&mut s, NO_ROOT, &facturas_spec()).unwrap();
         let mut bytes = encode_def(&def);
-        assert_eq!(bytes[0], 9);
+        assert_eq!(bytes[0], SCHEMA_VERSION);
         assert_eq!(bytes.pop(), Some(0), "count vectorial = 0 al final");
         assert_eq!(bytes.pop(), Some(0), "count FTS = 0");
         bytes[0] = 7;

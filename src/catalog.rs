@@ -1787,15 +1787,51 @@ fn fts_sub_prefix(fts_id: u32, sub: u8) -> Vec<u8> {
     k
 }
 
-/// Clave de un posting: `[0x03, fts_id, 0x00, term_id BE(4), rowid BE(8), field, pos]`.
-/// El `term_id` (del diccionario, [`fts_alloc_term_id`]) sustituye a la cadena del
-/// término —que antes se repetía entera en CADA posting— por 4 bytes fijos.
-fn fts_posting_key(fts_id: u32, term_id: u32, rowid: i64, field: u8, pos: u32) -> Vec<u8> {
+/// Clave de un posting: `[0x03, fts_id, 0x00, term_id BE(4), rowid BE(8)]` — UNA celda
+/// por (término, doc). El `term_id` (del diccionario, [`fts_alloc_term_id`]) sustituye a
+/// la cadena del término; las posiciones van en el VALOR ([`encode_posting_value`]) en
+/// vez de una celda vacía por cada posición.
+fn fts_posting_key(fts_id: u32, term_id: u32, rowid: i64) -> Vec<u8> {
     let mut k = fts_term_posting_prefix(fts_id, term_id);
     k.extend_from_slice(&record::rowid_be(rowid));
-    k.push(field);
-    put_varint(&mut k, pos as u64);
     k
+}
+
+/// Valor de un posting (término, doc): por cada `field` con ocurrencias,
+/// `field(1) ‖ count varint ‖ pos0 varint ‖ Δpos varint…`. Fields en orden ascendente;
+/// posiciones ascendentes y **delta-codificadas** (los huecos entre apariciones del
+/// término en el doc suelen ser pequeños ⇒ ~1 byte por posición).
+fn encode_posting_value(fields: &std::collections::BTreeMap<u8, Vec<u32>>) -> Vec<u8> {
+    let mut v = Vec::new();
+    for (&field, positions) in fields {
+        v.push(field);
+        put_varint(&mut v, positions.len() as u64);
+        let mut prev = 0u32;
+        for (i, &p) in positions.iter().enumerate() {
+            put_varint(&mut v, u64::from(if i == 0 { p } else { p - prev }));
+            prev = p;
+        }
+    }
+    v
+}
+
+/// Expande el valor de un posting a `(field, pos)` con posiciones absolutas.
+fn decode_posting_value(val: &[u8], mut emit: impl FnMut(u8, u32)) -> Result<()> {
+    let mut p = 0;
+    while p < val.len() {
+        let field = *val.get(p).ok_or(Error::CorruptRecord("field en posting FTS"))?;
+        p += 1;
+        let count =
+            take_varint(val, &mut p).ok_or(Error::CorruptRecord("count en posting FTS"))?;
+        let mut abs = 0u32;
+        for i in 0..count {
+            let d =
+                take_varint(val, &mut p).ok_or(Error::CorruptRecord("pos en posting FTS"))? as u32;
+            abs = if i == 0 { d } else { abs.wrapping_add(d) };
+            emit(field, abs);
+        }
+    }
+    Ok(())
 }
 
 /// Prefijo `[0x03, fts_id, 0x00, term_id BE(4)]`: todos los postings de un término.
@@ -1967,10 +2003,10 @@ fn fts_adjust_global<S: NodeStore>(
 }
 
 /// Aplica (`add`) o revierte (`!add`) la contribución de una fila a un índice FTS:
-/// sus postings (uno por token de cada columna indexada) y las stats —`doclen`,
-/// `df` por término distinto y globales—. Re-tokeniza el registro; como la
-/// tokenización es determinista, revertir reconstruye exactamente las claves que
-/// se insertaron.
+/// sus postings (una celda por (término, doc), con las posiciones por field en el
+/// valor) y las stats —`doclen`, `df` por término distinto y globales—. Re-tokeniza el
+/// registro; como la tokenización es determinista, revertir reconstruye exactamente las
+/// claves que se insertaron.
 fn apply_fts_row<S: NodeStore>(
     s: &mut S,
     mut root: PageId,
@@ -1981,7 +2017,10 @@ fn apply_fts_row<S: NodeStore>(
 ) -> Result<PageId> {
     let tk = crate::fts::tokenizer_for(&fts.tokenizer)?;
     let mut buf = Vec::new();
-    let mut doc_terms: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // Agrupa por término → (field → posiciones) para escribir UNA celda por
+    // (término, doc), con las posiciones en el valor, en vez de una celda por posición.
+    let mut per_term: std::collections::BTreeMap<String, std::collections::BTreeMap<u8, Vec<u32>>> =
+        std::collections::BTreeMap::new();
     let mut doclen: u64 = 0;
     for &col in &fts.columns {
         buf.clear();
@@ -1989,30 +2028,35 @@ fn apply_fts_row<S: NodeStore>(
             tk.tokenize(text, &mut buf);
         }
         for token in &buf {
-            // El posting va por `term_id` (diccionario): al insertar se asigna, al
-            // borrar se busca (siempre existe, porque se insertó antes). Si por algún
-            // motivo no estuviera, no hay posting que borrar; las stats igual cuadran.
-            let term_id = if add {
-                let (id, r) = fts_alloc_term_id(s, root, fts.fts_id, &token.text)?;
-                root = r;
-                Some(id)
-            } else {
-                fts_lookup_term_id(s, root, fts.fts_id, &token.text)?
-            };
-            if let Some(term_id) = term_id {
-                let key = fts_posting_key(fts.fts_id, term_id, rowid, col as u8, token.position);
-                if add {
-                    root = btree::insert(s, root, &key, &[])?;
-                } else {
-                    (root, _) = btree::delete(s, root, &key)?;
-                }
-            }
+            per_term
+                .entry(token.text.clone())
+                .or_default()
+                .entry(col as u8)
+                .or_default()
+                .push(token.position);
             doclen += 1;
-            doc_terms.insert(token.text.clone());
         }
     }
-    // `df`: una vez por término distinto del documento.
-    for term in &doc_terms {
+    for (term, fields) in &per_term {
+        // El posting va por `term_id` (diccionario): al insertar se asigna, al borrar
+        // se busca (siempre existe, porque se insertó antes). Si por algún motivo no
+        // estuviera, no hay celda que borrar; las stats igual cuadran.
+        let term_id = if add {
+            let (id, r) = fts_alloc_term_id(s, root, fts.fts_id, term)?;
+            root = r;
+            Some(id)
+        } else {
+            fts_lookup_term_id(s, root, fts.fts_id, term)?
+        };
+        if let Some(term_id) = term_id {
+            let key = fts_posting_key(fts.fts_id, term_id, rowid);
+            if add {
+                root = btree::insert(s, root, &key, &encode_posting_value(fields))?;
+            } else {
+                (root, _) = btree::delete(s, root, &key)?;
+            }
+        }
+        // `df`: una vez por término distinto del documento.
         root = fts_adjust_varint(s, root, &fts_df_key(fts.fts_id, term), add, 1)?;
     }
     // `doclen` del documento (no escribimos clave para longitud 0; ausente ⇒ 0).
@@ -2236,18 +2280,29 @@ pub fn fts_query_stats<S: NodeSource>(
 
 // --- evaluación de consultas MATCH contra el índice (docs/12-fts.md, fase 4) ---
 
-/// Decodifica el sufijo `rowid BE(8) ‖ field(1) ‖ pos(varint)` de un posting.
-fn decode_posting_suffix(suffix: &[u8]) -> Result<(i64, u8, u32)> {
-    let rid = suffix
-        .get(0..8)
-        .and_then(record::rowid_from_be)
-        .ok_or(Error::CorruptRecord("rowid en posting FTS"))?;
-    let field = *suffix
-        .get(8)
-        .ok_or(Error::CorruptRecord("field en posting FTS"))?;
-    let mut p = 9;
-    let pos = take_varint(suffix, &mut p).ok_or(Error::CorruptRecord("pos en posting FTS"))? as u32;
-    Ok((rid, field, pos))
+/// Escanea los postings de un `term_id` y los expande a `(rowid, field, pos)`: cada
+/// celda es un (término, doc) cuyo valor lleva las posiciones por field.
+fn scan_term_postings<S: NodeSource>(
+    src: &S,
+    root: PageId,
+    fts_id: u32,
+    term_id: u32,
+    out: &mut Vec<(i64, u8, u32)>,
+) -> Result<()> {
+    let prefix = fts_term_posting_prefix(fts_id, term_id);
+    let plen = prefix.len();
+    for item in btree::scan_from(src, root, &prefix)? {
+        let (k, v) = item?;
+        if !k.starts_with(&prefix) {
+            break;
+        }
+        let rid = k
+            .get(plen..plen + 8)
+            .and_then(record::rowid_from_be)
+            .ok_or(Error::CorruptRecord("rowid en posting FTS"))?;
+        decode_posting_value(&v, |field, pos| out.push((rid, field, pos)))?;
+    }
+    Ok(())
 }
 
 /// Postings `(rowid, field, pos)` de un término exacto.
@@ -2260,13 +2315,8 @@ fn fts_term_postings<S: NodeSource>(
     let Some(term_id) = fts_lookup_term_id(src, root, fts_id, term)? else {
         return Ok(Vec::new());
     };
-    let prefix = fts_term_posting_prefix(fts_id, term_id);
-    let plen = prefix.len();
     let mut out = Vec::new();
-    btree::for_each_prefix(src, root, &prefix, |key| {
-        out.push(decode_posting_suffix(&key[plen..])?);
-        Ok(())
-    })?;
+    scan_term_postings(src, root, fts_id, term_id, &mut out)?;
     Ok(out)
 }
 
@@ -2298,12 +2348,7 @@ fn fts_prefix_postings<S: NodeSource>(
     // 2) postings de cada término que casa el prefijo.
     let mut out = Vec::new();
     for term_id in term_ids {
-        let prefix = fts_term_posting_prefix(fts_id, term_id);
-        let plen = prefix.len();
-        btree::for_each_prefix(src, root, &prefix, |key| {
-            out.push(decode_posting_suffix(&key[plen..])?);
-            Ok(())
-        })?;
+        scan_term_postings(src, root, fts_id, term_id, &mut out)?;
     }
     Ok(out)
 }

@@ -61,3 +61,10 @@ harness = false
 [[bench]]
 name = "fts_bench"
 harness = false
+
+# Throughput vectorial CONCURRENTE: construye el índice IVF una vez y barre nº de
+# hilos a nprobe fijo, midiendo qps agregado. Aísla el lever de paralelismo (QPS =
+# throughput) del de latencia por query. Lee rutas/params por entorno.
+[[bench]]
+name = "vec_concurrent"
+harness = false

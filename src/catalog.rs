@@ -2120,6 +2120,102 @@ pub fn delete_fts_entries<S: NodeStore>(
     Ok(root)
 }
 
+/// Backfill **en bloque** de un índice FTS: acumula postings y stats en memoria y
+/// los escribe **ordenados por clave**, para que el cursor de append del b-tree no se
+/// rompa con inserciones fuera de orden —el coste dominante del build—. Es equivalente
+/// a `apply_fts_row(add)` por fila, pero cambia millones de operaciones de b-tree
+/// dispersas (un dict-get por token, un df read-modify-write por término-doc, un
+/// posting por posición) por hashing en memoria + una pasada de inserción monótona.
+/// Memoria: del orden del índice resultante (las filas ya se materializan en
+/// `create_fts_index`).
+fn backfill_fts_index<S: NodeStore>(
+    s: &mut S,
+    root: PageId,
+    fts: &FtsIndexDef,
+    rows: &[(i64, Vec<Value>)],
+) -> Result<PageId> {
+    let tk = crate::fts::tokenizer_for(&fts.tokenizer)?;
+    // term → (term_id, df): el term_id se asigna en memoria, no en el b-tree.
+    let mut dict: std::collections::HashMap<String, (u32, u64)> = std::collections::HashMap::new();
+    let mut next_id: u32 = 1;
+    // Todas las claves a escribir (postings + doclen); se ordenan antes de insertar.
+    let mut entries: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    let mut per_term: std::collections::BTreeMap<String, std::collections::BTreeMap<u8, Vec<u32>>> =
+        std::collections::BTreeMap::new();
+    let mut buf = Vec::new();
+    let mut total: u64 = 0;
+    for (rowid, values) in rows {
+        per_term.clear();
+        let mut doclen: u64 = 0;
+        for &col in &fts.columns {
+            buf.clear();
+            if let Some(Value::Text(text)) = values.get(col) {
+                tk.tokenize(text, &mut buf);
+            }
+            for token in &buf {
+                per_term
+                    .entry(token.text.clone())
+                    .or_default()
+                    .entry(col as u8)
+                    .or_default()
+                    .push(token.position);
+                doclen += 1;
+            }
+        }
+        for (term, fields) in &per_term {
+            let entry = dict.entry(term.clone()).or_insert_with(|| {
+                let id = next_id;
+                next_id += 1;
+                (id, 0)
+            });
+            entry.1 += 1; // df: +1 doc por término distinto del documento
+            entries.push((
+                fts_posting_key(fts.fts_id, entry.0, *rowid),
+                encode_posting_value(fields),
+            ));
+        }
+        if doclen > 0 {
+            let mut v = Vec::new();
+            put_varint(&mut v, doclen);
+            entries.push((fts_doclen_key(fts.fts_id, *rowid), v));
+        }
+        total += doclen;
+    }
+    // Diccionario (term → term_id) y df (term → nº de docs).
+    for (term, (term_id, df)) in &dict {
+        entries.push((
+            fts_term_dict_key(fts.fts_id, term),
+            term_id.to_be_bytes().to_vec(),
+        ));
+        let mut v = Vec::new();
+        put_varint(&mut v, *df);
+        entries.push((fts_df_key(fts.fts_id, term), v));
+    }
+    if next_id > 1 {
+        // Contador = próximo term_id libre (igual que el camino incremental).
+        entries.push((
+            fts_term_counter_key(fts.fts_id),
+            next_id.to_le_bytes().to_vec(),
+        ));
+    }
+    let n = rows.len() as u64;
+    if n > 0 {
+        let mut v = Vec::new();
+        put_varint(&mut v, n);
+        put_varint(&mut v, total);
+        entries.push((fts_global_key(fts.fts_id), v));
+    }
+    // Inserción MONÓTONA (ordenada por clave): el cursor de append no se rompe y las
+    // páginas se llenan en vez de partirse a media ocupación ⇒ build rápido y, de
+    // regalo, índice algo más compacto.
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut root = root;
+    for (k, v) in &entries {
+        root = btree::insert(s, root, k, v)?;
+    }
+    Ok(root)
+}
+
 /// Crea un índice FTS sobre columnas TEXT y lo **rellena** con las filas
 /// existentes (backfill). Nombre único en toda la base.
 pub fn create_fts_index<S: NodeStore>(
@@ -2159,11 +2255,10 @@ pub fn create_fts_index<S: NodeStore>(
         columns: columns.to_vec(),
         tokenizer: tokenizer.to_owned(),
     };
-    // Backfill: una entrada por token de cada fila existente.
+    // Backfill en bloque: acumula en memoria y escribe ordenado por clave (ver
+    // `backfill_fts_index`), en vez de un `apply_fts_row` disperso por fila.
     let rows: Vec<(i64, Vec<Value>)> = scan_table(s, root, &def)?.collect::<Result<_>>()?;
-    for (rowid, values) in rows {
-        root = apply_fts_row(s, root, &idx, rowid, &values, true)?;
-    }
+    root = backfill_fts_index(s, root, &idx, &rows)?;
     root = btree::insert(s, root, &fts_ref_key(index_name), table_name.as_bytes())?;
     def.fts_indexes.push(idx);
     root = btree::insert(s, root, &table_key(table_name), &encode_def(&def))?;

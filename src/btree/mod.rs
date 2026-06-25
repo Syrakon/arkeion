@@ -1328,6 +1328,93 @@ mod tests {
         assert!(!existed);
     }
 
+    /// Fuzz de invariantes ESTRUCTURALES del b-tree: secuencias aleatorias de
+    /// insert/delete (RNG xorshift sembrado, varios seeds) contra un `BTreeMap` de
+    /// referencia. Periódicamente verifica que (1) `get` coincide con el modelo para
+    /// TODA clave viva, y (2) el SCAN completo entrega exactamente las mismas claves
+    /// del modelo en orden ESTRICTAMENTE ascendente. Esto delata pérdida, duplicado o
+    /// desorden por splits/merges — invariantes de estructura que el test de valor por
+    /// clave (`tests/kv.rs`) no comprueba directamente. Claves de longitud variable
+    /// (4–12 bytes) con prefijos compartidos para forzar splits y casos de frontera.
+    #[test]
+    fn fuzz_structural_invariants_match_btreemap() {
+        use std::collections::BTreeMap;
+
+        // Pool determinista: longitud variable, los 4 primeros bytes distinguen `i`.
+        fn key_of(i: u32) -> Vec<u8> {
+            let mut k = i.to_be_bytes().to_vec();
+            for j in 0..(i % 9) {
+                k.push(i.wrapping_add(j) as u8);
+            }
+            k
+        }
+
+        for seed in [0xA11C_E5EDu64, 0xB0CA_0011, 0xC0FF_EE42, 0xD15E_A5E0] {
+            let mut s = MemStore::new();
+            let mut root = NO_ROOT;
+            let mut model: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+            let mut st = seed | 1;
+            let mut rnd = || {
+                st ^= st << 13;
+                st ^= st >> 7;
+                st ^= st << 17;
+                st
+            };
+
+            for round in 0..3000u64 {
+                let i = (rnd() % 400) as u32;
+                let key = key_of(i);
+                if rnd() % 100 < 65 {
+                    let vlen = (rnd() % 40) as usize;
+                    let val: Vec<u8> =
+                        (0..vlen).map(|b| (i as u8).wrapping_add(b as u8)).collect();
+                    root = insert(&mut s, root, &key, &val).unwrap();
+                    model.insert(key, val);
+                } else {
+                    let had = model.remove(&key).is_some();
+                    let (r, removed) = delete(&mut s, root, &key).unwrap();
+                    root = r;
+                    assert_eq!(
+                        removed, had,
+                        "delete reportó {removed} pero el modelo tenía {had} (round {round}, seed {seed:x})"
+                    );
+                }
+
+                if round % 200 == 0 {
+                    // (1) get == modelo para toda clave viva.
+                    for (mk, mv) in &model {
+                        assert_eq!(
+                            get(&s, root, mk).unwrap().as_deref(),
+                            Some(mv.as_slice()),
+                            "get != modelo (round {round}, seed {seed:x})"
+                        );
+                    }
+                    // (2) scan completo == modelo, en orden estricto ascendente.
+                    let mut prev: Option<Vec<u8>> = None;
+                    let mut n = 0usize;
+                    for item in scan_from(&s, root, b"").unwrap() {
+                        let (k, v) = item.unwrap();
+                        if let Some(p) = &prev {
+                            assert!(*p < k, "scan desordenado: {p:?} !< {k:?} (seed {seed:x})");
+                        }
+                        let mv = model
+                            .get(&k)
+                            .unwrap_or_else(|| panic!("clave {k:?} en scan ausente del modelo"));
+                        assert_eq!(&v, mv, "valor de scan != modelo para {k:?}");
+                        prev = Some(k);
+                        n += 1;
+                    }
+                    assert_eq!(
+                        n,
+                        model.len(),
+                        "scan cuenta {n} != modelo {} (round {round}, seed {seed:x})",
+                        model.len()
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn for_each_prefix_matches_filtered_scan() {
         let mut s = MemStore::new();

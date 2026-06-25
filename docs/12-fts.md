@@ -17,6 +17,11 @@
 > virtual table) y **versionado/auditable**. Pendiente (opcional): tokenizer
 > email-aware. (FTS implementado en `feat/fts`; F5/F6 y vectores conviven en
 > `feat/vectors`, que sale de `feat/fts`.)
+>
+> **Perf (en `main`):** diccionario de términos + una celda por `(term, doc)` con
+> posiciones delta-varint + ranking BM25 *index-only* con `LIMIT` + backfill en
+> bloque ⇒ índice **2.4×** menor, build **~8×** más rápido, queries hasta **9×**
+> (ver «Rendimiento» y D-FTS6–8).
 
 Primer consumidor real: **papaya** (correo del usuario) para la búsqueda de
 mensajes. La migración del store de papaya a Arkeion **no** depende de esto; FTS
@@ -41,21 +46,33 @@ de columna. Para no interferir con el escaneo de índices ordinarios (keyspace
 `0x02`) se reserva un keyspace propio **`0x03`** con sub-tipo:
 
 ```text
-[0x03, 0x00, fts_id BE(4), term escapado 0x00 0x00, rowid BE(8), pos varint] → vacío   (posting)
-[0x03, 0x01, fts_id BE(4), rowid BE(8)]                                       → len doc (varint, nº tokens)
-[0x03, 0x02, fts_id BE(4)]                                                    → {N docs, Σ tokens} (avgdl)
-[0x03, 0x03, fts_id BE(4), term escapado 0x00 0x00]                           → df (nº docs con el término)
+[0x03, fts_id BE(4), 0x00, term_id BE(4), rowid BE(8)] → posiciones por field (valor)  (posting)
+[0x03, fts_id BE(4), 0x01, rowid BE(8)]                → len doc (varint, nº tokens)
+[0x03, fts_id BE(4), 0x02]                             → {N docs, Σ tokens} (avgdl)
+[0x03, fts_id BE(4), 0x03, term escapado 0x00 0x00]    → df (nº docs con el término)
+[0x03, fts_id BE(4), 0x04, term escapado 0x00 0x00]    → term_id BE(4) (diccionario)
+[0x03, fts_id BE(4), 0x05]                             → próximo term_id (u32 LE) (contador)
 ```
 
-- **Postings** ordenados por `(fts_id, term, rowid, pos)`: un prefix-scan sobre
-  `[0x03,0x00,fts_id,term]` da todos los `(rowid, pos)` del término — exactamente
-  como `index_lookup`. El `term` se escapa igual que el texto memcomparable
-  (`0x00 → 0x00 0xFF`, terminador `0x00 0x00`) para ser self-delimitado frente al
-  `rowid` que le sigue.
+- **Diccionario de términos** (`0x04`/`0x05`): el término (memcomparable, escapado
+  `0x00 → 0x00 0xFF`, terminador `0x00 0x00`) se guarda **una sola vez** y mapea a un
+  `term_id` de 4 bytes; los postings se indexan por ese `term_id`, no repitiendo la
+  palabra en cada celda. El prefijo `term*` se resuelve con un range-scan del
+  diccionario → conjunto de `term_id`.
+- **Postings** (`0x00`): **una celda por `(term, doc)`**, clave
+  `[…0x00, term_id, rowid]`; el **valor** lleva, por cada field, sus posiciones en
+  **delta-varint** (`field, count, pos0, Δpos…`). Un prefix-scan sobre
+  `[…0x00, term_id]` da todos los `(rowid, posiciones)` del término. (Antes: una celda
+  *vacía* por cada `(term, doc, pos)`, con la palabra entera repetida en la clave.)
 - **Stats** (`0x01`/`0x02`/`0x03`) son lo que pide Okapi BM25: longitud del doc,
-  longitud media (`Σtokens/N`) y frecuencia documental por término (`df`). Se
-  mantienen incrementalmente: al añadir el primer posting de un `(term, doc)` se
-  incrementa `df`; al borrar el último, se decrementa.
+  longitud media (`Σtokens/N`) y frecuencia documental por término (`df`). El
+  incremental (`apply_fts_row`) las mantiene celda a celda; el backfill las computa en
+  memoria y las escribe ordenadas (ver Rendimiento).
+
+> **Cambio de formato on-disk:** el diccionario + el valor de posting cambian el
+> layout del keyspace `0x03` (no `encode_def`, así que el esquema de catálogo sigue en
+> v9). **Los índices FTS creados con versiones anteriores deben reconstruirse**
+> (`DROP` + `CREATE FULLTEXT INDEX`).
 
 `FtsIndexDef { name, fts_id, columns: Vec<usize>, tokenizer: String, options }`
 se guarda **dentro del esquema de la tabla** (como `IndexDef`), así el
@@ -133,6 +150,25 @@ cablear un `FtsMatchState` por consulta (indexado por rowid) hasta el evaluador:
 - **F5 — `bm25`/`rank` + `snippet`/`highlight`** (match-state plumbing).
 - **F6 — Bordes**: `MATCH … AS OF`, interacción con `vacuum`, `tests/fts.rs`.
 
+## Rendimiento
+
+Optimizaciones de tamaño, build y latencia (diccionario, colapso de postings,
+ranking index-only, backfill en bloque). Medido en **MS MARCO 50k** passages,
+embebido vs SQLite **FTS5** (misma máquina, in-process):
+
+| | formato original | **actual** | SQLite FTS5 |
+|---|--:|--:|--:|
+| Índice | 146 MB | **62 MB** (2.4× menor) | 27 MB (2.3×) |
+| Build | 63 s | **8 s** (7.9×) | 0.6 s (13×) |
+| Query término común | 25.6 ms | **2.8 ms** (9×) | 1.1 ms (2.5×) |
+| Query prefijo / frase | 9.3 / 9.1 ms | **1.3 / 2.4 ms** | 0.6 / 0.6 ms |
+
+Resumen: el índice quedó **2.4× más pequeño** y el build **~8× más rápido** que el
+formato original, y la latencia de queries pesadas bajó hasta **9×**. El hueco que
+queda con FTS5 (índice ~2.3×, build ~13×, latencia ~2-3×) es, por diseño,
+posting-lists segmentadas (D-FTS3) y block-max WAND. _Números de sandbox — re-medir
+en hardware ECC con el kit `reverify/` (ver memoria del repo)._
+
 ## Decisiones
 
 - **D-FTS1 — Nativo, no virtual table.** Arkeion no tiene vtabs y la
@@ -140,10 +176,27 @@ cablear un `FtsMatchState` por consulta (indexado por rowid) hasta el evaluador:
   predicado especial sobre un índice físico.
 - **D-FTS2 — Keyspace `0x03` propio.** Disjunto del `0x02` de índices ordinarios:
   el escaneo de índices normales no ve nunca postings FTS y viceversa.
-- **D-FTS3 — Postings term-major, una celda por `(term,doc,pos)`.** Menos compacto
-  que un posting-list comprimido en payload, pero los update/delete son
-  inserciones/borrados limpios — ideal para copy-on-write y MVCC.
+- **D-FTS3 — Postings term-major, una celda por `(term, doc)`.** El término se guarda
+  una vez en el diccionario (`term_id` de 4 B) y las posiciones van en el valor en
+  delta-varint; update/delete siguen siendo inserciones/borrados limpios de una celda
+  por `(term, doc)` — ideal para copy-on-write y MVCC. **No** se usan posting-lists por
+  término (un blob con todos los docs) a propósito: darían un índice ~3.6× menor
+  (paridad FTS5) pero romperían el incremental O(tokens) y obligarían a segmentos +
+  merge en background.
 - **D-FTS4 — Tokenizer en `std`, plegado de diacríticos a mano.** Cero deps;
   stemming fuera de v1 pero pluggable por trait.
 - **D-FTS5 — Stats BM25 materializadas e incrementales** (`df`, len doc, avgdl) en
   vez de recalcular por consulta.
+- **D-FTS6 — Diccionario de términos.** `term → term_id` (4 B) evita repetir la cadena
+  del término en cada posting; los prefijos `term*` se resuelven contra el diccionario.
+- **D-FTS7 — Ranking BM25 *index-only* con `LIMIT`.** `… MATCH 'q' ORDER BY
+  bm25(col,'q') DESC LIMIT k` se puntúa **desde el índice** (`tf` del valor del
+  posting, `dl` de la clave de doclen, `idf`/`avgdl` de stats) y solo materializa un
+  shortlist de filas que `run_select` re-rankea exacto — evita un `get_row` +
+  re-tokenización por cada doc que casa. Con otros predicados en el WHERE cae al plan
+  general. Fórmula BM25 única (`catalog::bm25_idf`/`bm25_term`), compartida con el
+  `bm25()` por-fila para que no diverjan.
+- **D-FTS8 — Backfill en bloque.** `CREATE FULLTEXT INDEX` acumula el índice en memoria
+  (dict/df/postings/doclen/global como mapas) y lo escribe **ordenado por clave**
+  (cursor de append), no con una inserción dispersa por token. Más rápido y, de regalo,
+  índice más compacto (páginas llenas en vez de partidas a media ocupación).

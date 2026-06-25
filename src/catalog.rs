@@ -1803,7 +1803,9 @@ fn fts_sub_prefix(fts_id: u32, sub: u8) -> Vec<u8> {
 /// vez de una celda vacía por cada posición.
 fn fts_posting_key(fts_id: u32, term_id: u32, rowid: i64) -> Vec<u8> {
     let mut k = fts_term_posting_prefix(fts_id, term_id);
-    k.extend_from_slice(&record::rowid_be(rowid));
+    // rowid order-preserving de longitud variable (enc_oint): ~2–4 B típicos en vez de
+    // 8 fijos, sin romper el orden del b-tree ni el prefix-scan por término.
+    keyenc::encode_oint(rowid, &mut k);
     k
 }
 
@@ -2339,9 +2341,8 @@ pub fn fts_term_rowids<S: NodeSource>(
     let mut rowids = Vec::new();
     let mut last: Option<i64> = None;
     btree::for_each_prefix(src, root, &prefix, |key| {
-        let rid = key
-            .get(plen..plen + 8)
-            .and_then(record::rowid_from_be)
+        let mut p = plen;
+        let rid = keyenc::decode_oint(key, &mut p)
             .ok_or(Error::CorruptRecord("rowid en posting FTS"))?;
         if last != Some(rid) {
             rowids.push(rid);
@@ -2401,9 +2402,8 @@ fn scan_term_postings<S: NodeSource>(
         if !k.starts_with(&prefix) {
             break;
         }
-        let rid = k
-            .get(plen..plen + 8)
-            .and_then(record::rowid_from_be)
+        let mut p = plen;
+        let rid = keyenc::decode_oint(&k, &mut p)
             .ok_or(Error::CorruptRecord("rowid en posting FTS"))?;
         decode_posting_value(&v, |field, pos| out.push((rid, field, pos)))?;
     }
@@ -2782,9 +2782,8 @@ fn fts_term_doc_tf<S: NodeSource>(
         if !k.starts_with(&prefix) {
             break;
         }
-        let rid = k
-            .get(plen..plen + 8)
-            .and_then(record::rowid_from_be)
+        let mut p = plen;
+        let rid = keyenc::decode_oint(&k, &mut p)
             .ok_or(Error::CorruptRecord("rowid en posting FTS"))?;
         let mut tf = 0u32;
         decode_posting_value(&v, |_field, _pos| tf += 1)?;

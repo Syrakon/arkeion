@@ -257,7 +257,13 @@ pub fn encode_leaf(cells: &[LeafCell], body: &mut [u8]) -> bool {
     // el prefijo se guarda UNA vez tras la cabecera y las celdas solo el sufijo. El
     // umbral deja las hojas de filas (prefijo corto) sin comprimir (scan rápido).
     let plen = if n >= 2 { keys_lcp(cells) } else { 0 };
-    if plen >= LEAF_MIN_PREFIX {
+    // Excepción: el keyspace vectorial (`0x04`). Sus hojas de cluster tienen prefijo
+    // común (~8 B) pero NO se benefician —el build vectorial inserta sin ordenar, las
+    // páginas van medio vacías, comprimir no reduce el nº de páginas— y SÍ pagarían la
+    // reconstrucción de clave en el scan ANN candidato-a-candidato (caliente). Medido:
+    // PQ −5% QPS sin ganar tamaño. El FTS (`0x03`) y los secundarios (`0x02`) sí ganan.
+    let is_vector = cells.first().is_some_and(|c| c.key.first() == Some(&0x04));
+    if plen >= LEAF_MIN_PREFIX && !is_vector {
         let pblock = varint_len(plen as u64) + plen;
         let content_len: usize =
             pblock + cells.iter().map(|c| leaf_suffix_cell_size(c, plen)).sum::<usize>();

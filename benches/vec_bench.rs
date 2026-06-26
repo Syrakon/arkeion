@@ -204,6 +204,41 @@ fn main() {
         sweep.push((np, ms, rec));
     }
 
+    // --- Throughput CONCURRENTE: N hilos, cada uno su conexión (como el servidor M11
+    // sirviendo clientes en paralelo). Es la métrica relevante de una BD bajo carga, vs
+    // la latencia de query SUELTA del barrido de arriba. nprobe fijo a `VEC_CONC_PROBE`
+    // (default 50 ≈ recall 0.99 a 1M); cada hilo corre `VEC_CONC_Q` queries. ---
+    let conc_probe: usize = env("VEC_CONC_PROBE")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(50)
+        .min(lists);
+    let per_thread: usize = env("VEC_CONC_Q").and_then(|s| s.parse().ok()).unwrap_or(150);
+    for &nthreads in &[1usize, 2, 4, 8, 16] {
+        let t = Instant::now();
+        std::thread::scope(|s| {
+            for tid in 0..nthreads {
+                let db = &db;
+                let queries = &queries;
+                s.spawn(move || {
+                    let c = db.connect().unwrap();
+                    let r = c.table("docs").unwrap();
+                    for i in 0..per_thread {
+                        let idx = (tid * per_thread + i) % nq;
+                        let qv = &queries[idx * dim..(idx + 1) * dim];
+                        let _ = r.vector_search("vi", qv, k, conc_probe).unwrap();
+                    }
+                });
+            }
+        });
+        let secs = t.elapsed().as_secs_f64();
+        let total = (per_thread * nthreads) as f64;
+        eprintln!(
+            "concurrente hilos={nthreads:>2}: {:>8.0} qps agregado · {:.2} ms/query efectiva (np={conc_probe})",
+            total / secs,
+            secs * 1000.0 / per_thread as f64
+        );
+    }
+
     // --- JSON de salida ---
     let mut j = String::new();
     j.push_str("{\n");

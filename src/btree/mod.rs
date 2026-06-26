@@ -1490,6 +1490,169 @@ mod tests {
         assert!(empty.is_empty()); // árbol vacío
     }
 
+    /// Fuzz del b-tree contra un oráculo `BTreeMap`, dirigido a las hojas COMPRIMIDAS:
+    /// claves con prefijo común largo (`[0x10, g, "grpkey"]` = 8 B ⇒ compresión activa)
+    /// + sufijos de longitud variable, borrados, valores grandes (overflow) y la clave
+    /// = prefijo exacto (sufijo VACÍO). Fase 1 = appends SECUENCIALES por grupo (ejercita
+    /// el cursor de append → append-a-comprimido; el cambio de grupo rompe el prefijo →
+    /// camino general). Fase 2 = inserts/borrados ALEATORIOS (re-encode + re-compresión).
+    /// Verifica `get` (presentes y ausentes), `scan` total ordenado y `for_each_prefix`
+    /// con prefijos más cortos / iguales / más largos que el de la hoja. PRNG xorshift
+    /// determinista (sin reloj ni aleatoriedad real ⇒ reproducible, apto para CI).
+    #[test]
+    fn prefix_compression_fuzz_vs_oracle() {
+        use std::collections::BTreeMap;
+        struct R(u64);
+        impl R {
+            fn n(&mut self) -> u64 {
+                let mut x = self.0;
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                self.0 = x;
+                x
+            }
+            fn val(&mut self) -> Vec<u8> {
+                // mayormente inline corto; 1/40 grande ⇒ va a overflow (>1280 B)
+                let len = if self.n() % 40 == 0 {
+                    1300 + (self.n() % 300) as usize
+                } else {
+                    (self.n() % 9) as usize
+                };
+                (0..len).map(|i| (self.n() ^ i as u64) as u8).collect()
+            }
+        }
+        // prefijo común por grupo = [0x10, g, "grpkey"] (8 B ⇒ comprime); + sufijo
+        let gkey = |g: u8, suf: &[u8]| -> Vec<u8> {
+            let mut k = vec![0x10u8, g];
+            k.extend_from_slice(b"grpkey");
+            k.extend_from_slice(suf);
+            k
+        };
+        // Recorre el árbol contando hojas comprimidas vs total (prueba que el fuzz
+        // realmente ejercita la compresión, no que pase sobre hojas sin comprimir).
+        fn walk<S: NodeSource>(s: &S, id: PageId, comp: &mut usize, leaves: &mut usize) {
+            if id == NO_ROOT {
+                return;
+            }
+            let b = s.body(id).unwrap();
+            let body = b.bytes();
+            match node::node_type(body) {
+                node::TYPE_LEAF => {
+                    *leaves += 1;
+                    if node::leaf_is_compressed(body) {
+                        *comp += 1;
+                    }
+                }
+                node::TYPE_INNER => {
+                    for i in 0..node::inner_ncells(body) {
+                        let child = node::inner_child_value_at(id.0, body, i).unwrap();
+                        walk(s, child, comp, leaves);
+                    }
+                    walk(s, node::inner_rightmost(body), comp, leaves);
+                }
+                _ => panic!("tipo de página desconocido"),
+            }
+        }
+
+        for &seed in &[1u64, 7, 0x1234_5678, 0xDEAD_BEEF, 99] {
+            let mut r = R(seed ^ 0x9E37_79B9_7F4A_7C15);
+            let mut s = CursorStore::new();
+            let mut root = NO_ROOT;
+            let mut oracle: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+
+            // Fase 1: appends secuenciales por grupo (cursor de append + comprimido).
+            for g in 0..5u8 {
+                for i in 0..400u32 {
+                    let key = gkey(g, &i.to_be_bytes());
+                    let vv = r.val();
+                    root = insert(&mut s, root, &key, &vv).unwrap();
+                    oracle.insert(key, vv);
+                }
+            }
+            // Clave = prefijo exacto (sufijo vacío), grupo nuevo y mayor ⇒ append; borde.
+            {
+                let key = gkey(9, &[]);
+                let vv = r.val();
+                root = insert(&mut s, root, &key, &vv).unwrap();
+                oracle.insert(key, vv);
+            }
+
+            // Fase 2: inserts + borrados aleatorios (camino general + re-compresión).
+            for _ in 0..1500 {
+                if r.n() % 4 == 0 && !oracle.is_empty() {
+                    let idx = (r.n() as usize) % oracle.len();
+                    let key = oracle.keys().nth(idx).unwrap().clone();
+                    let (nr, existed) = delete(&mut s, root, &key).unwrap();
+                    root = nr;
+                    assert!(existed, "delete de clave existente (seed {seed})");
+                    oracle.remove(&key);
+                } else {
+                    let g = (r.n() % 11) as u8;
+                    let slen = (r.n() % 10) as usize;
+                    let suf: Vec<u8> = (0..slen).map(|_| (r.n() % 251) as u8).collect();
+                    let key = gkey(g, &suf);
+                    let vv = r.val();
+                    root = insert(&mut s, root, &key, &vv).unwrap();
+                    oracle.insert(key, vv);
+                }
+            }
+
+            // Prueba que el árbol tiene varias hojas y que de verdad hay compresión.
+            let (mut comp, mut leaves) = (0usize, 0usize);
+            walk(&s, root, &mut comp, &mut leaves);
+            assert!(leaves > 5, "árbol multi-hoja esperado (seed {seed}): {leaves}");
+            assert!(comp > 0, "el fuzz debe ejercitar hojas COMPRIMIDAS (seed {seed})");
+
+            // get de cada clave presente.
+            for (key, vv) in &oracle {
+                assert_eq!(
+                    get(&s, root, key).unwrap().as_deref(),
+                    Some(vv.as_slice()),
+                    "get presente (seed {seed})"
+                );
+            }
+            // get de claves probablemente ausentes (coincide con el oráculo en ambos casos).
+            for _ in 0..300 {
+                let g = (r.n() % 13) as u8;
+                let slen = (r.n() % 10) as usize;
+                let suf: Vec<u8> = (0..slen).map(|_| (r.n() % 251) as u8).collect();
+                let key = gkey(g, &suf);
+                assert_eq!(
+                    get(&s, root, &key).unwrap(),
+                    oracle.get(&key).cloned(),
+                    "get ausente/presente (seed {seed})"
+                );
+            }
+            // scan total == oráculo, en orden.
+            let scanned: Vec<(Vec<u8>, Vec<u8>)> =
+                scan(&s, root).unwrap().map(|x| x.unwrap()).collect();
+            let expected: Vec<(Vec<u8>, Vec<u8>)> =
+                oracle.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+            assert_eq!(scanned, expected, "scan total (seed {seed})");
+            // for_each_prefix == range del oráculo, con prefijos más cortos/iguales/largos
+            // que el de la hoja (ejercita cmp_prefix Below/Within/Above + travesía hermanos).
+            let mut prefixes: Vec<Vec<u8>> = vec![vec![0x10], vec![0x10, 3], vec![0x11]];
+            for g in 0..11u8 {
+                prefixes.push(gkey(g, &[])); // prefijo común completo de cada grupo
+            }
+            for pfx in prefixes {
+                let mut got: Vec<Vec<u8>> = Vec::new();
+                for_each_prefix(&s, root, &pfx, |key| {
+                    got.push(key.to_vec());
+                    Ok(())
+                })
+                .unwrap();
+                let exp: Vec<Vec<u8>> = oracle
+                    .range(pfx.clone()..)
+                    .take_while(|(k, _)| k.starts_with(&pfx))
+                    .map(|(k, _)| k.clone())
+                    .collect();
+                assert_eq!(got, exp, "for_each_prefix {pfx:?} (seed {seed})");
+            }
+        }
+    }
+
     #[test]
     fn many_keys_split_scan_and_drain() {
         let mut s = MemStore::new();

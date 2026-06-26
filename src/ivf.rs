@@ -33,6 +33,38 @@ fn nearest(centroids: &[Vec<f32>], v: &[f32]) -> usize {
     best
 }
 
+/// Asigna en PARALELO el centroide más cercano a cada punto (`out[i] = nearest(c, p[i])`).
+/// Cada punto es independiente y el resultado NO depende del nº de hilos (cada `out[i]`
+/// se calcula idéntico) ⇒ **byte-determinista** en cualquier máquina. Reparte `points`
+/// en franjas de índice disjuntas (`chunks_mut` da `&mut` no solapados; `scope` une antes
+/// de devolver) — seguro y sin `unsafe`. Serie si hay pocos puntos (evita coste de hilos).
+fn nearest_all<V: AsRef<[f32]> + Sync>(points: &[V], centroids: &[Vec<f32>]) -> Vec<usize> {
+    let n = points.len();
+    let mut out = vec![0usize; n];
+    let nt = std::thread::available_parallelism()
+        .map(|x| x.get())
+        .unwrap_or(1)
+        .min(16);
+    if nt <= 1 || n < 4096 {
+        for (o, p) in out.iter_mut().zip(points.iter()) {
+            *o = nearest(centroids, p.as_ref());
+        }
+        return out;
+    }
+    let chunk = n.div_ceil(nt);
+    std::thread::scope(|sc| {
+        for (ci, slot) in out.chunks_mut(chunk).enumerate() {
+            let pts = &points[ci * chunk..ci * chunk + slot.len()];
+            sc.spawn(move || {
+                for (o, p) in slot.iter_mut().zip(pts.iter()) {
+                    *o = nearest(centroids, p.as_ref());
+                }
+            });
+        }
+    });
+    out
+}
+
 /// Entrena `k` centroides por k-means (Lloyd) sobre `vectors`. Init **determinista**
 /// (muestreo equiespaciado), `max_iters` iteraciones o hasta convergencia. Los
 /// clusters que quedan vacíos conservan su centroide. Devuelve menos de `k`
@@ -112,8 +144,11 @@ pub fn train(vectors: &[Vec<f32>], k: usize, max_iters: usize) -> Vec<Vec<f32>> 
     for _ in 0..max_iters {
         let mut sums = vec![vec![0.0f64; dim]; k];
         let mut counts = vec![0usize; k];
-        for v in &sample {
-            let c = nearest(&centroids, v);
+        // `nearest` (lo caro, ×k×dim) en PARALELO; la acumulación de `sums` queda en
+        // SERIE y en orden de índice ⇒ misma suma f64 que la versión secuencial
+        // (byte-idéntica), solo que el kernel se reparte entre hilos.
+        let assigns = nearest_all(&sample, &centroids);
+        for (v, &c) in sample.iter().zip(assigns.iter()) {
             counts[c] += 1;
             for (s, &x) in sums[c].iter_mut().zip(v.iter()) {
                 *s += x as f64;
@@ -143,9 +178,12 @@ pub fn train(vectors: &[Vec<f32>], k: usize, max_iters: usize) -> Vec<Vec<f32>> 
 /// Asigna cada vector a su centroide más cercano → listas invertidas
 /// (`lists[c]` = índices de los vectores del cluster `c`).
 pub fn assign(vectors: &[Vec<f32>], centroids: &[Vec<f32>]) -> Vec<Vec<usize>> {
+    // `nearest` de las N en paralelo; el `push` a las listas queda en orden de índice
+    // ⇒ mismas listas (mismo orden de miembros) que la versión secuencial.
+    let assigns = nearest_all(vectors, centroids);
     let mut lists = vec![Vec::new(); centroids.len()];
-    for (i, v) in vectors.iter().enumerate() {
-        lists[nearest(centroids, v)].push(i);
+    for (i, &c) in assigns.iter().enumerate() {
+        lists[c].push(i);
     }
     lists
 }
@@ -214,6 +252,25 @@ mod tests {
     fn train_is_deterministic() {
         let v = two_blobs();
         assert_eq!(train(&v, 2, 25), train(&v, 2, 25));
+    }
+
+    #[test]
+    fn parallel_path_is_deterministic() {
+        // n >= 4096 fuerza el camino PARALELO de `nearest_all` (train + assign); el
+        // `train_is_deterministic` de arriba usa n<4096 y solo cubre el fallback serie.
+        // El kernel paralelo + suma de centroides en orden de índice ⇒ dos builds
+        // idénticos (independiente del nº de hilos: cada `out[i]` se calcula igual).
+        let mut st = 0x1234_5678u64;
+        let mut rng = || {
+            st ^= st << 13;
+            st ^= st >> 7;
+            st ^= st << 17;
+            (st >> 40) as f32 / 16_777_216.0
+        };
+        let data: Vec<Vec<f32>> = (0..5000).map(|_| (0..8).map(|_| rng()).collect()).collect();
+        assert_eq!(train(&data, 32, 15), train(&data, 32, 15), "train paralelo no determinista");
+        let c = train(&data, 32, 15);
+        assert_eq!(assign(&data, &c), assign(&data, &c), "assign paralelo no determinista");
     }
 
     #[test]

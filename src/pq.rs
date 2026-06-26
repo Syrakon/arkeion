@@ -72,6 +72,37 @@ impl Pq {
             .collect()
     }
 
+    /// Codifica un LOTE de vectores en PARALELO. Cada código es independiente y no
+    /// depende del nº de hilos ⇒ resultado byte-idéntico a codificarlos en serie.
+    /// Franjas de índice disjuntas (`chunks_mut` + `scope`, sin `unsafe`); serie si
+    /// hay pocos. Separa el cómputo (paralelo) de la escritura al b-tree (en serie).
+    pub fn encode_all(&self, vectors: &[Vec<f32>]) -> Vec<Vec<u8>> {
+        let n = vectors.len();
+        let mut out: Vec<Vec<u8>> = vec![Vec::new(); n];
+        let nt = std::thread::available_parallelism()
+            .map(|x| x.get())
+            .unwrap_or(1)
+            .min(16);
+        if nt <= 1 || n < 4096 {
+            for (o, v) in out.iter_mut().zip(vectors.iter()) {
+                *o = self.encode(v);
+            }
+            return out;
+        }
+        let chunk = n.div_ceil(nt);
+        std::thread::scope(|sc| {
+            for (ci, slot) in out.chunks_mut(chunk).enumerate() {
+                let vs = &vectors[ci * chunk..ci * chunk + slot.len()];
+                sc.spawn(move || {
+                    for (o, v) in slot.iter_mut().zip(vs.iter()) {
+                        *o = self.encode(v);
+                    }
+                });
+            }
+        });
+        out
+    }
+
     /// Tabla ADC de una query: `table[s][c] = ‖query_sub_s − codebook[s][c]‖²`. Se
     /// calcula UNA vez por query; luego cada candidato cuesta `m` lookups + sumas.
     pub fn adc_table(&self, query: &[f32]) -> Vec<Vec<f32>> {

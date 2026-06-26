@@ -3181,6 +3181,9 @@ fn build_vector_clusters<S: NodeStore>(
         // lee de la fila.
         let pqm = (dim / 8).clamp(1, dim.max(1));
         let pq = crate::pq::Pq::train(&vectors, pqm, 15);
+        // Pre-codifica las N en PARALELO (cada código independiente, byte-determinista);
+        // las escrituras al b-tree quedan en SERIE (escritor único) leyendo `codes[i]`.
+        let codes = pq.encode_all(&vectors);
         root = btree::insert(s, root, &vec_pq_key(vidx_id), &pq.to_bytes())?;
         for (cid, members) in assignments.iter().enumerate() {
             for &i in members {
@@ -3188,7 +3191,7 @@ fn build_vector_clusters<S: NodeStore>(
                     s,
                     root,
                     &vec_posting_key(vidx_id, cid as u16, rowids[i]),
-                    &pq.encode(&vectors[i]),
+                    &codes[i],
                 )?;
             }
         }

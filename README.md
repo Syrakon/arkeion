@@ -240,23 +240,30 @@ FTS is young, but it is **native to the engine** — encrypted, crash-consistent
 only one that answers `MATCH … AS OF` (full-text search *of the past*) and **hybrid** BM25 + vector
 ranking in the same query.
 
-### Vector search — vs pgvector / Qdrant (SIFT 1M, 128-dim, L2, real ground-truth)
+### Vector search — vs pgvector / Qdrant (SIFT 1M, 128-dim, L2, real top-100 ground-truth)
 
-| | index | build | notes |
-|---|--:|--:|---|
-| **Arkeion (IVF-PQ)** | **~39 MB** | 64 s | recall@10 ~0.99; **streaming** build scales to tens of M |
-| pgvector IVFFlat | 551 MB | 23 s | |
-| pgvector HNSW | 820 MB | 324 s | |
-| Qdrant (HNSW) | — | 49 s | |
+| system | index | build | **single-query QPS @recall ~0.99** |
+|---|--:|--:|--:|
+| **Arkeion (IVF-PQ)** | **~39 MB** | 64 s | **356** |
+| pgvector IVFFlat | 551 MB | 23 s | 63 |
+| pgvector HNSW | 820 MB | 324 s | 188 |
+| Qdrant (HNSW) | — | 49 s | 508 |
 
-The win is **footprint and integration**: the IVF-PQ index is **14–21× smaller** than HNSW, so 50M
-vectors fit where a graph index needs ~10× the RAM, and the **parallel + streaming** build keeps memory
-flat (it never materializes the dataset). At equal recall Arkeion **matches pgvector IVFFlat** with a
-far smaller index. **Honesty**: a dedicated HNSW engine (Qdrant) still wins raw QPS@recall — that gap is
-**algorithmic** (HNSW is O(log N) per query, IVF is O(N) at fixed recall) and **structural**: HNSW's
-random-access graph is incompatible with copy-on-write / versioning / time-travel, so it is excluded by
-design. Arkeion is not the ANN throughput champion; it is the one engine where vectors live next to SQL,
-full-text, branches, `AS OF` and per-page encryption — in a single file, on a small box.
+With a **per-reader centroid cache** and a **parallel + streaming** build, single-query latency at 1M
+reaches **~356 qps @recall 0.99** (and ~590 at recall ~0.88) — **above both pgvector configurations**
+and at **70–92% of Qdrant**, with a **14–21× smaller index**. Under concurrent load (what a DB actually
+serves) it sustains **~700 qps** on 8 cores. The build is now **parallel (186 s → 64 s)** and
+**streaming** — it never materializes the dataset, so it scales to tens of millions on a modest box, and
+the sorted bulk insert **halved the index** (75 → 39 MB).
+
+**Honesty**: (1) pgvector/Qdrant answer over localhost TCP, so a ~0.05–0.2 ms RTT inflates their sub-ms
+latencies — read the Qdrant gap with that caveat. (2) The edge **narrows at larger N**: IVF scans O(N)
+candidates at fixed recall while HNSW is O(log N), so a dedicated graph engine pulls ahead at tens of
+millions — though even there our index still fits in a fraction of the RAM HNSW needs. HNSW itself is
+**excluded by design** (its random-access graph is incompatible with copy-on-write / versioning /
+time-travel). Net: Arkeion is the one engine where vectors live next to SQL, full-text, branches,
+`AS OF` and per-page encryption — in a single file, on a small box — and at single-node scale it is now
+**competitive on speed**, not just on footprint.
 
 ## License
 

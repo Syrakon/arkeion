@@ -1511,6 +1511,39 @@ impl Snapshot {
         catalog::vector_search(self, self.data_root, vidx, query, nprobe, limit)
     }
 
+    /// Carga centroides + codebook PQ decodificados (para que el `TableReader` los
+    /// CACHEE y los reutilice en [`Snapshot::vector_search_with`], evitando re-leerlos
+    /// cada query — eran ~2 ms del coste ANN una vez paralelizado el escaneo).
+    pub fn read_vec_index(&self, vidx_id: u32) -> Result<(Vec<Vec<f32>>, Option<crate::pq::Pq>)> {
+        catalog::read_vec_index(self, self.data_root, vidx_id)
+    }
+
+    /// ANN con centroides+PQ ya cacheados y `threads` para el escaneo paralelo
+    /// (opt-in del `TableReader`; `Snapshot` es `Sync`, el pager es thread-safe).
+    #[allow(clippy::too_many_arguments)]
+    pub fn vector_search_with(
+        &self,
+        vidx: &VectorIndexDef,
+        centroids: &[Vec<f32>],
+        pq: &Option<crate::pq::Pq>,
+        query: &[f32],
+        nprobe: usize,
+        limit: usize,
+        threads: usize,
+    ) -> Result<Vec<i64>> {
+        catalog::vector_search_with(
+            self,
+            self.data_root,
+            vidx,
+            centroids,
+            pq,
+            query,
+            nprobe,
+            limit,
+            threads,
+        )
+    }
+
     /// Top-`want` rowids de un `MATCH` rankeados por BM25 desde el índice (shortlist
     /// para re-rank exacto), sin materializar ni re-tokenizar las filas que casan.
     pub fn fts_bm25_topk(

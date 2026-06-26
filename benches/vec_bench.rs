@@ -102,7 +102,11 @@ fn main() {
     let dbdir = env("VEC_DBDIR").unwrap_or_else(|| tmp.path().to_string_lossy().into_owned());
     let dbpath = format!("{dbdir}/vec_bench.arkeion");
     let _ = fs::remove_file(&dbpath);
-    let db = Database::open(&dbpath, Options::default()).unwrap();
+    let opts = match env("VEC_CACHE_MB").and_then(|s| s.parse::<usize>().ok()) {
+        Some(mb) => Options::default().cache_bytes(mb * 1024 * 1024),
+        None => Options::default(),
+    };
+    let db = Database::open(&dbpath, opts).unwrap();
     let conn = db.connect().unwrap();
     conn.execute("CREATE TABLE docs (id INTEGER PRIMARY KEY, emb BLOB)", &[])
         .unwrap();
@@ -187,13 +191,21 @@ fn main() {
         .into_iter()
         .filter(|&p| p <= lists && p <= maxprobe)
         .collect();
+    // VEC_PARALLEL=1 ⇒ usa el escaneo paralelo opt-in (latencia de query suelta);
+    // por defecto el camino serie cacheado (el que sirve bajo carga concurrente).
+    let parallel = env("VEC_PARALLEL").is_some();
     let mut sweep = Vec::new();
     for &np in &probes {
         let mut got = Vec::with_capacity(ann_q);
         let t = Instant::now();
         for q in 0..ann_q {
             let qv = &queries[q * dim..(q + 1) * dim];
-            got.push(reader.vector_search("vi", qv, k, np).unwrap());
+            let r = if parallel {
+                reader.vector_search_parallel("vi", qv, k, np)
+            } else {
+                reader.vector_search("vi", qv, k, np)
+            };
+            got.push(r.unwrap());
         }
         let ms = t.elapsed().as_secs_f64() * 1000.0 / ann_q as f64;
         let rec = recall_at_k(&got, &gt, ann_q, k);

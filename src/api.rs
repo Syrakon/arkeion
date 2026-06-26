@@ -806,15 +806,25 @@ impl Connection {
         let def = snap
             .table(name)?
             .ok_or_else(|| sql_err(format!("tabla desconocida: {name}")))?;
-        Ok(TableReader { snap, def })
+        Ok(TableReader {
+            snap,
+            def,
+            vcache: std::cell::RefCell::new(None),
+        })
     }
 }
 
 /// Lector a nivel motor de una tabla (sin SQL), abierto con [`Connection::table`].
 /// Lee el snapshot tomado al crearse: una vista confirmada y estable.
+type VecIndexData = std::sync::Arc<(Vec<Vec<f32>>, Option<crate::pq::Pq>)>;
+
 pub struct TableReader {
     snap: Snapshot,
     def: crate::catalog::TableDef,
+    /// Centroides+PQ decodificados del último índice vectorial consultado, cacheados
+    /// para no re-leerlos cada query (eran ~2 ms del coste ANN). Por-reader ⇒ cada
+    /// conexión cachea una vez; thread-safe porque cada hilo tiene su `TableReader`.
+    vcache: std::cell::RefCell<Option<(String, VecIndexData)>>,
 }
 
 impl TableReader {
@@ -887,6 +897,49 @@ impl TableReader {
         k: usize,
         nprobe: usize,
     ) -> Result<Vec<i64>> {
+        self.ann(index, query, k, nprobe, 1)
+    }
+
+    /// Igual que [`vector_search`](TableReader::vector_search) pero ESCANEA LOS CLUSTERS
+    /// EN PARALELO (hasta 8 cores, work-stealing dinámico) ⇒ baja la latencia de una
+    /// query SUELTA ~3× a escala. Pensado para **baja concurrencia / latencia-sensible**:
+    /// bajo carga alta el camino serie ya satura los cores con queries separadas, así que
+    /// esto es opt-in y NO el default (no roba cores al throughput concurrente).
+    pub fn vector_search_parallel(
+        &self,
+        index: &str,
+        query: &[f32],
+        k: usize,
+        nprobe: usize,
+    ) -> Result<Vec<i64>> {
+        let threads = std::thread::available_parallelism()
+            .map(|x| x.get())
+            .unwrap_or(1)
+            .min(8);
+        self.ann(index, query, k, nprobe, threads)
+    }
+
+    /// Centroides+PQ del índice `index`, cacheados por-reader (se leen+decodifican una
+    /// sola vez; re-hacerlo por query costaba ~2 ms y era el muro de la latencia ANN).
+    fn vec_data(&self, vidx_id: u32, index: &str) -> Result<VecIndexData> {
+        if let Some((name, data)) = self.vcache.borrow().as_ref()
+            && name == index
+        {
+            return Ok(data.clone());
+        }
+        let data: VecIndexData = std::sync::Arc::new(self.snap.read_vec_index(vidx_id)?);
+        *self.vcache.borrow_mut() = Some((index.to_string(), data.clone()));
+        Ok(data)
+    }
+
+    fn ann(
+        &self,
+        index: &str,
+        query: &[f32],
+        k: usize,
+        nprobe: usize,
+        threads: usize,
+    ) -> Result<Vec<i64>> {
         let vidx = self
             .def
             .vector_indexes
@@ -895,11 +948,18 @@ impl TableReader {
             .ok_or_else(|| sql_err(format!("índice vectorial desconocido: {index}")))?;
         let col = vidx.column;
         let qpacked = crate::vector::pack_f32(query);
-        // El índice rankea aprox por int8 y devuelve un shortlist (k·8); aquí se
-        // re-rankea exacto y se corta a k (antes fetcheaba TODOS los candidatos).
-        let candidates = self
-            .snap
-            .vector_search(vidx, query, nprobe, k.saturating_mul(32).max(64))?;
+        let data = self.vec_data(vidx.vidx_id, index)?;
+        // El índice rankea aprox (ADC/int8) y devuelve un shortlist (k·32); aquí se
+        // re-rankea exacto y se corta a k.
+        let candidates = self.snap.vector_search_with(
+            vidx,
+            &data.0,
+            &data.1,
+            query,
+            nprobe,
+            k.saturating_mul(32).max(64),
+            threads,
+        )?;
         let mut scored: Vec<(f64, i64)> = Vec::with_capacity(candidates.len());
         for rid in candidates {
             if let Some(row) = self.snap.get_row(&self.def, rid)?

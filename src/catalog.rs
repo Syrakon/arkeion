@@ -3085,6 +3085,17 @@ fn read_pq<S: NodeSource>(src: &S, root: PageId, vidx_id: u32) -> Result<Option<
     Ok(btree::get(src, root, &vec_pq_key(vidx_id))?.and_then(|b| crate::pq::Pq::from_bytes(&b)))
 }
 
+/// Carga centroides + codebook PQ DECODIFICADOS de un índice vectorial. El llamante los
+/// CACHEA y los pasa a [`vector_search_with`] — re-leerlos/decodificarlos por query
+/// costaba ~2 ms y era el muro de la latencia ANN una vez paralelizado el escaneo.
+pub fn read_vec_index<S: NodeSource>(
+    src: &S,
+    root: PageId,
+    vidx_id: u32,
+) -> Result<(Vec<Vec<f32>>, Option<crate::pq::Pq>)> {
+    Ok((read_centroids(src, root, vidx_id)?, read_pq(src, root, vidx_id)?))
+}
+
 fn alloc_vidx_id<S: NodeStore>(s: &mut S, root: PageId) -> Result<(u32, PageId)> {
     let next = match btree::get(s, root, &vector_counter_key())? {
         Some(v) => u32::from_le_bytes(
@@ -3368,6 +3379,48 @@ fn read_centroids<S: NodeSource>(src: &S, root: PageId, vidx_id: u32) -> Result<
     Ok(cents)
 }
 
+/// Escanea los clusters `cids` (postings) acumulando `(distancia_aprox, rowid)` por
+/// candidato: ADC si hay codebooks PQ, si no `l2_sq` int8. Extraído del bucle de
+/// `vector_search` para reutilizarlo en serie y en paralelo (un subconjunto de cids
+/// por hilo). `query` ya viene normalizado si la métrica es coseno.
+fn scan_clusters<S: NodeSource>(
+    src: &S,
+    root: PageId,
+    vidx_id: u32,
+    adc_table: &Option<Vec<Vec<f32>>>,
+    query: &[f32],
+    cids: &[usize],
+) -> Result<Vec<(f32, i64)>> {
+    let mut cands: Vec<(f32, i64)> = Vec::new();
+    for &cid in cids {
+        let pp = vec_cluster_prefix(vidx_id, cid as u16);
+        let mut st = btree::scan_state(src, root, Some(&pp))?;
+        loop {
+            let step = st.advance_view(src, |key, value| {
+                if !key.starts_with(&pp) {
+                    return Ok(None);
+                }
+                let rid = key
+                    .get(key.len() - 8..)
+                    .and_then(record::rowid_from_be)
+                    .ok_or(Error::CorruptRecord("rowid en posting vectorial"))?;
+                let d = match adc_table {
+                    Some(table) => crate::pq::Pq::adc_distance(table, value),
+                    None => crate::vector::l2_sq_packed_i8(value, query).ok_or(
+                        Error::CorruptRecord("posting vectorial sin código (índice antiguo: REBUILD)"),
+                    )?,
+                };
+                Ok(Some((d, rid)))
+            })?;
+            match step {
+                None | Some(None) => break,
+                Some(Some(c)) => cands.push(c),
+            }
+        }
+    }
+    Ok(cands)
+}
+
 /// rowids candidatos de los `nprobe` clusters más cercanos a `query_raw` (ANN). El
 /// planner los trae y rankea exacto. `query_raw` es el vector crudo de la query
 /// (se normaliza aquí si la métrica es coseno, igual que al construir).
@@ -3403,33 +3456,99 @@ pub fn vector_search<S: NodeSource>(
     // `limit` más cercanos; el `ORDER BY` exacto de SQL re-rankea solo esos.
     let pq = read_pq(src, root, vidx.vidx_id)?;
     let adc_table: Option<Vec<Vec<f32>>> = pq.as_ref().map(|p| p.adc_table(&query));
-    let mut cands: Vec<(f32, i64)> = Vec::new();
-    for &(_, cid) in cents.iter().take(probe) {
-        let pp = vec_cluster_prefix(vidx.vidx_id, cid as u16);
-        let mut st = btree::scan_state(src, root, Some(&pp))?;
-        loop {
-            let step = st.advance_view(src, |key, value| {
-                if !key.starts_with(&pp) {
-                    return Ok(None);
-                }
-                let rid = key
-                    .get(key.len() - 8..)
-                    .and_then(record::rowid_from_be)
-                    .ok_or(Error::CorruptRecord("rowid en posting vectorial"))?;
-                let d = match &adc_table {
-                    Some(table) => crate::pq::Pq::adc_distance(table, value),
-                    None => crate::vector::l2_sq_packed_i8(value, &query).ok_or(
-                        Error::CorruptRecord("posting vectorial sin código (índice antiguo: REBUILD)"),
-                    )?,
-                };
-                Ok(Some((d, rid)))
-            })?;
-            match step {
-                None | Some(None) => break,
-                Some(Some(c)) => cands.push(c),
-            }
-        }
+    let cids: Vec<usize> = cents.iter().take(probe).map(|&(_, c)| c).collect();
+    let mut cands = scan_clusters(src, root, vidx.vidx_id, &adc_table, &query, &cids)?;
+    let limit = limit.max(1);
+    if cands.len() > limit {
+        cands.select_nth_unstable_by(limit, |a, b| a.0.total_cmp(&b.0));
+        cands.truncate(limit);
     }
+    cands.sort_by(|a, b| a.0.total_cmp(&b.0));
+    Ok(cands.into_iter().map(|(_, rid)| rid).collect())
+}
+
+/// Núcleo ANN sobre centroides+PQ **ya decodificados** (los pasa el llamante, que los
+/// cachea — re-leerlos del b-tree costaba ~2 ms/query y capaba la latencia). Rankea
+/// centroides, escanea los `nprobe` clusters más cercanos y devuelve el shortlist de
+/// `limit` por distancia aproximada (ADC o int8). `threads`>1 reparte el escaneo con
+/// **work-stealing dinámico** (`thread::scope` sobre `src` compartido — requiere `Sync`;
+/// baja la latencia de UNA query usando los cores); `threads`==1 = serie (por defecto,
+/// no roba cores bajo carga concurrente). `read_vec_index` carga centroides+PQ.
+#[allow(clippy::too_many_arguments)]
+pub fn vector_search_with<S: NodeSource + Sync>(
+    src: &S,
+    root: PageId,
+    vidx: &VectorIndexDef,
+    centroids: &[Vec<f32>],
+    pq: &Option<crate::pq::Pq>,
+    query_raw: &[f32],
+    nprobe: usize,
+    limit: usize,
+    threads: usize,
+) -> Result<Vec<i64>> {
+    if centroids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let query = if vidx.metric == VectorMetric::Cosine {
+        crate::vector::normalize(query_raw)
+    } else {
+        query_raw.to_vec()
+    };
+    let mut cents: Vec<(f32, usize)> = centroids
+        .iter()
+        .enumerate()
+        .map(|(i, c)| (vec_l2_sq(c, &query), i))
+        .collect();
+    cents.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let probe = nprobe.clamp(1, cents.len());
+    let adc_table: Option<Vec<Vec<f32>>> = pq.as_ref().map(|p| p.adc_table(&query));
+    let cids: Vec<usize> = cents.iter().take(probe).map(|&(_, c)| c).collect();
+    let nt = threads.clamp(1, 8).min(probe.max(1));
+    let mut cands: Vec<(f32, i64)> = if nt <= 1 {
+        scan_clusters(src, root, vidx.vidx_id, &adc_table, &query, &cids)?
+    } else {
+        // Work-stealing dinámico: cada hilo coge el siguiente cluster (`AtomicUsize`)
+        // al terminar el anterior. Balancea aunque los clusters sean MUY desiguales
+        // (k-means real: 1k–50k vectores/cluster); un reparto estático por nº de
+        // clusters dejaba a un hilo con un cluster gigante y al resto ociosos.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let next = AtomicUsize::new(0);
+        let (next_ref, cids_ref, adc_ref) = (&next, &cids, &adc_table);
+        let q: &[f32] = &query;
+        let vid = vidx.vidx_id;
+        let parts: Vec<Result<Vec<(f32, i64)>>> = std::thread::scope(|s| {
+            (0..nt)
+                .map(|_| {
+                    s.spawn(move || {
+                        let mut local = Vec::new();
+                        loop {
+                            let i = next_ref.fetch_add(1, Ordering::Relaxed);
+                            if i >= cids_ref.len() {
+                                break;
+                            }
+                            local.extend(scan_clusters(
+                                src,
+                                root,
+                                vid,
+                                adc_ref,
+                                q,
+                                &cids_ref[i..i + 1],
+                            )?);
+                        }
+                        Ok(local)
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|h| h.join().expect("hilo de escaneo vectorial paniqueó"))
+                .collect()
+        });
+        let mut all = Vec::new();
+        for p in parts {
+            all.extend(p?);
+        }
+        all
+    };
     let limit = limit.max(1);
     if cands.len() > limit {
         cands.select_nth_unstable_by(limit, |a, b| a.0.total_cmp(&b.0));

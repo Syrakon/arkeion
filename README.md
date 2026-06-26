@@ -5,7 +5,10 @@
 > The place where the records of record live. — [arkeion.tech](https://arkeion.tech)
 
 **Arkeion** is an **embedded, auditable, versioned** database engine, written in pure Rust.
-The guiding analogy: *as if SQLite and Git had a child… and it was born in Europe*.
+The guiding analogy: *as if SQLite and Git had a child… and it was born in Europe*. And it
+learned to **search**: native **full-text** (BM25, `snippet`/`highlight`) and **vector / semantic**
+ANN (IVF/PQ) live in the *same* encrypted, versioned file — no external index — with `MATCH … AS OF`
+time-travel that no dedicated search engine offers.
 
 **Sovereign European** data infrastructure: designed, written and governed in Europe (holding
 **Syrakon**), with no fork of or inheritance from SQLite's format, and a minimal, auditable
@@ -20,6 +23,9 @@ supply chain (4 runtime dependencies, all pure-Rust except the FIPS primitives).
 | **Integrity** | Foreign keys (`REFERENCES`) with `ON DELETE RESTRICT`/`CASCADE`/`SET NULL` |
 | **Schema evolution** | **Logical** `ALTER TABLE`: `ADD`/`DROP`/`RENAME`/`MOVE`/`REORDER COLUMN` without rewriting rows — time-travel-safe |
 | **Indexes** | B-tree secondary: `CREATE [UNIQUE] INDEX`; the planner uses them for equality, ranges and multi-column, plus deterministic predicate pushdown in JOINs |
+| **Full-text search** | Native `MATCH` with **BM25** ranking, `snippet()`/`highlight()`, index-accelerated (`SELECT`/`UPDATE`/`DELETE`); prefix-compressed posting lists put the index **below SQLite FTS5**; `MATCH … AS OF` searches the past |
+| **Vector / semantic search** | `BLOB` vector columns (f32 / int8); **exact KNN** + **ANN** via `CREATE VECTOR INDEX … USING cosine\|l2` (IVF / IVF-PQ), `cosine_distance`/`l2_distance`/`dot`, opt-in int8 inline re-rank, **hybrid RRF** (BM25 + vector); index **≈10–20× smaller than HNSW**; embeddings stay external (no ML deps) |
+| **Build (search indexes)** | Vector build is **parallel** (k-means / assign / PQ over all cores) and **streaming** — never materializes the dataset, so it scales to tens of millions on a modest box; sorted bulk insert ⇒ full pages |
 | **Packaging** | A single file per tenant — backup = copy the file |
 | **Storage** | Append-only *copy-on-write* B-tree: the file **is** the WAL; nodes with a pointer array (binary search) |
 | **Bulk load** | `bulk_insert`: the whole batch in one transaction, no per-row executor, indexes in bulk — 2.5M rows/s |
@@ -66,17 +72,29 @@ for row in conn.query("SELECT id, total FROM invoices LIMIT 10", &[])? {
 // Time-travel: the query sees the past exactly as it was (and `verify()` proves it).
 let mut before = conn.query(&format!("SELECT COUNT(*) FROM invoices AS OF VERSION {v1}"), &[])?;
 assert_eq!(before.next().unwrap()?.get::<i64>(0)?, 1); // only the invoice before the batch
+
+// Search lives in the SAME file — full-text (BM25) and vector ANN, both time-travel-aware.
+conn.execute("CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT, emb BLOB)", &[])?;
+// … insert text + f32 embeddings (stored as BLOBs) …
+conn.execute("CREATE FULLTEXT INDEX ft ON notes (body)", &[])?;
+conn.execute("CREATE VECTOR INDEX vi ON notes (emb) USING cosine LISTS 64", &[])?;
+
+// Full-text, BM25-ranked (and `WHERE body MATCH 'archive' AS OF VERSION 3` searches the past):
+conn.query("SELECT id FROM notes WHERE body MATCH 'archive' ORDER BY bm25(body, 'archive') DESC LIMIT 5", &[])?;
+// Nearest neighbours via the IVF index (exact at small scale, ANN at large):
+conn.query("SELECT id FROM notes ORDER BY cosine_distance(emb, vector(0.1, 0.2, 0.3)) LIMIT 5", &[])?;
 ```
 
 ## Status
 
 **Working engine — milestones M0 to M10 + secondary indexes + bulk-load/streaming + a broad SQL
-dialect (subqueries, CTEs, `UNION`, views, foreign keys, triggers, logical `ALTER TABLE`),
-implemented and tested** (272 tests, `clippy -D warnings`, `#![forbid(unsafe_code)]`). **Pre-1.0**:
-the format may change and there is no production release yet. The
-[crates.io](https://crates.io/crates/arkeion) version is at **0.11.x** (0.10 = milestones M0–M10;
-0.11 adds the broad SQL dialect above); `1.0.0` will mean exactly one thing: **on-disk format
-frozen**. The full specification lives in [`docs/`](docs/):
+dialect (subqueries, CTEs, `UNION`, views, foreign keys, triggers, logical `ALTER TABLE`) +
+native full-text and vector search, implemented and tested** (389 tests, `clippy -D warnings`,
+`#![forbid(unsafe_code)]`). **Pre-1.0**: the format may change and there is no production release yet.
+The [crates.io](https://crates.io/crates/arkeion) version is at **0.12.x** (0.10 = milestones M0–M10;
+0.11 = the broad SQL dialect; 0.12 = full-text + vector search); `1.0.0` will mean exactly one thing:
+**on-disk format frozen**. A native **client/server** layer (TLS, argon2id auth, per-branch
+permissions) lives in companion repos. The full specification lives in [`docs/`](docs/):
 
 | Doc | Contents |
 |---|---|
@@ -90,6 +108,9 @@ frozen**. The full specification lives in [`docs/`](docs/):
 | [08-soberania](docs/08-soberania.md) | Positioning: why it is genuinely European and not a fork |
 | [09-m10-compresion](docs/09-m10-compresion.md) | Page compression + data stability (ECC) |
 | [10-indices-secundarios](docs/10-indices-secundarios.md) | Secondary indexes: memcomparable encoding, plan, node format v3 |
+| [11-cliente-servidor](docs/11-cliente-servidor.md) | Native client/server protocol, TLS, auth, per-branch permissions |
+| [12-fts](docs/12-fts.md) | Full-text: term dictionary, BM25, `snippet`/`highlight`, prefix-compressed postings |
+| [13-vectores](docs/13-vectores.md) | Vector search: IVF / IVF-PQ, int8 re-rank, hybrid RRF, parallel + streaming build |
 
 ## Benchmarks
 
@@ -205,6 +226,37 @@ optional compression uses **Densa** (LZSS + an adaptive range coder, pure-Rust, 
 supports compression (sqlite-zstd, ZIPVFS/CEROD), also not by default. What arkeion keeps and SQLite does
 not: **CoW history** (an explicit cost, recoverable with `vacuum`), `verify()` and `AS OF`, all while
 keeping compression and, optionally, Reed-Solomon correction.
+
+### Full-text search — vs SQLite FTS5 (50k MS MARCO passages, embedded vs embedded)
+
+| | index | build |
+|---|--:|--:|
+| **Arkeion** | **26.2 MB** | ~11 s |
+| SQLite FTS5 | 27.2 MB | 0.57 s |
+
+Arkeion's term dictionary + **prefix-compressed posting lists** land the index **below FTS5** on disk.
+**Honesty**: FTS5 is decades-mature C and still leads on raw query latency and build speed; Arkeion's
+FTS is young, but it is **native to the engine** — encrypted, crash-consistent, branchable — and the
+only one that answers `MATCH … AS OF` (full-text search *of the past*) and **hybrid** BM25 + vector
+ranking in the same query.
+
+### Vector search — vs pgvector / Qdrant (SIFT 1M, 128-dim, L2, real ground-truth)
+
+| | index | build | notes |
+|---|--:|--:|---|
+| **Arkeion (IVF-PQ)** | **~39 MB** | 64 s | recall@10 ~0.99; **streaming** build scales to tens of M |
+| pgvector IVFFlat | 551 MB | 23 s | |
+| pgvector HNSW | 820 MB | 324 s | |
+| Qdrant (HNSW) | — | 49 s | |
+
+The win is **footprint and integration**: the IVF-PQ index is **14–21× smaller** than HNSW, so 50M
+vectors fit where a graph index needs ~10× the RAM, and the **parallel + streaming** build keeps memory
+flat (it never materializes the dataset). At equal recall Arkeion **matches pgvector IVFFlat** with a
+far smaller index. **Honesty**: a dedicated HNSW engine (Qdrant) still wins raw QPS@recall — that gap is
+**algorithmic** (HNSW is O(log N) per query, IVF is O(N) at fixed recall) and **structural**: HNSW's
+random-access graph is incompatible with copy-on-write / versioning / time-travel, so it is excluded by
+design. Arkeion is not the ANN throughput champion; it is the one engine where vectors live next to SQL,
+full-text, branches, `AS OF` and per-page encryption — in a single file, on a small box.
 
 ## License
 

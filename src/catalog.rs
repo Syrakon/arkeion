@@ -3129,9 +3129,34 @@ fn row_vector(record: &[Value], column: usize, metric: VectorMetric) -> Result<O
     }
 }
 
+/// Asigna+codifica un LOTE de vectores (en paralelo) y vuelca `(cid, rowid, code)` a
+/// `postings`; vacía `bvecs`/`brids`. Lo usa el build en streaming para no materializar
+/// los N vectores f32. `code` = PQ (M bytes) si hay codebook, si no int8 (`pack_i8`).
+fn flush_vector_batch(
+    bvecs: &mut Vec<Vec<f32>>,
+    brids: &mut Vec<i64>,
+    centroids: &[Vec<f32>],
+    pq: &Option<crate::pq::Pq>,
+    postings: &mut Vec<(u16, i64, Vec<u8>)>,
+) {
+    if bvecs.is_empty() {
+        return;
+    }
+    let cids = crate::ivf::assign_each(bvecs, centroids);
+    let codes: Vec<Vec<u8>> = match pq {
+        Some(p) => p.encode_all(bvecs),
+        None => bvecs.iter().map(|v| crate::vector::pack_i8(v)).collect(),
+    };
+    for ((cid, rid), code) in cids.into_iter().zip(brids.drain(..)).zip(codes) {
+        postings.push((cid as u16, rid, code));
+    }
+    bvecs.clear();
+}
+
 /// Núcleo de construcción IVF, compartido por crear y reconstruir: escanea los
-/// vectores no-NULL de la columna, entrena k-means, asigna cada fila a su cluster
-/// y persiste centroides + postings bajo `vidx_id`. Devuelve la dimensión.
+/// vectores no-NULL de la columna, entrena k-means sobre una muestra y asigna cada fila
+/// a su cluster EN STREAMING (sin materializar los N), persiste centroides + postings
+/// ordenados bajo `vidx_id`. Devuelve la dimensión.
 #[allow(clippy::too_many_arguments)]
 fn build_vector_clusters<S: NodeStore>(
     s: &mut S,
@@ -3143,27 +3168,49 @@ fn build_vector_clusters<S: NodeStore>(
     vidx_id: u32,
     rerank_i8: bool,
 ) -> Result<(PageId, u32)> {
-    // Vectores existentes (filas con vector no-NULL de la misma dimensión).
-    let mut vectors: Vec<Vec<f32>> = Vec::new();
-    let mut rowids: Vec<i64> = Vec::new();
+    // --- Pase 1: MUESTRA por reservoir para entrenar k-means+PQ, SIN materializar los
+    // N vectores (a 50M serían ~27 GB de `Vec<Vec<f32>>`). La muestra (≈k·256, como el
+    // submuestreo interno de `ivf::train`) basta para los centroides; reservoir = 1 pase,
+    // determinista (RNG sembrado + orden de scan fijo ⇒ REBUILD reproducible).
+    let k = (lists as usize).max(1);
+    let cap = k.saturating_mul(256).max(4096);
+    let mut sample: Vec<Vec<f32>> = Vec::new();
     let mut dim = 0usize;
+    let mut seen: u64 = 0;
+    let mut rs = 0x9E37_79B9_7F4A_7C15u64 ^ (cap as u64).wrapping_mul(0x0100_0000_01b3);
+    let mut rng = || {
+        rs ^= rs << 13;
+        rs ^= rs >> 7;
+        rs ^= rs << 17;
+        rs
+    };
     for item in scan_table(s, root, def)? {
-        let (rowid, values) = item?;
+        let (_, values) = item?;
         if let Some(v) = row_vector(&values, column, metric)? {
-            if vectors.is_empty() {
+            if dim == 0 {
                 dim = v.len();
             } else if v.len() != dim {
                 return Err(Error::InvalidInput(
                     "vectores de distinta dimensión en la columna",
                 ));
             }
-            vectors.push(v);
-            rowids.push(rowid);
+            if sample.len() < cap {
+                sample.push(v);
+            } else {
+                let j = (rng() % (seen + 1)) as usize;
+                if j < cap {
+                    sample[j] = v;
+                }
+            }
+            seen += 1;
         }
     }
-    // Núcleo IVF: entrena los centroides y asigna cada vector a su cluster.
-    let centroids = crate::ivf::train(&vectors, lists as usize, 25);
-    let assignments = crate::ivf::assign(&vectors, &centroids);
+    if sample.is_empty() {
+        return Ok((root, 0));
+    }
+
+    // Entrena centroides (+ codebook PQ si no es int8) sobre la muestra y los persiste.
+    let centroids = crate::ivf::train(&sample, k, 25);
     for (cid, c) in centroids.iter().enumerate() {
         root = btree::insert(
             s,
@@ -3172,40 +3219,46 @@ fn build_vector_clusters<S: NodeStore>(
             &crate::vector::pack_f32(c),
         )?;
     }
-    if rerank_i8 {
-        // RERANK int8: el posting guarda el VECTOR int8 (preciso). El re-rank es
-        // INLINE en el scan del cluster (`l2_sq_packed_i8`), sin fetch de fila por
-        // candidato — índice ~2× pero ANN por SQL viable a escala.
-        for (cid, members) in assignments.iter().enumerate() {
-            for &i in members {
-                root = btree::insert(
-                    s,
-                    root,
-                    &vec_posting_key(vidx_id, cid as u16, rowids[i]),
-                    &crate::vector::pack_i8(&vectors[i]),
-                )?;
-            }
-        }
+    let pq = if rerank_i8 {
+        None
     } else {
-        // IVFPQ (por defecto, compacto): codebooks PQ (M ≈ dim/8) + código de M bytes
-        // ⇒ índice ~8× menor; el re-rank ADC ordena el shortlist y el f32 exacto se
-        // lee de la fila.
+        // El codebook PQ (clave 0x02) se escribe AL FINAL (tras los postings 0x01) para
+        // que los postings sean appends puros → páginas llenas.
         let pqm = (dim / 8).clamp(1, dim.max(1));
-        let pq = crate::pq::Pq::train(&vectors, pqm, 15);
-        // Pre-codifica las N en PARALELO (cada código independiente, byte-determinista);
-        // las escrituras al b-tree quedan en SERIE (escritor único) leyendo `codes[i]`.
-        let codes = pq.encode_all(&vectors);
-        root = btree::insert(s, root, &vec_pq_key(vidx_id), &pq.to_bytes())?;
-        for (cid, members) in assignments.iter().enumerate() {
-            for &i in members {
-                root = btree::insert(
-                    s,
-                    root,
-                    &vec_posting_key(vidx_id, cid as u16, rowids[i]),
-                    &codes[i],
-                )?;
+        Some(crate::pq::Pq::train(&sample, pqm, 15))
+    };
+    drop(sample); // libera la muestra antes del pase 2
+
+    // --- Pase 2: STREAMING por lotes. Lee cada vector de la tabla (no materializa los
+    // N), asigna+codifica cada LOTE en PARALELO (`assign_each`/`encode_all`) y recoge
+    // `(cid, rowid, code)` (16-133 B/vector, no los 513 del f32). RAM ≈ muestra+postings.
+    let mut postings: Vec<(u16, i64, Vec<u8>)> = Vec::new();
+    let mut bvecs: Vec<Vec<f32>> = Vec::new();
+    let mut brids: Vec<i64> = Vec::new();
+    for item in scan_table(s, root, def)? {
+        let (rowid, values) = item?;
+        if let Some(v) = row_vector(&values, column, metric)? {
+            bvecs.push(v);
+            brids.push(rowid);
+            if bvecs.len() >= 50_000 {
+                flush_vector_batch(&mut bvecs, &mut brids, &centroids, &pq, &mut postings);
             }
         }
+    }
+    flush_vector_batch(&mut bvecs, &mut brids, &centroids, &pq, &mut postings);
+
+    // Ordena por (cid, rowid) = orden de CLAVE del b-tree ⇒ inserción con cursor de
+    // APPEND (páginas llenas — bonus: el índice PQ ahora SÍ comprime) en vez de los
+    // inserts dispersos por cluster del build viejo.
+    postings.sort_unstable_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+    for (cid, rowid, code) in &postings {
+        root = btree::insert(s, root, &vec_posting_key(vidx_id, *cid, *rowid), code)?;
+    }
+    // Codebook PQ AL FINAL (clave 0x02, la más alta del índice) ⇒ los postings de arriba
+    // fueron appends (páginas LLENAS; el build viejo lo escribía antes de los postings,
+    // dejándolos como inserts dispersos a media página).
+    if let Some(p) = &pq {
+        root = btree::insert(s, root, &vec_pq_key(vidx_id), &p.to_bytes())?;
     }
     Ok((root, dim as u32))
 }

@@ -188,6 +188,14 @@ pub fn assign(vectors: &[Vec<f32>], centroids: &[Vec<f32>]) -> Vec<Vec<usize>> {
     lists
 }
 
+/// Centroide más cercano de CADA punto (mapeo directo punto→cluster), en PARALELO.
+/// Lo usa el build en STREAMING: asigna por lotes leídos de la tabla, sin materializar
+/// los N vectores (a 50M serían ~27 GB). Determinista (cada `out[i]` no depende del nº
+/// de hilos). Acepta `&[Vec<f32>]` o `&[&Vec<f32>]`.
+pub fn assign_each<V: AsRef<[f32]> + Sync>(points: &[V], centroids: &[Vec<f32>]) -> Vec<usize> {
+    nearest_all(points, centroids)
+}
+
 /// Búsqueda IVF: escanea los `nprobe` clusters más cercanos a `query` y devuelve
 /// los `top_k` índices de vector por distancia exacta (euclídea), ascendente.
 /// `nprobe == centroids.len()` ⇒ resultado **exacto** (escanea todo).

@@ -33,9 +33,12 @@ pub(crate) const CACHE_CAP: usize = 16384;
 
 /// Construye el proveedor cripto para una clave opcional (D8): AES-256-GCM con
 /// clave, integridad SHA-256 sin ella.
-pub(crate) fn provider_for(key: Option<&Key>) -> Arc<dyn CryptoProvider> {
+pub(crate) fn provider_for(key: Option<&Key>, file_id: &[u8; 16]) -> Arc<dyn CryptoProvider> {
     match key {
-        Some(k) => Arc::new(Aes256GcmProvider::new(k)),
+        // La clave AES se deriva por fichero de (clave_maestra, file_id) dentro del
+        // provider ⇒ misma clave maestra en dos ficheros = claves distintas = sin
+        // reúso de nonce entre ficheros (ver `Aes256GcmProvider::new`).
+        Some(k) => Arc::new(Aes256GcmProvider::new(k, file_id)),
         None => Arc::new(PlainProvider),
     }
 }
@@ -47,6 +50,10 @@ pub struct Pager {
     plain: PlainProvider,
     /// Zona append: `PlainProvider` sin cifrado, `Aes256GcmProvider` con clave (M7).
     crypto: Arc<dyn CryptoProvider>,
+    /// Clave MAESTRA cruda (no la derivada): la retiene el pager para que `vacuum`
+    /// re-derive la clave del fichero compactado con su `file_id` NUEVO. Ya vive en
+    /// memoria dentro del cipher; el `Key` zeroiza al soltarlo. `None` sin cifrado.
+    master_key: Option<Key>,
     /// Compresor de página (v2, M10): `None` = off (formato sin byte de método),
     /// `Some` = on (cada página de datos lleva un byte de método). Se decide al
     /// crear (bit `FLAG_COMPRESSED`) y se lee del header al abrir.
@@ -286,19 +293,17 @@ impl Pager {
     /// append se sella con AES-256-GCM; cabecera y meta slots van siempre en
     /// claro (no contienen datos de usuario).
     pub fn create_keyed(path: &Path, key: Option<&Key>) -> Result<Pager> {
-        Self::create_with_crypto(path, key.is_some(), provider_for(key), None, 0, CACHE_CAP)
+        Self::create_with_crypto(path, key, None, 0, CACHE_CAP)
     }
 
-    /// Núcleo de la creación, parametrizado por el proveedor cripto y el
-    /// compresor ya construidos (M9/M10). Lo usa `vacuum` para crear el archivo
-    /// temporal con el **mismo** proveedor (misma clave) y la **misma**
-    /// compresión sin volver a manejar la `Key` cruda, o con cripto nueva
-    /// (rotación de clave). Genera una identidad de archivo nueva: el archivo
-    /// compactado arranca una cadena de auditoría fresca.
+    /// Núcleo de la creación, parametrizado por la CLAVE (no un provider ya
+    /// construido) y el compresor (M9/M10). Genera una identidad de archivo nueva
+    /// (`file_id` aleatorio) y **deriva la clave AES de él**, así que el archivo
+    /// compactado por `vacuum` —con `file_id` nuevo— recibe su propia clave derivada
+    /// y arranca una cadena de auditoría fresca.
     pub(crate) fn create_with_crypto(
         path: &Path,
-        encrypted: bool,
-        crypto: Arc<dyn CryptoProvider>,
+        key: Option<&Key>,
         compressor: Option<Arc<dyn Compressor>>,
         ecc_nsym: u8,
         cache_pages: usize,
@@ -310,6 +315,10 @@ impl Pager {
 
         let mut file_id = [0u8; 16];
         getrandom::fill(&mut file_id).map_err(|e| Error::Io(std::io::Error::other(e)))?;
+        // La clave AES se deriva del `file_id` recién generado ⇒ cada fichero (incluido
+        // el compactado por vacuum, con file_id NUEVO) tiene su propia clave derivada.
+        let encrypted = key.is_some();
+        let crypto = provider_for(key, &file_id);
         let mut kdf_salt = [0u8; 16];
         getrandom::fill(&mut kdf_salt).map_err(|e| Error::Io(std::io::Error::other(e)))?;
         let flags = (if encrypted { FLAG_ENCRYPTED } else { 0 })
@@ -330,6 +339,7 @@ impl Pager {
             header,
             plain: PlainProvider,
             crypto,
+            master_key: key.cloned(),
             compressor,
             cache: ShardedCache::new(cache_pages),
             state: Mutex::new(AppendState {
@@ -406,7 +416,9 @@ impl Pager {
         let header = FileHeader::decode(page.body())?;
         let encrypted = header.flags & FLAG_ENCRYPTED != 0;
         let crypto: Arc<dyn CryptoProvider> = match (encrypted, key) {
-            (true, Some(k)) => Arc::new(Aes256GcmProvider::new(k)),
+            // Clave derivada de (clave_maestra, file_id del header) — el mismo file_id
+            // con el que se cifró al crear/compactar, así que descifra correctamente.
+            (true, Some(k)) => Arc::new(Aes256GcmProvider::new(k, &header.file_id)),
             (true, None) => return Err(Error::KeyRequired),
             (false, None) => Arc::new(PlainProvider),
             (false, Some(_)) => {
@@ -428,6 +440,7 @@ impl Pager {
             header,
             plain: PlainProvider,
             crypto,
+            master_key: key.cloned(),
             compressor,
             cache: ShardedCache::new(cache_pages),
             state: Mutex::new(AppendState {
@@ -874,10 +887,12 @@ impl Pager {
         &self.header
     }
 
-    /// Proveedor cripto activo, para crear un archivo hermano con la **misma**
-    /// clave (vacuum manteniendo el cifrado, M9).
-    pub(crate) fn crypto(&self) -> Arc<dyn CryptoProvider> {
-        self.crypto.clone()
+    /// Clave MAESTRA cruda del fichero (no la derivada por `file_id`), para que
+    /// `vacuum` re-derive la clave del fichero compactado con su `file_id` NUEVO.
+    /// `None` sin cifrado. (Reemplaza al antiguo `crypto()`: vacuum ahora re-deriva
+    /// en vez de reusar el provider, porque la clave es por-fichero.)
+    pub(crate) fn master_key(&self) -> Option<&Key> {
+        self.master_key.as_ref()
     }
 
     /// Compresor activo (clon del `Arc`), para que `vacuum` cree el archivo

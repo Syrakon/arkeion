@@ -24,7 +24,7 @@ use crate::crypto::Key;
 use crate::error::{Error, Result};
 use crate::format::{MIN_RECORD_LEN, PageBuf, PageId};
 use crate::io::sync_parent_dir;
-use crate::pager::{CACHE_CAP, Pager, ScrubReport, provider_for};
+use crate::pager::{CACHE_CAP, Pager, ScrubReport};
 use crate::record::Value;
 
 /// Rama única de M1; el branching llega en M8.
@@ -350,14 +350,7 @@ impl Store {
         cache_pages: usize,
     ) -> Result<Store> {
         let compressor = compress.then(|| Arc::new(Densa) as Arc<dyn Compressor>);
-        let pager = Pager::create_with_crypto(
-            path,
-            key.is_some(),
-            provider_for(key),
-            compressor,
-            ecc_nsym,
-            cache_pages,
-        )?;
+        let pager = Pager::create_with_crypto(path, key, compressor, ecc_nsym, cache_pages)?;
         let head = commit::genesis_head(&pager.header().file_id);
         Ok(Store::from_parts(path, pager, head, cache_pages))
     }
@@ -994,18 +987,20 @@ impl Store {
         // y la **misma** compresión y ECC que el original (M10).
         let ecc_nsym = old_pager.header().ecc_nsym;
         let new_pager = match rekey {
+            // Keep: misma clave MAESTRA. `create_with_crypto` deriva la clave AES del
+            // `file_id` NUEVO del compactado ⇒ clave distinta de la del original, así
+            // que continuar el contador de nonce (abajo) es seguro de sobra (par
+            // (clave, nonce) ya distinto por la clave). Sin cifrado, `master_key()` = None.
             Rekey::Keep => Pager::create_with_crypto(
                 &temp,
-                old_pager.is_encrypted(),
-                old_pager.crypto(),
+                old_pager.master_key(),
                 old_pager.compressor(),
                 ecc_nsym,
                 self.cache_pages,
             )?,
             Rekey::To(key) => Pager::create_with_crypto(
                 &temp,
-                key.is_some(),
-                provider_for(key),
+                key,
                 old_pager.compressor(),
                 ecc_nsym,
                 self.cache_pages,

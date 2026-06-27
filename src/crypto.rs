@@ -144,12 +144,49 @@ pub struct Aes256GcmProvider {
     cipher: Aes256Gcm,
 }
 
+/// HMAC-SHA256 (RFC 2104) sobre una clave de 32 B, hecho a mano con `sha2` para no
+/// añadir dependencia. La clave (32 B) es menor que el bloque de SHA-256 (64 B), así
+/// que se rellena con ceros. Los intermedios (derivados de la clave) se zeroizan.
+fn hmac_sha256(key: &[u8; 32], msg: &[u8]) -> [u8; 32] {
+    let mut k_block = [0u8; 64];
+    k_block[..32].copy_from_slice(key);
+    let mut ipad = [0x36u8; 64];
+    let mut opad = [0x5cu8; 64];
+    for i in 0..64 {
+        ipad[i] ^= k_block[i];
+        opad[i] ^= k_block[i];
+    }
+    let inner = {
+        let mut h = Sha256::new();
+        h.update(ipad);
+        h.update(msg);
+        h.finalize()
+    };
+    let outer = {
+        let mut h = Sha256::new();
+        h.update(opad);
+        h.update(inner);
+        h.finalize()
+    };
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&outer);
+    k_block.zeroize();
+    ipad.zeroize();
+    opad.zeroize();
+    out
+}
+
 impl Aes256GcmProvider {
-    pub fn new(key: &Key) -> Aes256GcmProvider {
-        Aes256GcmProvider {
-            // 32 bytes exactos: la construcción no puede fallar.
-            cipher: Aes256Gcm::new_from_slice(key.bytes()).expect("clave AES-256 de 32 B"),
-        }
+    /// Deriva una clave AES **distinta por fichero**: `HMAC-SHA256(clave_maestra,
+    /// file_id)`. Como `file_id` son 16 B aleatorios únicos por archivo, dos ficheros
+    /// con la MISMA clave maestra obtienen claves AES distintas ⇒ el par (clave, nonce)
+    /// **nunca colisiona entre ficheros** aunque el llamante reutilice una clave —
+    /// defensa en profundidad frente al fallo catastrófico de reúso de nonce en GCM.
+    pub fn new(key: &Key, file_id: &[u8; 16]) -> Aes256GcmProvider {
+        let mut subkey = hmac_sha256(key.bytes(), file_id);
+        let cipher = Aes256Gcm::new_from_slice(&subkey).expect("subclave AES-256 de 32 B");
+        subkey.zeroize();
+        Aes256GcmProvider { cipher }
     }
 
     /// Nonce de 96 bits = contador `u64` en LE + 4 bytes de padding a cero. La
@@ -245,20 +282,51 @@ mod tests {
         Key::new([b; 32])
     }
 
+    /// `file_id` fijo para los tests de sellado/round-trip (misma clave derivada).
+    const FID: [u8; 16] = [0xF1; 16];
+
     /// Página con un patrón reconocible en el body, sellada con AES-GCM.
     fn aes_sealed(key: &Key, page_id: PageId, counter: u64) -> PageBuf {
         let mut page = PageBuf::zeroed();
         for (i, b) in page.body_mut().iter_mut().enumerate() {
             *b = (i % 256) as u8;
         }
-        Aes256GcmProvider::new(key).seal(&mut page, page_id, counter);
+        Aes256GcmProvider::new(key, &FID).seal(&mut page, page_id, counter);
         page
+    }
+
+    #[test]
+    fn per_file_key_prevents_nonce_reuse() {
+        // MISMA clave maestra + MISMO (page_id, counter), distinto file_id ⇒ ciphertext
+        // distinto (clave derivada distinta) ⇒ nunca se reutiliza el par (clave, nonce)
+        // entre ficheros, AUNQUE el operador reutilice una clave maestra entre tenants.
+        let key = key_of(0x9C);
+        let seal = |fid: &[u8; 16]| -> PageBuf {
+            let mut p = PageBuf::zeroed();
+            p.body_mut()[0] = 0xCA;
+            Aes256GcmProvider::new(&key, fid).seal(&mut p, PageId(3), 0);
+            p
+        };
+        let a = seal(&[0xAA; 16]);
+        let b = seal(&[0xBB; 16]);
+        // Mismo counter ⇒ MISMO nonce; la separación NO está en el nonce sino en la
+        // clave derivada por file_id, así que el ciphertext (keystream) ya difiere:
+        assert_eq!(a.nonce(), b.nonce(), "mismo counter ⇒ mismo nonce (esperado)");
+        assert_ne!(a.body(), b.body(), "distinto file_id debe dar ciphertext distinto");
+        // Y el provider de un fichero NO abre la página del otro (clave derivada distinta):
+        let mut attempt = a.clone();
+        assert!(
+            Aes256GcmProvider::new(&key, &[0xBB; 16])
+                .open(&mut attempt, PageId(3))
+                .is_err(),
+            "clave derivada de otro file_id no debe descifrar"
+        );
     }
 
     #[test]
     fn aes_seal_open_roundtrip() {
         let key = key_of(0x42);
-        let provider = Aes256GcmProvider::new(&key);
+        let provider = Aes256GcmProvider::new(&key, &FID);
         let mut page = aes_sealed(&key, PageId(7), 99);
         provider.open(&mut page, PageId(7)).unwrap();
         for (i, &b) in page.body().iter().enumerate() {
@@ -272,7 +340,7 @@ mod tests {
         let mut attempt = page.clone();
         // Clave distinta ⇒ fallo de autenticación, no datos en claro.
         assert!(
-            Aes256GcmProvider::new(&key_of(0x02))
+            Aes256GcmProvider::new(&key_of(0x02), &FID)
                 .open(&mut attempt, PageId(3))
                 .is_err()
         );
@@ -282,7 +350,7 @@ mod tests {
     fn aes_detects_flip_of_any_byte() {
         let key = key_of(0x5A);
         let reference = aes_sealed(&key, PageId(11), 7);
-        let provider = Aes256GcmProvider::new(&key);
+        let provider = Aes256GcmProvider::new(&key, &FID);
         for i in 0..reference.as_bytes().len() {
             let mut page = reference.clone();
             page.as_bytes_mut()[i] ^= 0x01;
@@ -299,7 +367,7 @@ mod tests {
         let key = key_of(0x33);
         let mut page = aes_sealed(&key, PageId(5), 3);
         assert!(
-            Aes256GcmProvider::new(&key)
+            Aes256GcmProvider::new(&key, &FID)
                 .open(&mut page, PageId(6))
                 .is_err()
         );
@@ -337,7 +405,7 @@ mod tests {
     fn providers() -> Vec<(Box<dyn CryptoProvider>, &'static str)> {
         vec![
             (Box::new(PlainProvider), "plain"),
-            (Box::new(Aes256GcmProvider::new(&key_of(0x6B))), "aes"),
+            (Box::new(Aes256GcmProvider::new(&key_of(0x6B), &FID)), "aes"),
         ]
     }
 

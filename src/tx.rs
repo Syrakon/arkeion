@@ -2011,6 +2011,7 @@ impl WriteTx {
 
     /// Construye un índice vectorial IVF sobre `column` (BLOB) entrenando k-means
     /// sobre las filas existentes.
+    #[allow(clippy::too_many_arguments)]
     pub fn create_vector_index(
         &mut self,
         table: &str,

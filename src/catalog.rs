@@ -3250,7 +3250,7 @@ fn build_vector_clusters<S: NodeStore>(
     // Ordena por (cid, rowid) = orden de CLAVE del b-tree ⇒ inserción con cursor de
     // APPEND (páginas llenas — bonus: el índice PQ ahora SÍ comprime) en vez de los
     // inserts dispersos por cluster del build viejo.
-    postings.sort_unstable_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+    postings.sort_unstable_by_key(|p| (p.0, p.1));
     for (cid, rowid, code) in &postings {
         root = btree::insert(s, root, &vec_posting_key(vidx_id, *cid, *rowid), code)?;
     }
